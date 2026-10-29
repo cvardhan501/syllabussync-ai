@@ -1,10 +1,10 @@
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     app_name: str = "SyllabusSync AI API"
-    app_version: str = "0.1.0"
+    app_version: "str" = "0.2.0"
     app_env: str = "development"
     api_port: int = 8000
     api_host: str = "0.0.0.0"
@@ -27,9 +27,38 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "sqlite:///./syllabus_sync.db"
     
-    # Future extension keys (Phase 2 & beyond)
-    youtube_api_key: str | None = None
-    strands_api_key: str | None = None
+    # Strands Agents SDK Configuration
+    strands_provider: str = "bedrock"
+    strands_model: str = "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    
+    # AWS Bedrock Credentials
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_region: str = "us-east-1"
+    aws_session_token: Optional[str] = None
+    
+    # Alternative Provider Credentials
+    openai_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    
+    # Development Fallback Flag (for local UI development when keys are not configured)
+    allow_dev_fallback_analysis: bool = True
+
+    # Future extension keys (Phase 3 & beyond)
+    youtube_api_key: Optional[str] = None
+
+    def has_strands_credentials(self) -> bool:
+        """Determines if the active provider has valid credentials configured."""
+        provider = self.strands_provider.lower()
+        if provider == "bedrock":
+            return bool(self.aws_access_key_id and self.aws_secret_access_key)
+        elif provider == "openai":
+            return bool(self.openai_api_key)
+        elif provider == "anthropic":
+            return bool(self.anthropic_api_key)
+        elif provider in ("ollama", "local"):
+            return True
+        return False
 
     model_config = SettingsConfigDict(
         env_file=".env",

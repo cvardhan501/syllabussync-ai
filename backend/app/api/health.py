@@ -17,3 +17,4 @@ async def get_health():
         version=settings.app_version,
         environment=settings.app_env,
     )
+

@@ -5,3 +5,4 @@ from app.api.syllabus import router as syllabus_router
 api_router = APIRouter()
 api_router.include_router(health_router)
 api_router.include_router(syllabus_router)
+

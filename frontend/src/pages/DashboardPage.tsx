@@ -6,18 +6,25 @@ import {
   BarChart3, 
   CheckCircle2, 
   ArrowRight, 
-  Sparkles
+  Sparkles,
+  Clock
 } from 'lucide-react';
-import type { NavigationTab, SyllabusUploadResponse } from '../types';
+import type { 
+  NavigationTab, 
+  SyllabusUploadResponse, 
+  SyllabusAnalysisResponse 
+} from '../types';
 
 interface DashboardPageProps {
   onNavigate: (tab: NavigationTab) => void;
   uploadedSyllabus: SyllabusUploadResponse | null;
+  analyzedSyllabus: SyllabusAnalysisResponse | null;
 }
 
 export const DashboardPage: React.FC<DashboardPageProps> = ({
   onNavigate,
   uploadedSyllabus,
+  analyzedSyllabus,
 }) => {
   return (
     <div className="space-y-8 max-w-7xl mx-auto">
@@ -43,7 +50,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm transition-all shadow-lg shadow-indigo-600/30 cursor-pointer"
             >
               <UploadCloud className="w-4 h-4" />
-              <span>{uploadedSyllabus ? 'View or Replace Syllabus' : 'Upload Syllabus'}</span>
+              <span>
+                {analyzedSyllabus
+                  ? 'Review Course Topics'
+                  : uploadedSyllabus
+                  ? 'Analyze Syllabus'
+                  : 'Upload Syllabus'}
+              </span>
               <ArrowRight className="w-4 h-4 ml-1" />
             </button>
             <button
@@ -64,14 +77,32 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                1. Syllabus Document
+                1. Syllabus & Topics
               </span>
               <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-400">
                 <FileText className="w-4 h-4" />
               </div>
             </div>
 
-            {uploadedSyllabus ? (
+            {analyzedSyllabus ? (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                    {analyzedSyllabus.file_type}
+                  </span>
+                  <span className="text-sm font-semibold text-white truncate" title={analyzedSyllabus.course_name || analyzedSyllabus.filename}>
+                    {analyzedSyllabus.course_name || analyzedSyllabus.filename}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 m-0">
+                  {analyzedSyllabus.modules.length} modules • {analyzedSyllabus.total_topics_count} discrete topics ({(analyzedSyllabus.total_estimated_minutes / 60).toFixed(1)} hrs total).
+                </p>
+                <div className="inline-flex items-center gap-1.5 text-xs text-emerald-400 pt-1">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Strands Hierarchy Extracted</span>
+                </div>
+              </div>
+            ) : uploadedSyllabus ? (
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
@@ -82,11 +113,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 m-0">
-                  {uploadedSyllabus.word_count.toLocaleString()} words extracted across {uploadedSyllabus.unit_count} {uploadedSyllabus.unit_label}.
+                  {uploadedSyllabus.word_count.toLocaleString()} words extracted. Ready for Strands Agent topic analysis.
                 </p>
-                <div className="inline-flex items-center gap-1.5 text-xs text-emerald-400 pt-1">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Parsed & Validated</span>
+                <div className="inline-flex items-center gap-1.5 text-xs text-amber-400 pt-1">
+                  <Clock className="w-3.5 h-3.5" />
+                  <span>Document parsed; awaiting topic analysis</span>
                 </div>
               </div>
             ) : (
@@ -104,7 +135,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               onClick={() => onNavigate('syllabus')}
               className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 flex items-center gap-1 cursor-pointer"
             >
-              <span>{uploadedSyllabus ? 'Inspect Extracted Text' : 'Go to Upload Page'}</span>
+              <span>{analyzedSyllabus ? 'Inspect & Edit Topics' : uploadedSyllabus ? 'Extract Topics with Agent' : 'Go to Upload Page'}</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -124,12 +155,14 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
             <div className="space-y-1.5 py-1">
               <div className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-amber-400/80" />
-                <p className="text-sm font-medium text-slate-300 m-0">Roadmap Not Generated</p>
+                <span className={`w-2 h-2 rounded-full ${analyzedSyllabus ? 'bg-indigo-400' : 'bg-amber-400/80'}`} />
+                <p className="text-sm font-medium text-slate-300 m-0">
+                  {analyzedSyllabus ? 'Topics Ready for Video Matching' : 'Roadmap Not Generated'}
+                </p>
               </div>
               <p className="text-xs text-slate-500 m-0">
-                {uploadedSyllabus 
-                  ? 'Ready for Phase 2: Topics will be structured into daily scheduled blocks.' 
+                {analyzedSyllabus 
+                  ? `${analyzedSyllabus.total_topics_count} topics structured. In Phase 3, each topic will be mapped to verified educational YouTube lectures.` 
                   : 'A daily study roadmap will be generated once your syllabus is parsed and analyzed.'}
               </p>
             </div>
@@ -198,24 +231,24 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             <h4 className="text-sm font-semibold text-white m-0">Digital Document Extraction</h4>
             <p className="text-xs text-slate-400 leading-relaxed m-0">
               Upload PDF or DOCX syllabus files. SyllabusSync AI safely inspects document structure,
-              extracts readable text, and prepares clean course segments.
+              extracts readable text, and validates document health.
             </p>
             <span className="inline-block text-[11px] font-medium text-emerald-400 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40">
-              Active in Phase 1
+              Completed (Phase 1)
             </span>
           </div>
 
-          <div className="rounded-2xl bg-slate-900/40 border border-slate-800 p-5 space-y-3">
-            <div className="w-8 h-8 rounded-xl bg-violet-600/20 text-violet-400 flex items-center justify-center font-bold text-sm">
+          <div className="rounded-2xl bg-indigo-950/30 border border-indigo-800/50 p-5 space-y-3">
+            <div className="w-8 h-8 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-sm shadow-md shadow-indigo-600/30">
               2
             </div>
-            <h4 className="text-sm font-semibold text-white m-0">Real Educational Video Matching</h4>
-            <p className="text-xs text-slate-400 leading-relaxed m-0">
-              Autonomous Strands Agents search the YouTube Data API v3 for high-yield lectures from top
-              educational channels with channel consistency.
+            <h4 className="text-sm font-semibold text-white m-0">Strands Agents Topic Hierarchy</h4>
+            <p className="text-xs text-slate-300 leading-relaxed m-0">
+              The Strands Agents SDK parses syllabus text into course modules, discrete testable topics,
+              study times, difficulty ratings, and highlights ambiguous sections for editing.
             </p>
-            <span className="inline-block text-[11px] font-medium text-indigo-400 bg-indigo-950/40 px-2 py-0.5 rounded border border-indigo-800/40">
-              Coming in Phase 2 & 3
+            <span className="inline-block text-[11px] font-medium text-emerald-400 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40">
+              Active (Phase 2)
             </span>
           </div>
 
@@ -223,13 +256,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             <div className="w-8 h-8 rounded-xl bg-purple-600/20 text-purple-400 flex items-center justify-center font-bold text-sm">
               3
             </div>
-            <h4 className="text-sm font-semibold text-white m-0">Adaptive Daily Scheduling</h4>
+            <h4 className="text-sm font-semibold text-white m-0">Real Educational Video Matching</h4>
             <p className="text-xs text-slate-400 leading-relaxed m-0">
-              Missed a day? The planner automatically adjusts your daily study load, flags upcoming
-              exam deadlines, and tracks concept mastery without stress.
+              Autonomous Strands Agents search the YouTube Data API v3 for high-yield lectures from top
+              educational channels with channel consistency.
             </p>
             <span className="inline-block text-[11px] font-medium text-indigo-400 bg-indigo-950/40 px-2 py-0.5 rounded border border-indigo-800/40">
-              Coming in Phase 4
+              Coming in Phase 3
             </span>
           </div>
         </div>

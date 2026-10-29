@@ -23,3 +23,4 @@ def test_root_endpoint():
     data = response.json()
     assert "docs_url" in data
     assert data["health_check"] == "/api/health"
+

@@ -13,3 +13,4 @@ class SyllabusRecord:
     word_count: int
     raw_text: str
     created_at: Optional[datetime] = None
+

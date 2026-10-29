@@ -6,7 +6,12 @@ import { SyllabusPage } from './pages/SyllabusPage';
 import { StudyPlanPage } from './pages/StudyPlanPage';
 import { ProgressPage } from './pages/ProgressPage';
 import { SettingsPage } from './pages/SettingsPage';
-import type { NavigationTab, HealthResponse, SyllabusUploadResponse } from './types';
+import type { 
+  NavigationTab, 
+  HealthResponse, 
+  SyllabusUploadResponse, 
+  SyllabusAnalysisResponse 
+} from './types';
 import { apiService } from './services/api';
 
 export const App: React.FC = () => {
@@ -15,6 +20,7 @@ export const App: React.FC = () => {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [uploadedSyllabus, setUploadedSyllabus] = useState<SyllabusUploadResponse | null>(null);
+  const [analyzedSyllabus, setAnalyzedSyllabus] = useState<SyllabusAnalysisResponse | null>(null);
 
   // Poll or check health on mount
   useEffect(() => {
@@ -61,7 +67,7 @@ export const App: React.FC = () => {
         <Header
           currentTab={currentTab}
           onOpenSidebar={() => setIsSidebarOpen(true)}
-          hasSyllabus={!!uploadedSyllabus}
+          hasSyllabus={!!(uploadedSyllabus || analyzedSyllabus)}
         />
 
         <main className="flex-1 p-4 sm:p-8 overflow-y-auto">
@@ -69,6 +75,7 @@ export const App: React.FC = () => {
             <DashboardPage
               onNavigate={setCurrentTab}
               uploadedSyllabus={uploadedSyllabus}
+              analyzedSyllabus={analyzedSyllabus}
             />
           )}
 
@@ -76,6 +83,9 @@ export const App: React.FC = () => {
             <SyllabusPage
               uploadedSyllabus={uploadedSyllabus}
               onSyllabusUploaded={setUploadedSyllabus}
+              analyzedSyllabus={analyzedSyllabus}
+              onAnalysisComplete={setAnalyzedSyllabus}
+              onNavigateToStudyPlan={() => setCurrentTab('study-plan')}
             />
           )}
 

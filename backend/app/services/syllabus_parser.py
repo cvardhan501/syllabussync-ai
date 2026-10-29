@@ -1,4 +1,5 @@
 import io
+import uuid
 from typing import Tuple
 from fastapi import HTTPException, UploadFile, status
 from pypdf import PdfReader
@@ -7,6 +8,7 @@ import docx
 
 from app.core.config import settings
 from app.schemas.syllabus import SyllabusUploadResponse
+from app.models.database import save_raw_syllabus
 
 # Accepted file extensions and MIME patterns
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
@@ -16,7 +18,7 @@ ALLOWED_MIME_TYPES = {
     "application/vnd.pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/zip",
-    "application/octet-stream",  # Browsers sometimes use generic binary stream for docx/pdf
+    "application/octet-stream",  # Browsers sometimes use generic binary stream
 }
 
 
@@ -24,7 +26,7 @@ class SyllabusParserService:
     @staticmethod
     def validate_file_metadata(file: UploadFile) -> Tuple[str, str]:
         """
-        Validates file presence, filename, extension, and MIME type.
+        Validates file presence, filename, and extension.
         Returns normalized (filename, extension).
         """
         if not file.filename:
@@ -49,22 +51,18 @@ class SyllabusParserService:
                 detail=f"Unsupported file format '{filename}'. SyllabusSync AI currently supports PDF (.pdf) and Microsoft Word (.docx) files."
             )
 
-        # Check content-type if provided
-        if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
-            # If extension is valid but browser sent unexpected mime type, verify carefully
-            pass
-
         return filename, extension
 
     @classmethod
-    async def parse_uploaded_file(cls, file: UploadFile) -> SyllabusUploadResponse:
+    async def extract_text_and_metadata(cls, file: UploadFile) -> Tuple[str, str, str, int, int, int, str, int, str, str]:
         """
-        Reads, validates, and extracts text content from an uploaded PDF or DOCX file.
-        Enforces size constraints and checks for scanned/empty documents.
+        Validates and extracts raw text from an UploadFile.
+        Returns:
+        (syllabus_id, filename, file_type, file_size, char_count, word_count, full_text, unit_count, unit_label, preview_text)
         """
         filename, extension = cls.validate_file_metadata(file)
 
-        # Read file contents into memory safely
+        # Read file contents safely
         try:
             content = await file.read()
         except Exception:
@@ -75,39 +73,106 @@ class SyllabusParserService:
 
         file_size = len(content)
 
-        # Check for empty file
         if file_size == 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="The uploaded file is empty (0 bytes). Please upload a valid syllabus document."
             )
 
-        # Check file size limit
         if file_size > settings.max_upload_size_bytes:
             raise HTTPException(
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail=f"File size ({file_size / (1024 * 1024):.2f} MB) exceeds the maximum limit of {settings.max_upload_size_mb} MB."
             )
 
+        syllabus_id = str(uuid.uuid4())
+
         if extension == ".pdf":
-            return cls._extract_pdf(filename, content, file_size)
+            file_type = "pdf"
+            full_text, unit_count, unit_label, notes = cls._extract_pdf_text(content)
         elif extension == ".docx":
-            return cls._extract_docx(filename, content, file_size)
+            file_type = "docx"
+            full_text, unit_count, unit_label, notes = cls._extract_docx_text(content)
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Unsupported document format."
             )
 
+        words = full_text.split()
+        word_count = len(words)
+        char_count = len(full_text)
+
+        preview = full_text[:1200]
+        if len(full_text) > 1200:
+            preview += "..."
+
+        # Persist raw syllabus record in database
+        save_raw_syllabus(
+            syllabus_id=syllabus_id,
+            filename=filename,
+            file_type=file_type,
+            file_size_bytes=file_size,
+            char_count=char_count,
+            word_count=word_count,
+            raw_text=full_text,
+        )
+
+        return (
+            syllabus_id,
+            filename,
+            file_type,
+            file_size,
+            char_count,
+            word_count,
+            full_text,
+            unit_count,
+            unit_label,
+            preview,
+            notes
+        )
+
     @classmethod
-    def _extract_pdf(cls, filename: str, content: bytes, file_size: int) -> SyllabusUploadResponse:
+    async def parse_uploaded_file(cls, file: UploadFile) -> SyllabusUploadResponse:
+        """Endpoint handler for POST /api/syllabus/upload."""
+        (
+            syllabus_id,
+            filename,
+            file_type,
+            file_size,
+            char_count,
+            word_count,
+            full_text,
+            unit_count,
+            unit_label,
+            preview,
+            notes
+        ) = await cls.extract_text_and_metadata(file)
+
+        return SyllabusUploadResponse(
+            status="success",
+            syllabus_id=syllabus_id,
+            filename=filename,
+            file_type=file_type,  # type: ignore
+            file_size_bytes=file_size,
+            char_count=char_count,
+            word_count=word_count,
+            unit_count=unit_count,
+            unit_label=unit_label,
+            preview_text=preview,
+            full_text_length=char_count,
+            extraction_notes=notes,
+            message=f"Syllabus '{filename}' parsed successfully ({unit_count} {unit_label}, {word_count:,} words)."
+        )
+
+    @classmethod
+    def _extract_pdf_text(cls, content: bytes) -> Tuple[str, int, str, str]:
         try:
             pdf_stream = io.BytesIO(content)
             reader = PdfReader(pdf_stream)
-            
+
             if reader.is_encrypted:
                 try:
-                    # Attempt empty password decrypt if standard
                     reader.decrypt("")
                 except Exception:
                     raise HTTPException(
@@ -123,7 +188,7 @@ class SyllabusParserService:
                 )
 
             extracted_chunks = []
-            for page_idx, page in enumerate(reader.pages):
+            for page in reader.pages:
                 page_text = page.extract_text() or ""
                 cleaned = page_text.strip()
                 if cleaned:
@@ -131,7 +196,6 @@ class SyllabusParserService:
 
             full_text = "\n\n".join(extracted_chunks).strip()
 
-            # Handle scanned/image-only PDFs
             if not full_text:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -143,28 +207,8 @@ class SyllabusParserService:
                     )
                 )
 
-            words = full_text.split()
-            word_count = len(words)
-            char_count = len(full_text)
-
-            preview = full_text[:1200]
-            if len(full_text) > 1200:
-                preview += "..."
-
-            return SyllabusUploadResponse(
-                status="success",
-                filename=filename,
-                file_type="pdf",
-                file_size_bytes=file_size,
-                char_count=char_count,
-                word_count=word_count,
-                unit_count=num_pages,
-                unit_label="pages",
-                preview_text=preview,
-                full_text_length=char_count,
-                extraction_notes=f"Successfully extracted digital text from all {num_pages} page(s).",
-                message=f"Syllabus '{filename}' parsed successfully ({num_pages} pages, {word_count:,} words)."
-            )
+            notes = f"Successfully extracted digital text from all {num_pages} page(s)."
+            return full_text, num_pages, "pages", notes
 
         except PdfReadError:
             raise HTTPException(
@@ -180,7 +224,7 @@ class SyllabusParserService:
             )
 
     @classmethod
-    def _extract_docx(cls, filename: str, content: bytes, file_size: int) -> SyllabusUploadResponse:
+    def _extract_docx_text(cls, content: bytes) -> Tuple[str, int, str, str]:
         try:
             docx_stream = io.BytesIO(content)
             doc = docx.Document(docx_stream)
@@ -188,14 +232,12 @@ class SyllabusParserService:
             extracted_chunks = []
             para_count = 0
 
-            # Extract from paragraphs
             for p in doc.paragraphs:
                 text = p.text.strip()
                 if text:
                     extracted_chunks.append(text)
                     para_count += 1
 
-            # Extract from tables if present
             table_row_count = 0
             for table in doc.tables:
                 for row in table.rows:
@@ -212,32 +254,12 @@ class SyllabusParserService:
                     detail="The uploaded DOCX document does not contain readable text."
                 )
 
-            words = full_text.split()
-            word_count = len(words)
-            char_count = len(full_text)
-
-            preview = full_text[:1200]
-            if len(full_text) > 1200:
-                preview += "..."
-
             notes = f"Extracted {para_count} text paragraph(s)"
             if table_row_count > 0:
                 notes += f" and {table_row_count} table row(s)"
 
-            return SyllabusUploadResponse(
-                status="success",
-                filename=filename,
-                file_type="docx",
-                file_size_bytes=file_size,
-                char_count=char_count,
-                word_count=word_count,
-                unit_count=para_count + table_row_count,
-                unit_label="paragraphs & table rows",
-                preview_text=preview,
-                full_text_length=char_count,
-                extraction_notes=notes,
-                message=f"Syllabus '{filename}' parsed successfully ({word_count:,} words)."
-            )
+            total_units = para_count + table_row_count
+            return full_text, total_units, "paragraphs & table rows", notes
 
         except HTTPException:
             raise
