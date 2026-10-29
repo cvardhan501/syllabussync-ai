@@ -2,18 +2,17 @@ import React from 'react';
 import { 
   UploadCloud, 
   FileText, 
-  CalendarDays, 
-  BarChart3, 
-  CheckCircle2, 
   ArrowRight, 
   Sparkles,
-  Clock
+  PlaySquare,
+  Check
 } from 'lucide-react';
 import type { 
   NavigationTab, 
   SyllabusUploadResponse, 
   SyllabusAnalysisResponse 
 } from '../types';
+import { MountainClimbIllustration } from '../components/Illustrations';
 
 interface DashboardPageProps {
   onNavigate: (tab: NavigationTab) => void;
@@ -26,247 +25,203 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   uploadedSyllabus,
   analyzedSyllabus,
 }) => {
+  // Determine current step in journey
+  const currentStep = analyzedSyllabus ? 2 : uploadedSyllabus ? 1 : 0;
+
   return (
-    <div className="space-y-8 max-w-7xl mx-auto">
-      {/* Welcome Banner */}
-      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-indigo-950/70 via-slate-900 to-slate-950 border border-indigo-900/40 p-6 sm:p-8 shadow-xl">
-        <div className="absolute top-0 right-0 w-96 h-96 bg-indigo-600/10 rounded-full blur-3xl pointer-events-none" />
-        <div className="relative z-10 max-w-2xl space-y-4">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
-            <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-            <span>AI-Powered Course Roadmap</span>
-          </div>
-          <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white m-0">
-            Turn your syllabus into an actionable video study plan.
-          </h2>
-          <p className="text-sm sm:text-base text-slate-300 leading-relaxed m-0">
-            SyllabusSync AI bridges the gap between static university syllabi and real, high-quality
-            educational YouTube video lectures with an adaptive daily study schedule.
-          </p>
-
-          <div className="pt-2 flex flex-wrap items-center gap-3">
-            <button
-              onClick={() => onNavigate('syllabus')}
-              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm transition-all shadow-lg shadow-indigo-600/30 cursor-pointer"
-            >
-              <UploadCloud className="w-4 h-4" />
-              <span>
-                {analyzedSyllabus
-                  ? 'Review Course Topics'
-                  : uploadedSyllabus
-                  ? 'Analyze Syllabus'
-                  : 'Upload Syllabus'}
-              </span>
-              <ArrowRight className="w-4 h-4 ml-1" />
-            </button>
-            <button
-              onClick={() => onNavigate('study-plan')}
-              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-300 border border-slate-700 font-medium text-sm transition-all cursor-pointer"
-            >
-              <CalendarDays className="w-4 h-4 text-slate-400" />
-              <span>Study Plan Preview</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Overview Cards Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-        {/* Card 1: Syllabus Status */}
-        <div className="rounded-2xl bg-slate-900/60 border border-slate-800/90 p-5 backdrop-blur-xs flex flex-col justify-between">
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                1. Syllabus & Topics
-              </span>
-              <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-400">
-                <FileText className="w-4 h-4" />
-              </div>
-            </div>
-
-            {analyzedSyllabus ? (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                    {analyzedSyllabus.file_type}
-                  </span>
-                  <span className="text-sm font-semibold text-white truncate" title={analyzedSyllabus.course_name || analyzedSyllabus.filename}>
-                    {analyzedSyllabus.course_name || analyzedSyllabus.filename}
-                  </span>
-                </div>
-                <p className="text-xs text-slate-400 m-0">
-                  {analyzedSyllabus.modules.length} modules • {analyzedSyllabus.total_topics_count} discrete topics ({(analyzedSyllabus.total_estimated_minutes / 60).toFixed(1)} hrs total).
-                </p>
-                <div className="inline-flex items-center gap-1.5 text-xs text-emerald-400 pt-1">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Strands Hierarchy Extracted</span>
-                </div>
-              </div>
-            ) : uploadedSyllabus ? (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                    {uploadedSyllabus.file_type}
-                  </span>
-                  <span className="text-sm font-semibold text-white truncate" title={uploadedSyllabus.filename}>
-                    {uploadedSyllabus.filename}
-                  </span>
-                </div>
-                <p className="text-xs text-slate-400 m-0">
-                  {uploadedSyllabus.word_count.toLocaleString()} words extracted. Ready for Strands Agent topic analysis.
-                </p>
-                <div className="inline-flex items-center gap-1.5 text-xs text-amber-400 pt-1">
-                  <Clock className="w-3.5 h-3.5" />
-                  <span>Document parsed; awaiting topic analysis</span>
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-1.5 py-1">
-                <p className="text-sm font-medium text-slate-300 m-0">No syllabus uploaded</p>
-                <p className="text-xs text-slate-500 m-0">
-                  Upload a PDF or DOCX file to extract course topics and study modules.
-                </p>
-              </div>
-            )}
-          </div>
-
-          <div className="pt-4 border-t border-slate-800/80 mt-4">
-            <button
-              onClick={() => onNavigate('syllabus')}
-              className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 flex items-center gap-1 cursor-pointer"
-            >
-              <span>{analyzedSyllabus ? 'Inspect & Edit Topics' : uploadedSyllabus ? 'Extract Topics with Agent' : 'Go to Upload Page'}</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-
-        {/* Card 2: Study Plan Status (Empty State) */}
-        <div className="rounded-2xl bg-slate-900/60 border border-slate-800/90 p-5 backdrop-blur-xs flex flex-col justify-between">
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                2. Adaptive Study Plan
-              </span>
-              <div className="p-2 rounded-lg bg-amber-500/10 text-amber-400">
-                <CalendarDays className="w-4 h-4" />
-              </div>
-            </div>
-
-            <div className="space-y-1.5 py-1">
-              <div className="flex items-center gap-1.5">
-                <span className={`w-2 h-2 rounded-full ${analyzedSyllabus ? 'bg-indigo-400' : 'bg-amber-400/80'}`} />
-                <p className="text-sm font-medium text-slate-300 m-0">
-                  {analyzedSyllabus ? 'Topics Ready for Video Matching' : 'Roadmap Not Generated'}
-                </p>
-              </div>
-              <p className="text-xs text-slate-500 m-0">
-                {analyzedSyllabus 
-                  ? `${analyzedSyllabus.total_topics_count} topics structured. In Phase 3, each topic will be mapped to verified educational YouTube lectures.` 
-                  : 'A daily study roadmap will be generated once your syllabus is parsed and analyzed.'}
+    <div className="space-y-6 max-w-6xl mx-auto">
+      {/* 1. Welcome Banner (Matches Visual Reference Top-Left) */}
+      <div className="relative overflow-hidden rounded-3xl bg-gradient-to-r from-[#0c162f] via-[#101d3d] to-[#0a1226] border border-[#1b2b54] p-6 sm:p-8 shadow-xl">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+          <div className="space-y-4 max-w-xl">
+            <div>
+              <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white m-0">
+                Hey there, Future Techie! 🎓
+              </h2>
+              <p className="text-sm text-slate-300 mt-1 m-0">
+                Your syllabus. Your pace. Your success.
               </p>
             </div>
+
+            {/* Quick Upload Action Box */}
+            <div className="p-4 rounded-2xl bg-[#080e1e]/80 border border-[#1d2f58] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-blue-600/20 text-blue-400 flex items-center justify-center shrink-0">
+                  <FileText className="w-5 h-5" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-bold text-white m-0">
+                    {analyzedSyllabus ? 'Syllabus Analyzed' : 'Upload your syllabus'}
+                  </h4>
+                  <p className="text-[11px] text-slate-400 m-0">
+                    {analyzedSyllabus
+                      ? `${analyzedSyllabus.course_name || 'Course'} (${analyzedSyllabus.total_topics_count} topics)`
+                      : 'Get AI-powered topic breakdown and personalized study plan.'}
+                  </p>
+                </div>
+              </div>
+
+              <button
+                onClick={() => onNavigate('syllabus')}
+                className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-md shadow-blue-600/30 transition cursor-pointer self-start sm:self-auto shrink-0"
+              >
+                {analyzedSyllabus ? 'View Topics' : 'Upload Now'}
+              </button>
+            </div>
           </div>
 
-          <div className="pt-4 border-t border-slate-800/80 mt-4">
-            <button
-              onClick={() => onNavigate('study-plan')}
-              className="text-xs font-semibold text-slate-400 hover:text-slate-300 flex items-center gap-1 cursor-pointer"
-            >
-              <span>View Study Plan Structure</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
+          {/* Right Side: Mountain Illustration */}
+          <div className="hidden lg:block shrink-0">
+            <MountainClimbIllustration className="w-64 h-36" />
+          </div>
+        </div>
+      </div>
+
+      {/* 2. Three 3-Step Process Cards (Matches Visual Reference) */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {/* Step 1: Upload */}
+        <div 
+          onClick={() => onNavigate('syllabus')}
+          className="rounded-2xl bg-[#0b1429] border border-[#19284d] hover:border-blue-500/50 p-5 transition cursor-pointer group flex items-start gap-4"
+        >
+          <div className="w-10 h-10 rounded-xl bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+            <UploadCloud className="w-5 h-5" />
+          </div>
+          <div className="space-y-1">
+            <span className="text-[11px] font-bold text-cyan-400 uppercase tracking-wider block">1. Upload</span>
+            <h4 className="text-sm font-bold text-white m-0">Add your syllabus</h4>
+            <p className="text-xs text-slate-400 m-0 leading-relaxed">PDF or DOCX document</p>
           </div>
         </div>
 
-        {/* Card 3: Progress & Mastery Status (Empty State) */}
-        <div className="rounded-2xl bg-slate-900/60 border border-slate-800/90 p-5 backdrop-blur-xs flex flex-col justify-between">
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                3. Course Progress
+        {/* Step 2: Analyze */}
+        <div 
+          onClick={() => onNavigate('syllabus')}
+          className="rounded-2xl bg-[#0b1429] border border-[#19284d] hover:border-indigo-500/50 p-5 transition cursor-pointer group flex items-start gap-4"
+        >
+          <div className="w-10 h-10 rounded-xl bg-indigo-500/15 border border-indigo-500/30 text-indigo-400 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+            <Sparkles className="w-5 h-5" />
+          </div>
+          <div className="space-y-1">
+            <span className="text-[11px] font-bold text-indigo-400 uppercase tracking-wider block">2. Analyze</span>
+            <h4 className="text-sm font-bold text-white m-0">AI topic breakdown</h4>
+            <p className="text-xs text-slate-400 m-0 leading-relaxed">Strands Agents SDK structure</p>
+          </div>
+        </div>
+
+        {/* Step 3: Learn */}
+        <div 
+          onClick={() => onNavigate('videos')}
+          className="rounded-2xl bg-[#0b1429] border border-[#19284d] hover:border-purple-500/50 p-5 transition cursor-pointer group flex items-start gap-4"
+        >
+          <div className="w-10 h-10 rounded-xl bg-purple-500/15 border border-purple-500/30 text-purple-400 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+            <PlaySquare className="w-5 h-5" />
+          </div>
+          <div className="space-y-1">
+            <span className="text-[11px] font-bold text-purple-400 uppercase tracking-wider block">3. Learn</span>
+            <h4 className="text-sm font-bold text-white m-0">Find real YouTube videos</h4>
+            <p className="text-xs text-slate-400 m-0 leading-relaxed">& create your daily plan</p>
+          </div>
+        </div>
+      </div>
+
+      {/* 3. Your Learning Journey Stepper (Matches Visual Reference) */}
+      <div className="rounded-2xl bg-[#0b1429] border border-[#19284d] p-5 sm:p-6 space-y-4">
+        <h3 className="text-sm font-bold text-white tracking-tight m-0">
+          Your Learning Journey
+        </h3>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {[
+            { step: 1, label: 'Upload Syllabus', desc: uploadedSyllabus ? 'Document ready' : 'PDF or DOCX' },
+            { step: 2, label: 'Analyze Topics', desc: analyzedSyllabus ? `${analyzedSyllabus.total_topics_count} topics` : 'Strands agent' },
+            { step: 3, label: 'Get Resources', desc: 'YouTube API v3' },
+            { step: 4, label: 'Follow Plan', desc: 'Daily study schedule' },
+          ].map((item, idx) => {
+            const isCompleted = idx < currentStep;
+            const isCurrent = idx === currentStep;
+
+            return (
+              <div 
+                key={item.step} 
+                className={`p-3.5 rounded-xl border flex items-center gap-3 transition ${
+                  isCompleted
+                    ? 'bg-emerald-950/20 border-emerald-800/40'
+                    : isCurrent
+                    ? 'bg-blue-950/30 border-blue-600/50'
+                    : 'bg-[#080f21] border-[#162548] opacity-60'
+                }`}
+              >
+                <div 
+                  className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
+                    isCompleted
+                      ? 'bg-emerald-500 text-white'
+                      : isCurrent
+                      ? 'bg-blue-600 text-white ring-2 ring-blue-400/40'
+                      : 'bg-slate-800 text-slate-400'
+                  }`}
+                >
+                  {isCompleted ? <Check className="w-3.5 h-3.5" /> : item.step}
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-white truncate m-0">{item.label}</p>
+                  <p className="text-[11px] text-slate-400 truncate m-0">{item.desc}</p>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 4. Active Course State or Empty Guidance */}
+      {analyzedSyllabus ? (
+        <div className="rounded-2xl bg-[#0b1429] border border-[#19284d] p-5 sm:p-6 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <span className="text-[11px] font-bold uppercase tracking-wider text-blue-400">
+                Active Course Roadmap
               </span>
-              <div className="p-2 rounded-lg bg-violet-500/10 text-violet-400">
-                <BarChart3 className="w-4 h-4" />
-              </div>
+              <h3 className="text-lg font-bold text-white m-0">
+                {analyzedSyllabus.course_name || analyzedSyllabus.filename}
+              </h3>
             </div>
-
-            <div className="space-y-1.5 py-1">
-              <div className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-slate-500" />
-                <p className="text-sm font-medium text-slate-300 m-0">0% Course Covered</p>
-              </div>
-              <p className="text-xs text-slate-500 m-0">
-                No active progress data. Topic mastery and video completions will track dynamically as you study.
-              </p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => onNavigate('syllabus')}
+                className="px-3.5 py-1.5 rounded-xl bg-[#162548] hover:bg-[#1e3466] text-slate-200 text-xs font-medium border border-[#233a72] transition cursor-pointer"
+              >
+                Edit Topics
+              </button>
+              <button
+                onClick={() => onNavigate('study-plan')}
+                className="px-4 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium shadow-md shadow-blue-600/30 transition cursor-pointer flex items-center gap-1.5"
+              >
+                <span>Study Plan</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 
-          <div className="pt-4 border-t border-slate-800/80 mt-4">
-            <button
-              onClick={() => onNavigate('progress')}
-              className="text-xs font-semibold text-slate-400 hover:text-slate-300 flex items-center gap-1 cursor-pointer"
-            >
-              <span>View Progress Dashboard</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* How SyllabusSync AI Works Section */}
-      <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-base sm:text-lg font-bold text-white tracking-tight m-0">
-            How SyllabusSync AI Works
-          </h3>
-          <span className="text-xs text-slate-400">3-Step AI Workflow</span>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-          <div className="rounded-2xl bg-slate-900/40 border border-slate-800 p-5 space-y-3">
-            <div className="w-8 h-8 rounded-xl bg-indigo-600/20 text-indigo-400 flex items-center justify-center font-bold text-sm">
-              1
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="p-3 rounded-xl bg-[#070e20] border border-[#162548]">
+              <span className="text-[11px] text-slate-400">Total Units</span>
+              <p className="text-lg font-bold text-white m-0 mt-0.5">{analyzedSyllabus.modules.length}</p>
             </div>
-            <h4 className="text-sm font-semibold text-white m-0">Digital Document Extraction</h4>
-            <p className="text-xs text-slate-400 leading-relaxed m-0">
-              Upload PDF or DOCX syllabus files. SyllabusSync AI safely inspects document structure,
-              extracts readable text, and validates document health.
-            </p>
-            <span className="inline-block text-[11px] font-medium text-emerald-400 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40">
-              Completed (Phase 1)
-            </span>
-          </div>
-
-          <div className="rounded-2xl bg-indigo-950/30 border border-indigo-800/50 p-5 space-y-3">
-            <div className="w-8 h-8 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-sm shadow-md shadow-indigo-600/30">
-              2
+            <div className="p-3 rounded-xl bg-[#070e20] border border-[#162548]">
+              <span className="text-[11px] text-slate-400">Topics Extracted</span>
+              <p className="text-lg font-bold text-white m-0 mt-0.5">{analyzedSyllabus.total_topics_count}</p>
             </div>
-            <h4 className="text-sm font-semibold text-white m-0">Strands Agents Topic Hierarchy</h4>
-            <p className="text-xs text-slate-300 leading-relaxed m-0">
-              The Strands Agents SDK parses syllabus text into course modules, discrete testable topics,
-              study times, difficulty ratings, and highlights ambiguous sections for editing.
-            </p>
-            <span className="inline-block text-[11px] font-medium text-emerald-400 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40">
-              Active (Phase 2)
-            </span>
-          </div>
-
-          <div className="rounded-2xl bg-slate-900/40 border border-slate-800 p-5 space-y-3">
-            <div className="w-8 h-8 rounded-xl bg-purple-600/20 text-purple-400 flex items-center justify-center font-bold text-sm">
-              3
+            <div className="p-3 rounded-xl bg-[#070e20] border border-[#162548]">
+              <span className="text-[11px] text-slate-400">Study Duration</span>
+              <p className="text-lg font-bold text-blue-400 m-0 mt-0.5">{(analyzedSyllabus.total_estimated_minutes / 60).toFixed(1)} hrs</p>
             </div>
-            <h4 className="text-sm font-semibold text-white m-0">Real Educational Video Matching</h4>
-            <p className="text-xs text-slate-400 leading-relaxed m-0">
-              Autonomous Strands Agents search the YouTube Data API v3 for high-yield lectures from top
-              educational channels with channel consistency.
-            </p>
-            <span className="inline-block text-[11px] font-medium text-indigo-400 bg-indigo-950/40 px-2 py-0.5 rounded border border-indigo-800/40">
-              Coming in Phase 3
-            </span>
+            <div className="p-3 rounded-xl bg-[#070e20] border border-[#162548]">
+              <span className="text-[11px] text-slate-400">Engine</span>
+              <p className="text-xs font-mono text-slate-300 m-0 mt-1 truncate">{analyzedSyllabus.is_fallback ? 'Dev Fallback' : 'Strands SDK'}</p>
+            </div>
           </div>
         </div>
-      </div>
+      ) : null}
     </div>
   );
 };

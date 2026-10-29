@@ -1,6 +1,7 @@
 export type NavigationTab = 
   | 'dashboard' 
   | 'syllabus' 
+  | 'videos'
   | 'study-plan' 
   | 'progress' 
   | 'settings';
@@ -76,6 +77,41 @@ export interface TopicUpdateRequest {
   course_name?: string;
   modules: ModuleItem[];
   ambiguous_sections?: string[];
+}
+
+export interface VideoResourceItem {
+  id: string;
+  title: string;
+  channelTitle: string;
+  thumbnailUrl: string;
+  durationFormatted: string;
+  durationSeconds: number;
+  language: string;
+  difficulty: 'easy' | 'medium' | 'hard';
+  matchedTopicTitle: string;
+  matchedModuleTitle?: string;
+  videoUrl: string;
+  isBookmarked?: boolean;
+}
+
+export interface UserPreferences {
+  preferredLanguage: string;
+  lessonStyle: string;
+  dailyStudyAvailability: string;
+  examDate: string;
+  theme: 'dark' | 'light';
+  studyReminders: boolean;
+  deadlineAlerts: boolean;
+  autoSaveProgress: boolean;
+}
+
+export interface StudyTaskItem {
+  id: string;
+  title: string;
+  durationMinutes: number;
+  type: 'Video' | 'Practice' | 'Study';
+  completed: boolean;
+  topicId?: string;
 }
 
 export interface ApiError {
