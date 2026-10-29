@@ -1,80 +1,235 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   CalendarDays, 
   Check, 
-  ListTodo
+  ListTodo,
+  AlertTriangle,
+  RotateCcw,
+  Sparkles,
+  FileText,
+  ExternalLink,
+  Loader2,
+  X,
+  Save,
+  CheckCircle2,
+  Clock
 } from 'lucide-react';
 import type { 
   NavigationTab, 
   SyllabusAnalysisResponse, 
-  StudyTaskItem 
+  StudyPlanResponse,
+  TaskItemSchema 
 } from '../types';
+import { apiService, ApiErrorResponse } from '../services/api';
 import { SproutingPlantIllustration } from '../components/Illustrations';
 
 interface StudyPlanPageProps {
   analyzedSyllabus: SyllabusAnalysisResponse | null;
   onNavigate: (tab: NavigationTab) => void;
   examDate?: string;
+  onPlanUpdated?: (plan: StudyPlanResponse) => void;
 }
 
 export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
   analyzedSyllabus,
   onNavigate,
-  examDate = '25 Apr 2026',
+  examDate = '2026-05-15',
+  onPlanUpdated,
 }) => {
+  const [plan, setPlan] = useState<StudyPlanResponse | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isRescheduling, setIsRescheduling] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
   const [viewMode, setViewMode] = useState<'daily' | 'weekly'>('daily');
-  const [selectedDayIndex, setSelectedDayIndex] = useState(1); // Tue 22
+  const [selectedDate, setSelectedDate] = useState<string>('');
 
-  const days = [
-    { name: 'Mon', date: '21' },
-    { name: 'Tue', date: '22' },
-    { name: 'Wed', date: '23' },
-    { name: 'Thu', date: '24' },
-    { name: 'Fri', date: '25' },
-    { name: 'Sat', date: '26' },
-    { name: 'Sun', date: '27' },
-  ];
+  // Notes Modal State
+  const [activeNoteTask, setActiveNoteTask] = useState<TaskItemSchema | null>(null);
+  const [noteContent, setNoteContent] = useState('');
+  const [isSavingNote, setIsSavingNote] = useState(false);
 
-  // Derive initial tasks from analyzed topics or defaults
-  const initialTasks: StudyTaskItem[] = analyzedSyllabus?.modules[0]?.topics?.slice(0, 4).map((t, idx) => ({
-    id: t.id || `task_${idx+1}`,
-    title: t.title,
-    durationMinutes: t.estimated_minutes || 20,
-    type: idx % 3 === 0 ? 'Video' : idx % 3 === 1 ? 'Practice' : 'Study',
-    completed: idx === 0, // 1st completed by default for demonstration
-    topicId: t.id,
-  })) || [
-    { id: 't1', title: 'Introduction to Core Concepts', durationMinutes: 15, type: 'Video', completed: true },
-    { id: 't2', title: 'Syntax & Primitives Breakdown', durationMinutes: 20, type: 'Video', completed: false },
-    { id: 't3', title: 'Hands-on Practice Questions', durationMinutes: 30, type: 'Practice', completed: false },
-    { id: 't4', title: 'Concept Summary & Quick Revision', durationMinutes: 15, type: 'Study', completed: false },
-  ];
+  // Load existing study plan on mount
+  useEffect(() => {
+    let isMounted = true;
+    if (!analyzedSyllabus?.syllabus_id) {
+      setPlan(null);
+      return;
+    }
 
-  const [tasks, setTasks] = useState<StudyTaskItem[]>(initialTasks);
+    const loadPlan = async () => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const data = await apiService.getStudyPlan(analyzedSyllabus.syllabus_id);
+        if (isMounted) {
+          setPlan(data);
+          if (onPlanUpdated) onPlanUpdated(data);
+          // Set selectedDate to today or first day
+          const todayIso = new Date().toISOString().split('T')[0];
+          const hasToday = data.daily_schedules.some((d) => d.date === todayIso);
+          setSelectedDate(hasToday ? todayIso : data.daily_schedules[0]?.date || '');
+        }
+      } catch (err: any) {
+        if (isMounted && err instanceof ApiErrorResponse && err.status !== 404) {
+          setError(err.message);
+        }
+      } finally {
+        if (isMounted) setIsLoading(false);
+      }
+    };
 
-  const toggleTask = (taskId: string) => {
-    setTasks((prev) =>
-      prev.map((t) => (t.id === taskId ? { ...t, completed: !t.completed } : t))
-    );
+    loadPlan();
+    return () => {
+      isMounted = false;
+    };
+  }, [analyzedSyllabus?.syllabus_id]);
+
+  // Generate / Regenerate Study Plan
+  const handleGeneratePlan = async () => {
+    if (!analyzedSyllabus?.syllabus_id) return;
+    setIsGenerating(true);
+    setError(null);
+    try {
+      const data = await apiService.createStudyPlan(analyzedSyllabus.syllabus_id, {
+        exam_date: examDate,
+        daily_target_minutes: 120,
+        preserve_completed: true,
+      });
+      setPlan(data);
+      if (onPlanUpdated) onPlanUpdated(data);
+      const todayIso = new Date().toISOString().split('T')[0];
+      const hasToday = data.daily_schedules.some((d) => d.date === todayIso);
+      setSelectedDate(hasToday ? todayIso : data.daily_schedules[0]?.date || '');
+    } catch (err: any) {
+      setError(err.message || 'Failed to generate study timetable.');
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
-  const handleMarkAllCompleted = () => {
-    const allDone = tasks.every((t) => t.completed);
-    setTasks((prev) => prev.map((t) => ({ ...t, completed: !allDone })));
+  // Toggle task completion in real-time
+  const handleToggleTask = async (task: TaskItemSchema) => {
+    if (!plan) return;
+    const newCompleted = task.status !== 'completed';
+
+    // Optimistic UI update
+    setPlan((prev) => {
+      if (!prev) return prev;
+      const updatedSchedules = prev.daily_schedules.map((group) => {
+        const updatedTasks = group.tasks.map((t) =>
+          t.id === task.id ? { ...t, status: newCompleted ? ('completed' as const) : ('pending' as const) } : t
+        );
+        const compMin = updatedTasks.reduce(
+          (sum, t) => sum + (t.status === 'completed' ? t.duration_minutes : 0),
+          0
+        );
+        return { ...group, tasks: updatedTasks, completed_minutes: compMin };
+      });
+
+      const totalCompletedTasks = updatedSchedules.reduce(
+        (sum, g) => sum + g.tasks.filter((t) => t.status === 'completed').length,
+        0
+      );
+      const totalCompMinutes = updatedSchedules.reduce((sum, g) => sum + g.completed_minutes, 0);
+      const progress = prev.total_planned_minutes > 0
+        ? Math.round((totalCompMinutes / prev.total_planned_minutes) * 100)
+        : 0;
+
+      const nextPlan = {
+        ...prev,
+        daily_schedules: updatedSchedules,
+        completed_tasks_count: totalCompletedTasks,
+        completed_minutes: totalCompMinutes,
+        progress_percentage: progress,
+      };
+      if (onPlanUpdated) onPlanUpdated(nextPlan);
+      return nextPlan;
+    });
+
+    try {
+      await apiService.updateTaskStatus(plan.id, task.id, newCompleted);
+    } catch {
+      // Revert on failure
+      const refreshed = await apiService.getStudyPlan(plan.syllabus_id);
+      setPlan(refreshed);
+      if (onPlanUpdated) onPlanUpdated(refreshed);
+    }
   };
 
-  // Progress metrics
-  const completedCount = tasks.filter((t) => t.completed).length;
-  const progressPercent = tasks.length > 0 ? Math.round((completedCount / tasks.length) * 100) : 0;
+  // Reschedule missed sessions
+  const handleReschedule = async () => {
+    if (!plan) return;
+    setIsRescheduling(true);
+    setError(null);
+    try {
+      const updated = await apiService.reschedulePlan(plan.id);
+      setPlan(updated);
+      if (onPlanUpdated) onPlanUpdated(updated);
+    } catch (err: any) {
+      setError(err.message || 'Failed to reschedule missed tasks.');
+    } finally {
+      setIsRescheduling(false);
+    }
+  };
 
-  // SVG circular gauge calculations
+  // Open Notes Modal
+  const handleOpenNotes = (task: TaskItemSchema) => {
+    setActiveNoteTask(task);
+    setNoteContent(task.notes || '');
+  };
+
+  // Save Notes
+  const handleSaveNotes = async () => {
+    if (!plan || !activeNoteTask) return;
+    setIsSavingNote(true);
+    try {
+      await apiService.saveTaskNote(plan.id, activeNoteTask.id, noteContent);
+      setPlan((prev) => {
+        if (!prev) return prev;
+        const updatedSchedules = prev.daily_schedules.map((group) => ({
+          ...group,
+          tasks: group.tasks.map((t) =>
+            t.id === activeNoteTask.id ? { ...t, notes: noteContent } : t
+          ),
+        }));
+        const nextPlan = { ...prev, daily_schedules: updatedSchedules };
+        if (onPlanUpdated) onPlanUpdated(nextPlan);
+        return nextPlan;
+      });
+      setActiveNoteTask(null);
+    } catch (err: any) {
+      setError(err.message || 'Failed to save notes.');
+    } finally {
+      setIsSavingNote(false);
+    }
+  };
+
+  // Active Schedule Day
+  const activeDayGroup = plan?.daily_schedules.find((d) => d.date === selectedDate) 
+    || plan?.daily_schedules[0];
+
+  const activeTasks = activeDayGroup?.tasks || [];
+  const completedTodayCount = activeTasks.filter((t) => t.status === 'completed').length;
+  const progressPercentToday = activeTasks.length > 0 
+    ? Math.round((completedTodayCount / activeTasks.length) * 100) 
+    : 0;
+
+  // Check if any overdue uncompleted tasks exist before today
+  const todayIso = new Date().toISOString().split('T')[0];
+  const hasOverdueTasks = (plan?.daily_schedules || []).some(
+    (g) => g.date < todayIso && g.tasks.some((t) => t.status !== 'completed')
+  );
+
+  // SVG Gauge
   const radius = 38;
   const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (progressPercent / 100) * circumference;
+  const strokeDashoffset = circumference - (progressPercentToday / 100) * circumference;
 
   return (
-    <div className="space-y-6 max-w-6xl mx-auto">
-      {/* Header Row (Matches Reference Screen 6) */}
+    <div className="space-y-6 max-w-7xl mx-auto pb-16">
+      {/* Header Row */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight m-0">
@@ -85,205 +240,436 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
           </p>
         </div>
 
-        {/* Exam Date Badge */}
-        <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#0e1a38] border border-[#1e3262] text-xs font-semibold text-blue-300 self-start sm:self-auto">
-          <CalendarDays className="w-4 h-4 text-blue-400" />
-          <span>Exam Date: {examDate}</span>
+        <div className="flex flex-wrap items-center gap-2.5">
+          {/* Exam Date Pill */}
+          <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#0e1a38] border border-[#1e3262] text-xs font-semibold text-blue-300">
+            <CalendarDays className="w-4 h-4 text-blue-400" />
+            <span>Exam Date: {plan?.exam_date || examDate}</span>
+          </div>
+
+          {analyzedSyllabus && plan && (
+            <button
+              onClick={handleGeneratePlan}
+              disabled={isGenerating}
+              className="px-3.5 py-1.5 rounded-xl bg-[#0b1429] hover:bg-[#132247] border border-[#1b2b52] text-xs font-semibold text-slate-200 hover:text-white transition cursor-pointer"
+            >
+              {isGenerating ? 'Regenerating...' : 'Regenerate Plan'}
+            </button>
+          )}
         </div>
       </div>
 
-      {!analyzedSyllabus && (
-        <div className="flex items-center justify-between p-3 rounded-xl bg-blue-950/30 border border-blue-800/40 text-xs text-blue-200">
-          <span>Using sample curriculum tasks. Upload your syllabus to generate your personalized timetable.</span>
-          <button 
-            onClick={() => onNavigate('syllabus')}
-            className="px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium ml-3 shrink-0 cursor-pointer"
+      {/* Error Alert */}
+      {error && (
+        <div className="rounded-xl bg-rose-950/40 border border-rose-800/60 p-3.5 text-xs text-rose-300 flex items-center justify-between">
+          <span>{error}</span>
+          <button onClick={() => setError(null)} className="text-rose-400 hover:text-rose-200">Dismiss</button>
+        </div>
+      )}
+
+      {/* Feasibility Warning Banner */}
+      {plan?.feasibility_status === 'impossible' && (
+        <div className="rounded-2xl bg-rose-950/30 border border-rose-600/50 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-xl bg-rose-600/20 border border-rose-500/40 flex items-center justify-center text-rose-400 shrink-0">
+              <AlertTriangle className="w-5 h-5" />
+            </div>
+            <div>
+              <h4 className="text-sm font-bold text-rose-200 m-0">Impossible Deadline Warning</h4>
+              <p className="text-xs text-rose-300/90 m-0 mt-0.5 leading-relaxed">
+                {plan.feasibility_warning}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => onNavigate('settings')}
+            className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold shrink-0 cursor-pointer shadow transition"
           >
-            Go to Syllabus
+            Adjust Availability in Settings
           </button>
         </div>
       )}
 
-      {/* View Toggle & Weekdays Row (Matches Reference Screen 6) */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-3 rounded-2xl bg-[#0b1429] border border-[#18284e]">
-        {/* Daily / Weekly Toggle */}
-        <div className="flex items-center p-1 bg-[#070e20] border border-[#1b2b54] rounded-xl self-start sm:self-auto">
-          <button
-            onClick={() => setViewMode('daily')}
-            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
-              viewMode === 'daily'
-                ? 'bg-blue-600 text-white shadow-xs'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            Daily View
-          </button>
-          <button
-            onClick={() => setViewMode('weekly')}
-            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
-              viewMode === 'weekly'
-                ? 'bg-blue-600 text-white shadow-xs'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            Weekly View
-          </button>
+      {plan?.feasibility_status === 'tight' && (
+        <div className="rounded-2xl bg-amber-950/30 border border-amber-600/50 p-4 flex items-center gap-3 text-xs text-amber-200">
+          <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
+          <span>{plan.feasibility_warning}</span>
         </div>
+      )}
 
-        {/* Days of the Week Selector */}
-        <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto pb-1 sm:pb-0">
-          {days.map((day, idx) => {
-            const isSelected = selectedDayIndex === idx;
-
-            return (
-              <button
-                key={day.name}
-                onClick={() => setSelectedDayIndex(idx)}
-                className={`flex flex-col items-center justify-center w-12 py-2 rounded-xl transition cursor-pointer border ${
-                  isSelected
-                    ? 'bg-blue-600 border-blue-500 text-white shadow-md shadow-blue-600/30'
-                    : 'bg-[#070e20] border-[#18284e] text-slate-400 hover:text-white hover:bg-[#0e1935]'
-                }`}
-              >
-                <span className="text-[10px] font-medium leading-tight">{day.name}</span>
-                <span className="text-sm font-bold mt-0.5">{day.date}</span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Two Column Layout: Today's Tasks (Left) & Study Progress (Right) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-        {/* Left Column: Today's Tasks (8 cols) */}
-        <div className="lg:col-span-8 rounded-2xl bg-[#0b1429] border border-[#18284e] p-5 sm:p-6 space-y-4">
-          <div className="flex items-center justify-between pb-3 border-b border-[#18284e]">
-            <div className="flex items-center gap-2">
-              <ListTodo className="w-5 h-5 text-blue-400" />
-              <h3 className="text-sm sm:text-base font-bold text-white m-0">
-                Today's Tasks ({tasks.length})
-              </h3>
-            </div>
-
-            <button
-              onClick={handleMarkAllCompleted}
-              className="text-xs font-semibold text-blue-400 hover:text-blue-300 transition cursor-pointer"
-            >
-              {tasks.every((t) => t.completed) ? 'Reset Tasks' : '+ Mark All Completed'}
-            </button>
-          </div>
-
-          {/* Task List */}
-          <div className="space-y-3">
-            {tasks.map((task, idx) => (
-              <div
-                key={task.id}
-                onClick={() => toggleTask(task.id)}
-                className={`p-3.5 rounded-xl border transition cursor-pointer flex items-center justify-between gap-3 ${
-                  task.completed
-                    ? 'bg-[#081226]/60 border-emerald-900/40 text-slate-400'
-                    : 'bg-[#070e20] border-[#162548] hover:border-[#223869] text-white'
-                }`}
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  <div
-                    className={`w-5 h-5 rounded-md flex items-center justify-center transition border ${
-                      task.completed
-                        ? 'bg-emerald-500 border-emerald-500 text-white'
-                        : 'border-slate-600 bg-[#0c162e]'
-                    }`}
-                  >
-                    {task.completed && <Check className="w-3.5 h-3.5" />}
-                  </div>
-
-                  <div className="min-w-0">
-                    <p
-                      className={`text-xs sm:text-sm font-semibold truncate m-0 ${
-                        task.completed ? 'line-through text-slate-400' : 'text-slate-100'
-                      }`}
-                    >
-                      {idx + 1}. {task.title}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2 shrink-0">
-                  <span className="text-[11px] text-slate-400 font-mono">
-                    ({task.durationMinutes} min)
-                  </span>
-
-                  <span
-                    className={`text-[10px] font-semibold px-2 py-0.5 rounded-md border ${
-                      task.type === 'Video'
-                        ? 'bg-blue-950/40 text-blue-300 border-blue-800/40'
-                        : task.type === 'Practice'
-                        ? 'bg-purple-950/40 text-purple-300 border-purple-800/40'
-                        : 'bg-emerald-950/40 text-emerald-300 border-emerald-800/40'
-                    }`}
-                  >
-                    {task.type}
-                  </span>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Right Column: Progress Radial Gauge & Motivation Card (4 cols) */}
-        <div className="lg:col-span-4 space-y-5">
-          {/* Study Progress Card */}
-          <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-5 text-center space-y-4">
-            <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider m-0">
-              Study Progress
-            </h4>
-
-            {/* Circular Gauge */}
-            <div className="relative w-28 h-28 mx-auto flex items-center justify-center">
-              <svg className="w-full h-full -rotate-90" viewBox="0 0 100 100">
-                <circle
-                  cx="50"
-                  cy="50"
-                  r={radius}
-                  stroke="#162548"
-                  strokeWidth="8"
-                  fill="none"
-                />
-                <circle
-                  cx="50"
-                  cy="50"
-                  r={radius}
-                  stroke="#3b82f6"
-                  strokeWidth="8"
-                  strokeDasharray={circumference}
-                  strokeDashoffset={strokeDashoffset}
-                  strokeLinecap="round"
-                  fill="none"
-                  className="transition-all duration-500 ease-out"
-                />
-              </svg>
-              <div className="absolute inset-0 flex flex-col items-center justify-center">
-                <span className="text-xl font-extrabold text-white">{progressPercent}%</span>
-              </div>
-            </div>
-
-            <div>
-              <p className="text-xs font-bold text-white m-0">Today's Progress</p>
-              <p className="text-[11px] text-slate-400 mt-0.5 m-0">
-                {completedCount} of {tasks.length} tasks completed
-              </p>
-            </div>
-          </div>
-
-          {/* Motivation Card with Sprouting Seedling (Matches Reference Screen 6) */}
-          <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-5 text-center space-y-2">
-            <SproutingPlantIllustration className="w-16 h-16 mx-auto" />
-            <h4 className="text-xs font-bold text-white m-0">Consistency builds confidence!</h4>
-            <p className="text-[11px] text-slate-400 m-0 leading-relaxed">
-              Complete your daily tasks to stay on track before exam day.
+      {/* Missed Day Recovery Banner */}
+      {hasOverdueTasks && (
+        <div className="rounded-2xl bg-blue-950/30 border border-blue-500/40 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <RotateCcw className="w-4 h-4 text-blue-400 shrink-0" />
+            <p className="text-xs text-blue-200 m-0">
+              You have unfinished tasks from previous days. Redistribute them into future available study slots?
             </p>
           </div>
+          <button
+            onClick={handleReschedule}
+            disabled={isRescheduling}
+            className="px-4 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shrink-0 cursor-pointer shadow transition flex items-center gap-1.5"
+          >
+            <RotateCcw className={`w-3.5 h-3.5 ${isRescheduling ? 'animate-spin' : ''}`} />
+            <span>{isRescheduling ? 'Rescheduling...' : 'Reschedule Missed Sessions'}</span>
+          </button>
         </div>
-      </div>
+      )}
+
+      {/* Empty State: No Syllabus */}
+      {!analyzedSyllabus && (
+        <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-8 text-center space-y-4">
+          <div className="w-14 h-14 rounded-2xl bg-blue-600/15 border border-blue-500/30 text-blue-400 flex items-center justify-center mx-auto">
+            <ListTodo className="w-7 h-7" />
+          </div>
+          <div className="space-y-1 max-w-md mx-auto">
+            <h3 className="text-base font-bold text-white m-0">Upload Syllabus to Generate Plan</h3>
+            <p className="text-xs text-slate-400 m-0">
+              Your personalized timetable will map out daily study blocks, matched video lessons, and practice questions once your syllabus is parsed.
+            </p>
+          </div>
+          <button
+            onClick={() => onNavigate('syllabus')}
+            className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-md shadow-blue-600/30 transition cursor-pointer"
+          >
+            Go to My Syllabus
+          </button>
+        </div>
+      )}
+
+      {/* Empty State: Syllabus Exists but Plan not yet created */}
+      {analyzedSyllabus && !plan && !isLoading && (
+        <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-8 text-center space-y-4">
+          <div className="w-14 h-14 rounded-2xl bg-blue-600/15 border border-blue-500/30 text-blue-400 flex items-center justify-center mx-auto">
+            <Sparkles className="w-7 h-7" />
+          </div>
+          <div className="space-y-1 max-w-lg mx-auto">
+            <h3 className="text-base font-bold text-white m-0">
+              Ready to Build Your Study Roadmap
+            </h3>
+            <p className="text-xs text-slate-400 m-0">
+              Generate a timetable based on {analyzedSyllabus.total_topics_count} verified topics, targeting your exam on {examDate}.
+            </p>
+          </div>
+          <button
+            onClick={handleGeneratePlan}
+            disabled={isGenerating}
+            className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-lg shadow-blue-600/30 transition cursor-pointer"
+          >
+            <Sparkles className="w-4 h-4 text-cyan-300" />
+            <span>{isGenerating ? 'Building Schedule...' : 'Generate Personalized Study Plan'}</span>
+          </button>
+        </div>
+      )}
+
+      {isLoading && (
+        <div className="p-12 text-center rounded-2xl bg-[#0b1429] border border-[#18284e] space-y-2">
+          <Loader2 className="w-8 h-8 text-blue-400 animate-spin mx-auto" />
+          <p className="text-xs text-slate-400">Loading your study roadmap...</p>
+        </div>
+      )}
+
+      {/* Main Schedule Content */}
+      {plan && !isLoading && (
+        <>
+          {/* View Toggle & Calendar Days Bar */}
+          <div className="p-3.5 rounded-2xl bg-[#0b1429] border border-[#18284e] flex flex-col md:flex-row md:items-center justify-between gap-4">
+            {/* View Mode Toggle */}
+            <div className="flex items-center p-1 bg-[#070e20] border border-[#1b2b54] rounded-xl self-start">
+              <button
+                onClick={() => setViewMode('daily')}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                  viewMode === 'daily'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Daily View
+              </button>
+              <button
+                onClick={() => setViewMode('weekly')}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                  viewMode === 'weekly'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Weekly View
+              </button>
+            </div>
+
+            {/* Date Selector Row */}
+            <div className="flex items-center gap-2 overflow-x-auto pb-1 max-w-full">
+              {plan.daily_schedules.map((group) => {
+                const isSelected = group.date === selectedDate;
+                const isAllCompleted = group.tasks.length > 0 && group.tasks.every((t) => t.status === 'completed');
+
+                return (
+                  <button
+                    key={group.date}
+                    onClick={() => setSelectedDate(group.date)}
+                    className={`flex flex-col items-center justify-center min-w-[56px] py-2 px-2.5 rounded-xl transition cursor-pointer shrink-0 border ${
+                      isSelected
+                        ? 'bg-blue-600 text-white border-blue-500 shadow-md shadow-blue-600/30'
+                        : group.is_today
+                        ? 'bg-[#111e3b] text-blue-300 border-blue-500/40 hover:bg-[#162548]'
+                        : 'bg-[#070e20] text-slate-400 border-[#18284e] hover:border-slate-700 hover:text-slate-200'
+                    }`}
+                  >
+                    <span className="text-[10px] font-semibold uppercase">{group.day_name}</span>
+                    <span className="text-sm font-extrabold mt-0.5">{group.formatted_date.split(' ')[0]}</span>
+                    {isAllCompleted && (
+                      <CheckCircle2 className="w-3 h-3 text-emerald-400 mt-0.5" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Two-Column Workspace */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            {/* Left Column: Tasks List (8 cols) */}
+            <div className="lg:col-span-8 rounded-2xl bg-[#0b1429] border border-[#18284e] p-5 sm:p-6 space-y-4 shadow-md">
+              <div className="flex items-center justify-between border-b border-[#18284e] pb-3">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base font-bold text-white m-0">
+                    Tasks for {activeDayGroup?.formatted_date || 'Today'}
+                  </h3>
+                  <span className="text-xs text-blue-400 font-medium px-2 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/20">
+                    {activeTasks.length} {activeTasks.length === 1 ? 'task' : 'tasks'}
+                  </span>
+                </div>
+
+                <span className="text-xs text-slate-400">
+                  {activeDayGroup?.total_minutes || 0} min total planned
+                </span>
+              </div>
+
+              {/* Tasks List */}
+              <div className="space-y-3 pt-1">
+                {activeTasks.length === 0 ? (
+                  <div className="p-8 text-center text-xs text-slate-400 bg-[#070e20] rounded-xl border border-[#18284e]">
+                    No study tasks scheduled for this date. Rest day or revision!
+                  </div>
+                ) : (
+                  activeTasks.map((task) => {
+                    const isCompleted = task.status === 'completed';
+
+                    return (
+                      <div
+                        key={task.id}
+                        className={`p-3.5 rounded-xl border transition flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                          isCompleted
+                            ? 'bg-[#070e20]/60 border-[#152342] opacity-80'
+                            : 'bg-[#091122] border-[#18284e] hover:border-blue-500/40 shadow-xs'
+                        }`}
+                      >
+                        <div className="flex items-start gap-3">
+                          {/* Checkbox */}
+                          <button
+                            onClick={() => handleToggleTask(task)}
+                            className={`w-5 h-5 rounded-md border flex items-center justify-center shrink-0 mt-0.5 transition cursor-pointer ${
+                              isCompleted
+                                ? 'bg-emerald-600 border-emerald-500 text-white'
+                                : 'border-[#2d4272] hover:border-blue-400 bg-[#070e20]'
+                            }`}
+                            title={isCompleted ? 'Mark pending' : 'Mark completed'}
+                          >
+                            {isCompleted && <Check className="w-3.5 h-3.5" />}
+                          </button>
+
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                              {/* Task Type Pill */}
+                              <span
+                                className={`text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider ${
+                                  task.task_type === 'Video'
+                                    ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+                                    : task.task_type === 'Practice'
+                                    ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                                    : 'bg-blue-500/15 text-blue-300 border border-blue-500/30'
+                                }`}
+                              >
+                                {task.task_type}
+                              </span>
+
+                              <span className="text-[11px] text-slate-400 flex items-center gap-1 font-mono">
+                                <Clock className="w-3 h-3 text-slate-500" />
+                                {task.duration_minutes} min
+                              </span>
+
+                              {task.notes && (
+                                <span className="text-[10px] text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded-sm">
+                                  Notes saved
+                                </span>
+                              )}
+                            </div>
+
+                            <p
+                              className={`text-xs font-semibold m-0 leading-snug ${
+                                isCompleted ? 'line-through text-slate-500' : 'text-white'
+                              }`}
+                            >
+                              {task.title}
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Actions */}
+                        <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+                          {task.video_url && (
+                            <button
+                              onClick={() => window.open(task.video_url, '_blank')}
+                              className="px-2.5 py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/30 text-[11px] font-medium flex items-center gap-1 cursor-pointer transition"
+                              title="Watch Lecture"
+                            >
+                              <span>Lecture</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </button>
+                          )}
+
+                          <button
+                            onClick={() => handleOpenNotes(task)}
+                            className="px-2.5 py-1.5 rounded-lg bg-[#111e3b] hover:bg-[#182c56] text-slate-300 border border-[#1b2f5c] text-[11px] font-medium flex items-center gap-1 cursor-pointer transition"
+                            title="Open Study Notes"
+                          >
+                            <FileText className="w-3 h-3 text-blue-400" />
+                            <span>Notes</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            {/* Right Column: Gauges & Motivation (4 cols) */}
+            <div className="lg:col-span-4 space-y-4">
+              {/* Daily Progress Radial Gauge Card */}
+              <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-5 text-center space-y-4 shadow-md">
+                <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider m-0">
+                  Daily Workload Gauge
+                </h4>
+
+                {/* Circular Gauge */}
+                <div className="relative w-28 h-28 mx-auto flex items-center justify-center">
+                  <svg className="w-full h-full -rotate-90" viewBox="0 0 100 100">
+                    <circle
+                      cx="50"
+                      cy="50"
+                      r={radius}
+                      stroke="#162548"
+                      strokeWidth="8"
+                      fill="none"
+                    />
+                    <circle
+                      cx="50"
+                      cy="50"
+                      r={radius}
+                      stroke="#3b82f6"
+                      strokeWidth="8"
+                      strokeDasharray={circumference}
+                      strokeDashoffset={strokeDashoffset}
+                      strokeLinecap="round"
+                      fill="none"
+                      className="transition-all duration-500 ease-out"
+                    />
+                  </svg>
+                  <div className="absolute inset-0 flex flex-col items-center justify-center">
+                    <span className="text-xl font-extrabold text-white">{progressPercentToday}%</span>
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-xs font-bold text-white m-0">Today's Progress</p>
+                  <p className="text-[11px] text-slate-400 mt-0.5 m-0">
+                    {completedTodayCount} of {activeTasks.length} tasks completed
+                  </p>
+                </div>
+
+                {/* Overall Course Plan Progress Bar */}
+                <div className="pt-2 border-t border-[#18284e] space-y-1.5 text-left">
+                  <div className="flex justify-between text-[11px] text-slate-400">
+                    <span>Course Roadmap Progress</span>
+                    <span className="font-mono text-blue-400 font-bold">{plan.progress_percentage}%</span>
+                  </div>
+                  <div className="w-full h-1.5 rounded-full bg-[#132247] overflow-hidden">
+                    <div
+                      className="h-full bg-blue-500 rounded-full transition-all duration-500"
+                      style={{ width: `${plan.progress_percentage}%` }}
+                    />
+                  </div>
+                  <div className="flex justify-between text-[10px] text-slate-500">
+                    <span>{plan.completed_tasks_count} / {plan.total_tasks_count} tasks</span>
+                    <span>{Math.round(plan.completed_minutes / 60)}h / {Math.round(plan.total_planned_minutes / 60)}h</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Motivation Card */}
+              <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-5 text-center space-y-2 shadow-md">
+                <SproutingPlantIllustration className="w-16 h-16 mx-auto" />
+                <h4 className="text-xs font-bold text-white m-0">Consistency builds confidence!</h4>
+                <p className="text-[11px] text-slate-400 m-0 leading-relaxed">
+                  Complete your daily study block to maintain continuous momentum before exam day.
+                </p>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Task Notes Modal */}
+      {activeNoteTask && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xs">
+          <div className="rounded-2xl bg-[#0c162e] border border-[#1e305e] max-w-lg w-full p-6 space-y-4 shadow-2xl relative">
+            <button
+              onClick={() => setActiveNoteTask(null)}
+              className="absolute top-4 right-4 p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-[#162548] cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div>
+              <div className="flex items-center gap-2">
+                <FileText className="w-4 h-4 text-blue-400" />
+                <h3 className="text-base font-bold text-white m-0">Study Notes</h3>
+              </div>
+              <p className="text-xs text-slate-400 mt-1 m-0">
+                {activeNoteTask.title}
+              </p>
+            </div>
+
+            <textarea
+              value={noteContent}
+              onChange={(e) => setNoteContent(e.target.value)}
+              placeholder="Record your insights, formulas, code snippets, or revision questions..."
+              rows={6}
+              className="w-full p-3 rounded-xl bg-[#070e20] border border-[#1b2b52] text-xs text-white placeholder-slate-500 focus:outline-hidden focus:border-blue-500 resize-none font-sans leading-relaxed"
+            />
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-[#18284e]">
+              <button
+                onClick={() => setActiveNoteTask(null)}
+                className="px-4 py-2 rounded-xl bg-[#0f1b36] hover:bg-[#182c56] text-slate-300 text-xs font-medium cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveNotes}
+                disabled={isSavingNote}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-md cursor-pointer"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>{isSavingNote ? 'Saving...' : 'Save Notes'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Check, 
   Calendar, 
@@ -8,9 +8,11 @@ import {
   ShieldCheck, 
   ChevronDown,
   Sparkles,
-  Save
+  Save,
+  Loader2
 } from 'lucide-react';
 import type { HealthResponse, UserPreferences } from '../types';
+import { apiService } from '../services/api';
 
 interface SettingsPageProps {
   health: HealthResponse | null;
@@ -22,7 +24,7 @@ const DEFAULT_PREFERENCES: UserPreferences = {
   preferredLanguage: 'English',
   lessonStyle: 'In-depth',
   dailyStudyAvailability: '2-4 hours',
-  examDate: '2026-04-25',
+  examDate: '2026-05-15',
   theme: 'dark',
   studyReminders: true,
   deadlineAlerts: true,
@@ -36,18 +38,74 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
 }) => {
   const [formData, setFormData] = useState<UserPreferences>(preferences);
   const [isSaved, setIsSaved] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [showSystemDetails, setShowSystemDetails] = useState(false);
 
-  const handleSave = () => {
+  // Sync with backend SQLite on mount
+  useEffect(() => {
+    let isMounted = true;
+    const fetchBackendSettings = async () => {
+      try {
+        const backendSettings = await apiService.getSettings();
+        if (isMounted) {
+          const mapped: UserPreferences = {
+            preferredLanguage: backendSettings.preferred_language,
+            lessonStyle: backendSettings.lesson_style,
+            dailyStudyAvailability: backendSettings.daily_study_availability,
+            examDate: backendSettings.exam_date,
+            theme: backendSettings.theme,
+            studyReminders: backendSettings.study_reminders,
+            deadlineAlerts: backendSettings.deadline_alerts,
+            autoSaveProgress: backendSettings.auto_save_progress,
+          };
+          setFormData(mapped);
+          if (onSavePreferences) onSavePreferences(mapped);
+        }
+      } catch {
+        // Fallback to local state if backend unreachable
+      }
+    };
+
+    fetchBackendSettings();
+    return () => { isMounted = false; };
+  }, []);
+
+  const handleSave = async () => {
+    setIsSaving(true);
+    // Convert availability string to target minutes
+    let targetMin = 120;
+    if (formData.dailyStudyAvailability.includes('30-60')) targetMin = 60;
+    else if (formData.dailyStudyAvailability.includes('1-2')) targetMin = 90;
+    else if (formData.dailyStudyAvailability.includes('2-4')) targetMin = 180;
+    else if (formData.dailyStudyAvailability.includes('4+')) targetMin = 240;
+
+    try {
+      await apiService.updateSettings({
+        preferred_language: formData.preferredLanguage,
+        lesson_style: formData.lessonStyle,
+        daily_study_availability: formData.dailyStudyAvailability,
+        daily_target_minutes: targetMin,
+        exam_date: formData.examDate,
+        study_days: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        theme: formData.theme,
+        study_reminders: formData.studyReminders,
+        deadline_alerts: formData.deadlineAlerts,
+        auto_save_progress: formData.autoSaveProgress,
+      });
+    } catch {
+      // Continue to local save
+    }
+
     if (onSavePreferences) {
       onSavePreferences(formData);
     }
-    // Also save in localStorage
     try {
       localStorage.setItem('syllabussync_user_preferences', JSON.stringify(formData));
     } catch {
-      // Ignore localStorage errors
+      // Ignore
     }
+
+    setIsSaving(false);
     setIsSaved(true);
     setTimeout(() => setIsSaved(false), 3000);
   };
@@ -287,10 +345,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
             )}
             <button
               onClick={handleSave}
-              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-lg shadow-blue-600/25 transition cursor-pointer"
+              disabled={isSaving}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-semibold shadow-lg shadow-blue-600/25 transition cursor-pointer"
             >
-              <Save className="w-3.5 h-3.5" />
-              <span>Save Settings</span>
+              {isSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+              <span>{isSaving ? 'Saving...' : 'Save Settings'}</span>
             </button>
           </div>
         </div>

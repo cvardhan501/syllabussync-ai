@@ -177,6 +177,80 @@ export interface ReplaceChannelRequest {
   reason?: string;
 }
 
+export interface TaskItemSchema {
+  id: string;
+  plan_id: string;
+  syllabus_id: string;
+  module_id: string;
+  module_title?: string;
+  topic_id: string;
+  topic_title?: string;
+  scheduled_date: string;
+  title: string;
+  task_type: 'Video' | 'Practice' | 'Study';
+  duration_minutes: number;
+  video_id?: string;
+  video_url?: string;
+  status: 'pending' | 'completed';
+  completed_at?: string;
+  notes?: string;
+  order_index: number;
+}
+
+export interface DailyScheduleGroup {
+  date: string;
+  day_name: string;
+  formatted_date: string;
+  total_minutes: number;
+  completed_minutes: number;
+  is_today: boolean;
+  tasks: TaskItemSchema[];
+}
+
+export interface StudyPlanCreateRequest {
+  exam_date: string;
+  daily_target_minutes?: number;
+  preferred_days?: string[];
+  start_date?: string;
+  preserve_completed?: boolean;
+}
+
+export interface StudyPlanResponse {
+  id: string;
+  syllabus_id: string;
+  course_name?: string;
+  title: string;
+  exam_date: string;
+  daily_target_minutes: number;
+  preferred_days: string[];
+  feasibility_status: 'feasible' | 'tight' | 'impossible';
+  shortfall_minutes: number;
+  shortfall_hours: number;
+  feasibility_warning: string;
+  total_planned_minutes: number;
+  completed_minutes: number;
+  progress_percentage: number;
+  total_tasks_count: number;
+  completed_tasks_count: number;
+  daily_schedules: DailyScheduleGroup[];
+  created_at: string;
+  updated_at: string;
+  message: string;
+}
+
+export interface UserSettingsSchema {
+  preferred_language: string;
+  lesson_style: string;
+  daily_study_availability: string;
+  daily_target_minutes: number;
+  exam_date: string;
+  study_days: string[];
+  theme: 'dark' | 'light';
+  study_reminders: boolean;
+  deadline_alerts: boolean;
+  auto_save_progress: boolean;
+}
+
 export interface UserPreferences {
   preferredLanguage: string;
   lessonStyle: string;

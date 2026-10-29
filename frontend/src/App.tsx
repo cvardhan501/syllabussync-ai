@@ -21,9 +21,11 @@ import type {
   HealthResponse, 
   SyllabusUploadResponse, 
   SyllabusAnalysisResponse,
-  UserPreferences 
+  UserPreferences,
+  StudyPlanResponse,
+  ResourceDiscoveryResponse 
 } from './types';
-import { apiService } from './services/api';
+import { apiService, ApiErrorResponse } from './services/api';
 
 const DEFAULT_PREFERENCES: UserPreferences = {
   preferredLanguage: 'English',
@@ -44,6 +46,8 @@ export const App: React.FC = () => {
   const [healthError, setHealthError] = useState<string | null>(null);
   const [uploadedSyllabus, setUploadedSyllabus] = useState<SyllabusUploadResponse | null>(null);
   const [analyzedSyllabus, setAnalyzedSyllabus] = useState<SyllabusAnalysisResponse | null>(null);
+  const [studyPlan, setStudyPlan] = useState<StudyPlanResponse | null>(null);
+  const [discoveryData, setDiscoveryData] = useState<ResourceDiscoveryResponse | null>(null);
   const [preferences, setPreferences] = useState<UserPreferences>(() => {
     try {
       const saved = localStorage.getItem('syllabussync_user_preferences');
@@ -93,6 +97,41 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  // Fetch active study plan and discovery resources when syllabus changes
+  useEffect(() => {
+    let isMounted = true;
+    if (!analyzedSyllabus?.syllabus_id) {
+      setStudyPlan(null);
+      setDiscoveryData(null);
+      return;
+    }
+
+    const loadData = async () => {
+      try {
+        const plan = await apiService.getStudyPlan(analyzedSyllabus.syllabus_id);
+        if (isMounted) setStudyPlan(plan);
+      } catch (err: any) {
+        if (isMounted && err instanceof ApiErrorResponse && err.status === 404) {
+          setStudyPlan(null);
+        }
+      }
+
+      try {
+        const resources = await apiService.getResources(analyzedSyllabus.syllabus_id);
+        if (isMounted) setDiscoveryData(resources);
+      } catch (err: any) {
+        if (isMounted && err instanceof ApiErrorResponse && err.status === 404) {
+          setDiscoveryData(null);
+        }
+      }
+    };
+
+    loadData();
+    return () => {
+      isMounted = false;
+    };
+  }, [analyzedSyllabus?.syllabus_id]);
+
   const mobileNavItems: { id: NavigationTab; label: string; icon: React.FC<{ className?: string }> }[] = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'syllabus', label: 'Syllabus', icon: BookOpen },
@@ -136,6 +175,8 @@ export const App: React.FC = () => {
               onNavigate={setCurrentTab}
               uploadedSyllabus={uploadedSyllabus}
               analyzedSyllabus={analyzedSyllabus}
+              studyPlan={studyPlan}
+              discoveryData={discoveryData}
             />
           )}
 
@@ -154,6 +195,7 @@ export const App: React.FC = () => {
               analyzedSyllabus={analyzedSyllabus}
               onNavigateToSyllabus={() => setCurrentTab('syllabus')}
               preferredLanguage={preferences.preferredLanguage}
+              onDiscoveryUpdated={setDiscoveryData}
             />
           )}
 
@@ -162,6 +204,7 @@ export const App: React.FC = () => {
               analyzedSyllabus={analyzedSyllabus}
               onNavigate={setCurrentTab}
               examDate={preferences.examDate}
+              onPlanUpdated={setStudyPlan}
             />
           )}
 
@@ -169,6 +212,8 @@ export const App: React.FC = () => {
             <ProgressPage
               uploadedSyllabus={uploadedSyllabus}
               analyzedSyllabus={analyzedSyllabus}
+              studyPlan={studyPlan}
+              discoveryData={discoveryData}
               onNavigate={setCurrentTab}
             />
           )}

@@ -111,9 +111,76 @@ def init_db():
                 title TEXT NOT NULL,
                 exam_date TEXT,
                 daily_target_minutes INTEGER DEFAULT 60,
+                preferred_days_json TEXT DEFAULT '["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]',
+                start_date TEXT,
                 status TEXT DEFAULT 'active',
+                feasibility_status TEXT DEFAULT 'feasible',
+                shortfall_minutes INTEGER DEFAULT 0,
+                feasibility_warning TEXT,
+                total_planned_minutes INTEGER DEFAULT 0,
+                completed_minutes INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (syllabus_id) REFERENCES syllabi (id) ON DELETE CASCADE
+            )
+        """)
+
+        # Add missing columns to study_plans if migrating
+        cursor.execute("PRAGMA table_info(study_plans)")
+        existing_plan_cols = {col[1] for col in cursor.fetchall()}
+        for col_name, col_type in [
+            ("preferred_days_json", "TEXT DEFAULT '[\"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\", \"Sat\", \"Sun\"]'"),
+            ("start_date", "TEXT"),
+            ("feasibility_status", "TEXT DEFAULT 'feasible'"),
+            ("shortfall_minutes", "INTEGER DEFAULT 0"),
+            ("feasibility_warning", "TEXT"),
+            ("total_planned_minutes", "INTEGER DEFAULT 0"),
+            ("completed_minutes", "INTEGER DEFAULT 0"),
+            ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ]:
+            if col_name not in existing_plan_cols:
+                cursor.execute(f"ALTER TABLE study_plans ADD COLUMN {col_name} {col_type}")
+
+        # 4b. Study tasks table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS study_tasks (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                syllabus_id TEXT NOT NULL,
+                module_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                scheduled_date TEXT NOT NULL,
+                title TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                duration_minutes INTEGER NOT NULL,
+                video_id TEXT,
+                video_url TEXT,
+                status TEXT DEFAULT 'pending',
+                completed_at TIMESTAMP,
+                notes TEXT,
+                order_index INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (plan_id) REFERENCES study_plans (id) ON DELETE CASCADE,
+                FOREIGN KEY (syllabus_id) REFERENCES syllabi (id) ON DELETE CASCADE,
+                FOREIGN KEY (topic_id) REFERENCES topics (id) ON DELETE CASCADE
+            )
+        """)
+
+        # 4c. User settings table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                id TEXT PRIMARY KEY DEFAULT 'default_user',
+                preferred_language TEXT DEFAULT 'English',
+                lesson_style TEXT DEFAULT 'In-depth',
+                daily_study_availability TEXT DEFAULT '2-4 hours',
+                daily_target_minutes INTEGER DEFAULT 120,
+                exam_date TEXT DEFAULT '2026-05-15',
+                study_days_json TEXT DEFAULT '["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]',
+                theme TEXT DEFAULT 'dark',
+                study_reminders INTEGER DEFAULT 1,
+                deadline_alerts INTEGER DEFAULT 1,
+                auto_save_progress INTEGER DEFAULT 1,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -740,4 +807,317 @@ def set_third_channel_approved(syllabus_id: str, approved: bool) -> None:
             (0 if approved else 1, syllabus_id)
         )
         conn.commit()
+
+
+# ==============================================================================
+# Phase 4: Study Plan, Daily Tasks, Rescheduling & Settings Persistence
+# ==============================================================================
+
+def save_study_plan(plan: Dict[str, Any]) -> None:
+    """Saves or updates a study plan record in SQLite."""
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO study_plans
+            (id, syllabus_id, title, exam_date, daily_target_minutes, preferred_days_json,
+             start_date, status, feasibility_status, shortfall_minutes, feasibility_warning,
+             total_planned_minutes, completed_minutes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM study_plans WHERE id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
+            """,
+            (
+                plan["id"],
+                plan["syllabus_id"],
+                plan["title"],
+                plan["exam_date"],
+                plan.get("daily_target_minutes", 120),
+                json.dumps(plan.get("preferred_days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])),
+                plan.get("start_date"),
+                plan.get("status", "active"),
+                plan.get("feasibility_status", "feasible"),
+                plan.get("shortfall_minutes", 0),
+                plan.get("feasibility_warning", ""),
+                plan.get("total_planned_minutes", 0),
+                plan.get("completed_minutes", 0),
+                plan["id"],
+            )
+        )
+        conn.commit()
+
+
+def save_study_tasks(plan_id: str, tasks: List[Dict[str, Any]], preserve_completed: bool = True) -> None:
+    """
+    Saves daily study tasks. When preserve_completed=True, completed tasks and notes
+    are never deleted or overwritten during plan regeneration.
+    """
+    with get_db_connection() as conn:
+        if preserve_completed:
+            # Delete only pending tasks
+            conn.execute("DELETE FROM study_tasks WHERE plan_id = ? AND status != 'completed'", (plan_id,))
+        else:
+            conn.execute("DELETE FROM study_tasks WHERE plan_id = ?", (plan_id,))
+
+        for t in tasks:
+            # Check if this task was already completed
+            existing = conn.execute(
+                "SELECT status, completed_at, notes FROM study_tasks WHERE id = ?",
+                (t["id"],)
+            ).fetchone()
+
+            if existing and existing["status"] == "completed" and preserve_completed:
+                continue
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO study_tasks
+                (id, plan_id, syllabus_id, module_id, topic_id, scheduled_date, title,
+                 task_type, duration_minutes, video_id, video_url, status, completed_at, notes, order_index)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    t["id"],
+                    plan_id,
+                    t["syllabus_id"],
+                    t["module_id"],
+                    t["topic_id"],
+                    t["scheduled_date"],
+                    t["title"],
+                    t["task_type"],
+                    t["duration_minutes"],
+                    t.get("video_id"),
+                    t.get("video_url"),
+                    t.get("status", "pending"),
+                    t.get("completed_at"),
+                    t.get("notes") or (existing["notes"] if existing else None),
+                    t.get("order_index", 0),
+                )
+            )
+
+        # Recalculate completed & total minutes for the plan
+        stats = conn.execute(
+            """
+            SELECT 
+                COUNT(*) as total_tasks,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+                SUM(duration_minutes) as total_min,
+                SUM(CASE WHEN status = 'completed' THEN duration_minutes ELSE 0 END) as completed_min
+            FROM study_tasks WHERE plan_id = ?
+            """,
+            (plan_id,)
+        ).fetchone()
+
+        if stats:
+            conn.execute(
+                """
+                UPDATE study_plans 
+                SET total_planned_minutes = ?, completed_minutes = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (stats["total_min"] or 0, stats["completed_min"] or 0, plan_id)
+            )
+
+        conn.commit()
+
+
+def get_active_study_plan(syllabus_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves the active study plan for a syllabus."""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM study_plans WHERE syllabus_id = ? AND status = 'active' ORDER BY updated_at DESC LIMIT 1",
+            (syllabus_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+
+def get_study_plan_by_id(plan_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a study plan by its ID."""
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM study_plans WHERE id = ?", (plan_id,)).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+
+def get_plan_tasks(plan_id: str) -> List[Dict[str, Any]]:
+    """Retrieves all tasks for a study plan with module and topic titles."""
+    with get_db_connection() as conn:
+        query = """
+            SELECT 
+                st.*,
+                m.module_title,
+                t.topic_title
+            FROM study_tasks st
+            LEFT JOIN modules m ON st.module_id = m.id
+            LEFT JOIN topics t ON st.topic_id = t.id
+            WHERE st.plan_id = ?
+            ORDER BY st.scheduled_date ASC, st.order_index ASC
+        """
+        rows = conn.execute(query, (plan_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_task_completion(task_id: str, completed: bool) -> Optional[Dict[str, Any]]:
+    """Toggles task completion and updates parent plan progress metrics."""
+    with get_db_connection() as conn:
+        task = conn.execute("SELECT * FROM study_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            return None
+
+        new_status = "completed" if completed else "pending"
+        conn.execute(
+            """
+            UPDATE study_tasks
+            SET status = ?, completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END
+            WHERE id = ?
+            """,
+            (new_status, completed, task_id)
+        )
+
+        plan_id = task["plan_id"]
+        # Update parent plan
+        stats = conn.execute(
+            """
+            SELECT 
+                SUM(duration_minutes) as total_min,
+                SUM(CASE WHEN status = 'completed' THEN duration_minutes ELSE 0 END) as completed_min
+            FROM study_tasks WHERE plan_id = ?
+            """,
+            (plan_id,)
+        ).fetchone()
+
+        if stats:
+            conn.execute(
+                """
+                UPDATE study_plans
+                SET total_planned_minutes = ?, completed_minutes = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (stats["total_min"] or 0, stats["completed_min"] or 0, plan_id)
+            )
+
+        conn.commit()
+
+        # Return updated task
+        updated = conn.execute(
+            """
+            SELECT st.*, m.module_title, t.topic_title
+            FROM study_tasks st
+            LEFT JOIN modules m ON st.module_id = m.id
+            LEFT JOIN topics t ON st.topic_id = t.id
+            WHERE st.id = ?
+            """,
+            (task_id,)
+        ).fetchone()
+        return dict(updated) if updated else None
+
+
+def update_task_note(task_id: str, notes: str) -> Optional[Dict[str, Any]]:
+    """Saves student notes for a study task."""
+    with get_db_connection() as conn:
+        conn.execute("UPDATE study_tasks SET notes = ? WHERE id = ?", (notes, task_id))
+        conn.commit()
+        updated = conn.execute(
+            """
+            SELECT st.*, m.module_title, t.topic_title
+            FROM study_tasks st
+            LEFT JOIN modules m ON st.module_id = m.id
+            LEFT JOIN topics t ON st.topic_id = t.id
+            WHERE st.id = ?
+            """,
+            (task_id,)
+        ).fetchone()
+        return dict(updated) if updated else None
+
+
+def reschedule_plan_tasks(
+    plan_id: str,
+    rescheduled_tasks: List[Dict[str, Any]],
+    new_feasibility: Dict[str, Any],
+) -> None:
+    """Updates dates of rescheduled pending tasks and updates plan feasibility warning."""
+    with get_db_connection() as conn:
+        for t in rescheduled_tasks:
+            conn.execute(
+                """
+                UPDATE study_tasks
+                SET scheduled_date = ?, order_index = ?
+                WHERE id = ? AND status != 'completed'
+                """,
+                (t["scheduled_date"], t.get("order_index", 0), t["id"])
+            )
+
+        conn.execute(
+            """
+            UPDATE study_plans
+            SET feasibility_status = ?, shortfall_minutes = ?, feasibility_warning = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                new_feasibility.get("feasibility_status", "feasible"),
+                new_feasibility.get("shortfall_minutes", 0),
+                new_feasibility.get("feasibility_warning", ""),
+                plan_id,
+            )
+        )
+        conn.commit()
+
+
+def get_user_settings() -> Dict[str, Any]:
+    """Retrieves persisted student settings or default preferences."""
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM user_settings WHERE id = 'default_user'").fetchone()
+        if not row:
+            return {
+                "preferred_language": "English",
+                "lesson_style": "In-depth",
+                "daily_study_availability": "2-4 hours",
+                "daily_target_minutes": 120,
+                "exam_date": "2026-05-15",
+                "study_days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+                "theme": "dark",
+                "study_reminders": True,
+                "deadline_alerts": True,
+                "auto_save_progress": True,
+            }
+        return {
+            "preferred_language": row["preferred_language"],
+            "lesson_style": row["lesson_style"],
+            "daily_study_availability": row["daily_study_availability"],
+            "daily_target_minutes": row["daily_target_minutes"],
+            "exam_date": row["exam_date"],
+            "study_days": json.loads(row["study_days_json"] or '["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]'),
+            "theme": row["theme"],
+            "study_reminders": bool(row["study_reminders"]),
+            "deadline_alerts": bool(row["deadline_alerts"]),
+            "auto_save_progress": bool(row["auto_save_progress"]),
+        }
+
+
+def save_user_settings(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Persists student settings into SQLite."""
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO user_settings
+            (id, preferred_language, lesson_style, daily_study_availability, daily_target_minutes,
+             exam_date, study_days_json, theme, study_reminders, deadline_alerts, auto_save_progress, updated_at)
+            VALUES ('default_user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                data.get("preferred_language", "English"),
+                data.get("lesson_style", "In-depth"),
+                data.get("daily_study_availability", "2-4 hours"),
+                data.get("daily_target_minutes", 120),
+                data.get("exam_date", "2026-05-15"),
+                json.dumps(data.get("study_days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])),
+                data.get("theme", "dark"),
+                1 if data.get("study_reminders", True) else 0,
+                1 if data.get("deadline_alerts", True) else 0,
+                1 if data.get("auto_save_progress", True) else 0,
+            )
+        )
+        conn.commit()
+    return get_user_settings()
+
 

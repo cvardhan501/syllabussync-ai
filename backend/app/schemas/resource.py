@@ -114,3 +114,4 @@ class ReplaceChannelRequest(BaseModel):
 
 class ThirdChannelApprovalRequest(BaseModel):
     approve: bool = Field(default=True, description="Whether student approves introducing a 3rd channel")
+

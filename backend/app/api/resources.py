@@ -169,3 +169,4 @@ async def approve_third_channel(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         )
+

@@ -34,12 +34,14 @@ interface VideoLibraryPageProps {
   analyzedSyllabus: SyllabusAnalysisResponse | null;
   onNavigateToSyllabus: () => void;
   preferredLanguage?: string;
+  onDiscoveryUpdated?: (data: ResourceDiscoveryResponse) => void;
 }
 
 export const VideoLibraryPage: React.FC<VideoLibraryPageProps> = ({
   analyzedSyllabus,
   onNavigateToSyllabus,
   preferredLanguage = 'English',
+  onDiscoveryUpdated,
 }) => {
   const [discoveryData, setDiscoveryData] = useState<ResourceDiscoveryResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -80,6 +82,7 @@ export const VideoLibraryPage: React.FC<VideoLibraryPageProps> = ({
         const data = await apiService.getResources(analyzedSyllabus.syllabus_id);
         if (isMounted) {
           setDiscoveryData(data);
+          if (onDiscoveryUpdated) onDiscoveryUpdated(data);
         }
       } catch (err: any) {
         // If not found yet, leave data as null so user can trigger discovery
@@ -110,6 +113,7 @@ export const VideoLibraryPage: React.FC<VideoLibraryPageProps> = ({
         force_refresh: forceRefresh,
       });
       setDiscoveryData(data);
+      if (onDiscoveryUpdated) onDiscoveryUpdated(data);
     } catch (err: any) {
       setError(err.message || 'Failed to match educational videos.');
     } finally {
@@ -164,10 +168,12 @@ export const VideoLibraryPage: React.FC<VideoLibraryPageProps> = ({
         const updatedList = prev.topic_resources.map((tr) =>
           tr.topic_id === updatedMapping.topic_id ? updatedMapping : tr
         );
-        return {
+        const nextData = {
           ...prev,
           topic_resources: updatedList,
         };
+        if (onDiscoveryUpdated) onDiscoveryUpdated(nextData);
+        return nextData;
       });
 
       setReplaceTargetTopic(null);
@@ -186,6 +192,7 @@ export const VideoLibraryPage: React.FC<VideoLibraryPageProps> = ({
     try {
       const updated = await apiService.approveThirdChannel(analyzedSyllabus.syllabus_id);
       setDiscoveryData(updated);
+      if (onDiscoveryUpdated) onDiscoveryUpdated(updated);
     } catch (err: any) {
       setError(err.message || 'Failed to approve third channel.');
     } finally {

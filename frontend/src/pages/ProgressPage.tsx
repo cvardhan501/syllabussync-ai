@@ -15,40 +15,137 @@ import {
 import type { 
   NavigationTab, 
   SyllabusUploadResponse, 
-  SyllabusAnalysisResponse 
+  SyllabusAnalysisResponse,
+  StudyPlanResponse,
+  ResourceDiscoveryResponse 
 } from '../types';
 
 interface ProgressPageProps {
   uploadedSyllabus: SyllabusUploadResponse | null;
   analyzedSyllabus?: SyllabusAnalysisResponse | null;
+  studyPlan?: StudyPlanResponse | null;
+  discoveryData?: ResourceDiscoveryResponse | null;
   onNavigate: (tab: NavigationTab) => void;
 }
 
 export const ProgressPage: React.FC<ProgressPageProps> = ({
   uploadedSyllabus,
   analyzedSyllabus,
+  studyPlan,
+  discoveryData,
   onNavigate,
 }) => {
   const [timeRange, setTimeRange] = useState<'7days' | '30days' | 'all'>('7days');
   const [isFilterOpen, setIsFilterOpen] = useState(false);
 
-  // Derive real module data from analyzed syllabus if present, or provide standard curriculum placeholders
+  const hasRealSyllabus = Boolean(analyzedSyllabus || uploadedSyllabus);
+
+  // Real Metric 1: Coverage
+  const totalTopics = analyzedSyllabus?.total_topics_count || discoveryData?.coverage.total_topics || 0;
+  const coveragePercent = discoveryData?.coverage.coverage_percentage ?? 0;
+  const topicsWithVideos = discoveryData?.coverage.topics_with_relevant ?? 0;
+
+  // Real Metric 2: Study Progress
+  const totalTasks = studyPlan?.total_tasks_count || 0;
+  const completedTasks = studyPlan?.completed_tasks_count || 0;
+  const studyProgressPercent = studyPlan?.progress_percentage ?? 0;
+
+  // Real Metric 3: Learning Confidence (Practice Checkpoints)
+  // Check how many practice tasks were completed
+  const allTasks = (studyPlan?.daily_schedules || []).flatMap((g) => g.tasks);
+  const practiceTasks = allTasks.filter((t) => t.task_type === 'Practice');
+  const completedPractice = practiceTasks.filter((t) => t.status === 'completed');
+  const confidenceScore = practiceTasks.length > 0 
+    ? Math.round((completedPractice.length / practiceTasks.length) * 100) 
+    : 0;
+
+  // Real Metric 4: Exam Readiness
+  let readinessLabel = 'Not enough data';
+  let readinessSubtext = 'Requires active study roadmap';
+  if (studyPlan) {
+    if (studyPlan.feasibility_status === 'impossible') {
+      readinessLabel = 'Shortfall';
+      readinessSubtext = `-${studyPlan.shortfall_hours}h before exam`;
+    } else if (studyPlan.feasibility_status === 'tight') {
+      readinessLabel = 'Tight Pace';
+      readinessSubtext = `Target: ${studyPlan.exam_date}`;
+    } else if (studyPlan.progress_percentage >= 80) {
+      readinessLabel = 'High Readiness';
+      readinessSubtext = '80%+ workload mastered';
+    } else if (studyPlan.completed_tasks_count > 0) {
+      readinessLabel = 'On Track';
+      readinessSubtext = `${studyPlan.completed_tasks_count} tasks done`;
+    } else {
+      readinessLabel = 'Roadmap Ready';
+      readinessSubtext = `0 of ${studyPlan.total_tasks_count} tasks started`;
+    }
+  }
+
+  // Real Metric 5: Resource Gaps
+  const resourceGaps = discoveryData ? discoveryData.coverage.topics_with_no_resource : 0;
+
+  // Real Module-wise Progress Calculation
   const modulesList = analyzedSyllabus && analyzedSyllabus.modules.length > 0
-    ? analyzedSyllabus.modules.map((m, idx) => ({
-        id: m.id || `mod-${idx + 1}`,
-        title: `Module ${idx + 1}: ${m.title}`,
-        progress: 0,
-        topicCount: m.topics.length,
-      }))
+    ? analyzedSyllabus.modules.map((m, idx) => {
+        const modId = m.id;
+        const modTasks = allTasks.filter((t) => t.module_id === modId || t.module_id?.endsWith(modId));
+        const modCompleted = modTasks.filter((t) => t.status === 'completed').length;
+        const modProgress = modTasks.length > 0 ? Math.round((modCompleted / modTasks.length) * 100) : 0;
+
+        return {
+          id: m.id || `mod-${idx + 1}`,
+          title: `Module ${idx + 1}: ${m.title}`,
+          progress: modProgress,
+          completedTasks: modCompleted,
+          totalTasks: modTasks.length || m.topics.length,
+        };
+      })
     : [
-        { id: '1', title: 'Module 1: Introduction to Programming', progress: 0, topicCount: 8 },
-        { id: '2', title: 'Module 2: Data Structures and Algorithms', progress: 0, topicCount: 10 },
-        { id: '3', title: 'Module 3: Database Management Systems', progress: 0, topicCount: 8 },
-        { id: '4', title: 'Module 4: Computer Networks', progress: 0, topicCount: 7 },
-        { id: '5', title: 'Module 5: Web Technologies', progress: 0, topicCount: 6 },
+        { id: '1', title: 'Module 1: Introduction to Programming', progress: 0, completedTasks: 0, totalTasks: 8 },
+        { id: '2', title: 'Module 2: Data Structures and Algorithms', progress: 0, completedTasks: 0, totalTasks: 10 },
+        { id: '3', title: 'Module 3: Database Management Systems', progress: 0, completedTasks: 0, totalTasks: 8 },
+        { id: '4', title: 'Module 4: Computer Networks', progress: 0, completedTasks: 0, totalTasks: 7 },
+        { id: '5', title: 'Module 5: Web Technologies', progress: 0, completedTasks: 0, totalTasks: 6 },
       ];
 
-  const hasRealSyllabus = Boolean(analyzedSyllabus || uploadedSyllabus);
+  // Upcoming Pending Tasks
+  const todayIso = new Date().toISOString().split('T')[0];
+  const upcomingTasks = allTasks
+    .filter((t) => t.status === 'pending' && t.scheduled_date >= todayIso)
+    .slice(0, 3);
+
+  // Dynamic Next Recommended Action
+  let nextActionTitle = 'Upload your syllabus';
+  let nextActionDescription = 'Upload your syllabus to get AI-powered insights and a personalized study plan.';
+  let nextActionTab: NavigationTab = 'syllabus';
+  let nextActionBtnText = 'Go to My Syllabus';
+
+  if (!hasRealSyllabus) {
+    nextActionTitle = 'Upload your syllabus';
+    nextActionDescription = 'Upload your college syllabus (PDF or DOCX) to get a structured topic breakdown.';
+    nextActionTab = 'syllabus';
+    nextActionBtnText = 'Upload Syllabus';
+  } else if (!discoveryData || discoveryData.coverage.topics_with_relevant === 0) {
+    nextActionTitle = 'Match Educational Videos';
+    nextActionDescription = 'Discover verified YouTube video playlists matching your approved course topics.';
+    nextActionTab = 'videos';
+    nextActionBtnText = 'Discover YouTube Videos';
+  } else if (!studyPlan) {
+    nextActionTitle = 'Build Study Plan';
+    nextActionDescription = 'Generate a personalized daily timetable with tasks and deadline pacing.';
+    nextActionTab = 'study-plan';
+    nextActionBtnText = 'Generate Study Plan';
+  } else if (upcomingTasks.length > 0) {
+    nextActionTitle = "Today's Study Block";
+    nextActionDescription = `You have ${upcomingTasks.length} pending tasks scheduled for today. Complete them to maintain consistency!`;
+    nextActionTab = 'study-plan';
+    nextActionBtnText = "Start Today's Tasks";
+  } else {
+    nextActionTitle = 'All Caught Up!';
+    nextActionDescription = 'All current study tasks are complete. Review your revision notes or check upcoming modules.';
+    nextActionTab = 'study-plan';
+    nextActionBtnText = 'View Study Plan';
+  }
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto pb-16">
@@ -103,7 +200,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
         </div>
       </div>
 
-      {/* 5 Metric Cards in a Grid */}
+      {/* 5 Real Metric Cards in a Grid */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5">
         {/* Metric 1: Syllabus Coverage */}
         <div className="rounded-xl bg-[#0b1429]/90 border border-[#18284e] p-4 flex flex-col justify-between">
@@ -114,8 +211,10 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
             </div>
           </div>
           <div>
-            <div className="text-2xl font-bold text-white tracking-tight">0%</div>
-            <p className="text-[10px] text-slate-400 mt-1 m-0">Topics with resources</p>
+            <div className="text-2xl font-bold text-white tracking-tight">{coveragePercent}%</div>
+            <p className="text-[10px] text-slate-400 mt-1 m-0">
+              {topicsWithVideos} of {totalTopics || 0} topics with videos
+            </p>
           </div>
         </div>
 
@@ -128,8 +227,10 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
             </div>
           </div>
           <div>
-            <div className="text-2xl font-bold text-white tracking-tight">0%</div>
-            <p className="text-[10px] text-slate-400 mt-1 m-0">Tasks completed</p>
+            <div className="text-2xl font-bold text-white tracking-tight">{studyProgressPercent}%</div>
+            <p className="text-[10px] text-slate-400 mt-1 m-0">
+              {completedTasks} of {totalTasks || 0} tasks completed
+            </p>
           </div>
         </div>
 
@@ -142,8 +243,14 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
             </div>
           </div>
           <div>
-            <div className="text-2xl font-bold text-white tracking-tight">0%</div>
-            <p className="text-[10px] text-slate-400 mt-1 m-0">Practice & assessment</p>
+            <div className="text-2xl font-bold text-white tracking-tight">
+              {practiceTasks.length > 0 ? `${confidenceScore}%` : 'Not assessed'}
+            </div>
+            <p className="text-[10px] text-slate-400 mt-1 m-0">
+              {practiceTasks.length > 0
+                ? `${completedPractice.length} of ${practiceTasks.length} checkpoints passed`
+                : 'Awaiting practice completion'}
+            </p>
           </div>
         </div>
 
@@ -156,10 +263,12 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
             </div>
           </div>
           <div>
-            <div className="text-sm font-semibold text-slate-300 tracking-tight leading-tight pt-1">
-              Not enough data
+            <div className="text-sm font-semibold text-white tracking-tight leading-tight pt-1">
+              {readinessLabel}
             </div>
-            <p className="text-[10px] text-slate-400 mt-1.5 m-0">Based on your progress</p>
+            <p className="text-[10px] text-slate-400 mt-1.5 m-0 truncate">
+              {readinessSubtext}
+            </p>
           </div>
         </div>
 
@@ -172,10 +281,12 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
             </div>
           </div>
           <div>
-            <div className="text-sm font-semibold text-slate-300 tracking-tight leading-tight pt-1">
-              Not enough data
+            <div className="text-sm font-semibold text-white tracking-tight leading-tight pt-1">
+              {discoveryData ? `${resourceGaps} Gaps` : 'Not assessed'}
             </div>
-            <p className="text-[10px] text-slate-400 mt-1.5 m-0">Topics without resources</p>
+            <p className="text-[10px] text-slate-400 mt-1.5 m-0">
+              {discoveryData ? `${resourceGaps} topics without video` : 'Requires video discovery'}
+            </p>
           </div>
         </div>
       </div>
@@ -216,7 +327,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
                     {mod.title}
                   </span>
                   <span className="font-mono text-slate-400 font-medium shrink-0">
-                    {mod.progress}%
+                    {mod.progress}% ({mod.completedTasks}/{mod.totalTasks})
                   </span>
                 </div>
                 {/* Progress Track */}
@@ -243,19 +354,18 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
                 <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400 block mb-0.5">
                   Next Recommended Action
                 </span>
+                <h4 className="text-xs font-bold text-white m-0 mb-1">{nextActionTitle}</h4>
                 <p className="text-xs text-slate-300 font-medium leading-relaxed m-0">
-                  {hasRealSyllabus
-                    ? 'Review your analyzed topics to prepare video matching and activate your daily study schedule.'
-                    : 'Upload your syllabus to get AI-powered insights and a personalized study plan.'}
+                  {nextActionDescription}
                 </p>
               </div>
             </div>
 
             <button
-              onClick={() => onNavigate('syllabus')}
+              onClick={() => onNavigate(nextActionTab)}
               className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-lg shadow-blue-600/20 transition cursor-pointer"
             >
-              <span>Go to My Syllabus</span>
+              <span>{nextActionBtnText}</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -270,22 +380,36 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
                 onClick={() => onNavigate('study-plan')}
                 className="text-[11px] text-blue-400 hover:text-blue-300 font-medium transition cursor-pointer"
               >
-                View Plan
+                View Full Plan
               </button>
             </div>
 
-            {/* Honest Empty State for Tasks */}
-            <div className="rounded-xl bg-[#091122] border border-[#18284e] p-6 text-center space-y-2">
-              <div className="w-10 h-10 rounded-full bg-slate-800/80 border border-slate-700/60 flex items-center justify-center mx-auto text-slate-400">
-                <FileText className="w-5 h-5" />
+            {/* Real or Honest Empty State */}
+            {upcomingTasks.length > 0 ? (
+              <div className="space-y-2">
+                {upcomingTasks.map((t) => (
+                  <div key={t.id} className="p-2.5 rounded-xl bg-[#091122] border border-[#18284e] flex items-center justify-between text-xs">
+                    <div className="space-y-0.5">
+                      <p className="font-semibold text-white m-0 line-clamp-1">{t.title}</p>
+                      <span className="text-[10px] text-slate-400">{t.task_type} • {t.duration_minutes} min</span>
+                    </div>
+                    <span className="text-[10px] text-blue-400 font-mono font-medium">{t.scheduled_date}</span>
+                  </div>
+                ))}
               </div>
-              <p className="text-xs font-bold text-slate-300 m-0">
-                No tasks yet
-              </p>
-              <p className="text-[11px] text-slate-400 max-w-xs mx-auto m-0 leading-relaxed">
-                Complete your syllabus analysis to view your upcoming tasks.
-              </p>
-            </div>
+            ) : (
+              <div className="rounded-xl bg-[#091122] border border-[#18284e] p-6 text-center space-y-2">
+                <div className="w-10 h-10 rounded-full bg-slate-800/80 border border-slate-700/60 flex items-center justify-center mx-auto text-slate-400">
+                  <FileText className="w-5 h-5" />
+                </div>
+                <p className="text-xs font-bold text-slate-300 m-0">
+                  {studyPlan ? 'All tasks complete!' : 'No tasks yet'}
+                </p>
+                <p className="text-[11px] text-slate-400 max-w-xs mx-auto m-0 leading-relaxed">
+                  {studyPlan ? 'You are ahead of schedule. Review notes or rest!' : 'Generate your study plan to schedule upcoming tasks.'}
+                </p>
+              </div>
+            )}
           </div>
         </div>
       </div>

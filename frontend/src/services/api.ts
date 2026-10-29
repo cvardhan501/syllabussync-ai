@@ -6,7 +6,11 @@ import type {
   ResourceDiscoveryResponse,
   AlternativeResourcesResponse,
   ReplaceChannelRequest,
-  TopicResourceMapping 
+  TopicResourceMapping,
+  StudyPlanResponse,
+  StudyPlanCreateRequest,
+  TaskItemSchema,
+  UserSettingsSchema
 } from '../types';
 
 // Use relative API path to leverage Vite proxy in dev, or customizable via environment
@@ -272,5 +276,176 @@ export const apiService = {
     }
 
     return responseData as ResourceDiscoveryResponse;
+  },
+
+  async createStudyPlan(syllabusId: string, payload: StudyPlanCreateRequest): Promise<StudyPlanResponse> {
+    const response = await fetch(`${API_BASE}/study-plan/${syllabusId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response during study plan generation.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to generate personalized study plan.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as StudyPlanResponse;
+  },
+
+  async getStudyPlan(syllabusId: string): Promise<StudyPlanResponse> {
+    const response = await fetch(`${API_BASE}/study-plan/${syllabusId}`, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || `Failed to retrieve study plan for syllabus '${syllabusId}'.`;
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as StudyPlanResponse;
+  },
+
+  async updateTaskStatus(planId: string, taskId: string, completed: boolean): Promise<TaskItemSchema> {
+    const response = await fetch(`${API_BASE}/study-plan/${planId}/tasks/${taskId}/status`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ completed }),
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to update task completion state.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as TaskItemSchema;
+  },
+
+  async saveTaskNote(planId: string, taskId: string, notes: string): Promise<TaskItemSchema> {
+    const response = await fetch(`${API_BASE}/study-plan/${planId}/tasks/${taskId}/notes`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ notes }),
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to save task notes.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as TaskItemSchema;
+  },
+
+  async reschedulePlan(planId: string, options?: { missed_date?: string; from_date?: string }): Promise<StudyPlanResponse> {
+    const response = await fetch(`${API_BASE}/study-plan/${planId}/reschedule`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(options || {}),
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response during rescheduling.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to reschedule study plan.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as StudyPlanResponse;
+  },
+
+  async getSettings(): Promise<UserSettingsSchema> {
+    const response = await fetch(`${API_BASE}/settings`, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to retrieve settings.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as UserSettingsSchema;
+  },
+
+  async updateSettings(settingsData: UserSettingsSchema): Promise<UserSettingsSchema> {
+    const response = await fetch(`${API_BASE}/settings`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(settingsData),
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to update settings.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as UserSettingsSchema;
   },
 };
