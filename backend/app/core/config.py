@@ -46,6 +46,13 @@ class Settings(BaseSettings):
 
     # Future extension keys (Phase 3 & beyond)
     youtube_api_key: Optional[str] = None
+    youtube_max_search_results: int = 5
+    youtube_cache_ttl_hours: int = 48
+    allow_dev_fallback_youtube: bool = True
+
+    def has_youtube_credentials(self) -> bool:
+        """Determines if YouTube Data API credentials are configured."""
+        return bool(self.youtube_api_key and self.youtube_api_key.strip())
 
     def has_strands_credentials(self) -> bool:
         """Determines if the active provider has valid credentials configured."""

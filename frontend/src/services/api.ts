@@ -2,7 +2,11 @@ import type {
   HealthResponse, 
   SyllabusUploadResponse, 
   SyllabusAnalysisResponse, 
-  TopicUpdateRequest 
+  TopicUpdateRequest,
+  ResourceDiscoveryResponse,
+  AlternativeResourcesResponse,
+  ReplaceChannelRequest,
+  TopicResourceMapping 
 } from '../types';
 
 // Use relative API path to leverage Vite proxy in dev, or customizable via environment
@@ -139,5 +143,134 @@ export const apiService = {
     }
 
     return responseData as SyllabusAnalysisResponse;
+  },
+
+  async discoverResources(
+    syllabusId: string, 
+    options?: { preferred_language?: string; force_refresh?: boolean; allow_third_channel?: boolean }
+  ): Promise<ResourceDiscoveryResponse> {
+    const response = await fetch(`${API_BASE}/syllabus/${syllabusId}/discover-resources`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(options || {}),
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response during resource discovery.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to discover YouTube educational resources.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as ResourceDiscoveryResponse;
+  },
+
+  async getResources(syllabusId: string): Promise<ResourceDiscoveryResponse> {
+    const response = await fetch(`${API_BASE}/syllabus/${syllabusId}/resources`, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || `Failed to retrieve resources for syllabus '${syllabusId}'.`;
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as ResourceDiscoveryResponse;
+  },
+
+  async getTopicAlternatives(syllabusId: string, topicId: string, language: string = 'English'): Promise<AlternativeResourcesResponse> {
+    const params = new URLSearchParams({ language });
+    const response = await fetch(`${API_BASE}/syllabus/${syllabusId}/topics/${topicId}/alternatives?${params.toString()}`, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to fetch alternative channels for this topic.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as AlternativeResourcesResponse;
+  },
+
+  async replaceTopicChannel(
+    syllabusId: string, 
+    topicId: string, 
+    payload: ReplaceChannelRequest
+  ): Promise<TopicResourceMapping> {
+    const response = await fetch(`${API_BASE}/syllabus/${syllabusId}/topics/${topicId}/replace-channel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response during channel replacement.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to replace channel for this topic.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as TopicResourceMapping;
+  },
+
+  async approveThirdChannel(syllabusId: string): Promise<ResourceDiscoveryResponse> {
+    const response = await fetch(`${API_BASE}/syllabus/${syllabusId}/approve-third-channel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ approve: true }),
+    });
+
+    let responseData: any;
+    try {
+      responseData = await response.json();
+    } catch {
+      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
+    }
+
+    if (!response.ok) {
+      const errorMsg = responseData?.detail || 'Failed to approve third channel.';
+      throw new ApiErrorResponse(errorMsg, response.status);
+    }
+
+    return responseData as ResourceDiscoveryResponse;
   },
 };

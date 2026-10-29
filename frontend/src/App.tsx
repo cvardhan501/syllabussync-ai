@@ -153,6 +153,7 @@ export const App: React.FC = () => {
             <VideoLibraryPage
               analyzedSyllabus={analyzedSyllabus}
               onNavigateToSyllabus={() => setCurrentTab('syllabus')}
+              preferredLanguage={preferences.preferredLanguage}
             />
           )}
 

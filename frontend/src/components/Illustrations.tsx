@@ -128,3 +128,4 @@ export const SproutingPlantIllustration: React.FC<{ className?: string }> = ({ c
     </svg>
   </div>
 );
+

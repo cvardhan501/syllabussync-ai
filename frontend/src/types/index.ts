@@ -94,6 +94,89 @@ export interface VideoResourceItem {
   isBookmarked?: boolean;
 }
 
+export interface VideoResource {
+  id: string;
+  video_id: string;
+  title: string;
+  channel_title: string;
+  channel_id?: string;
+  thumbnail_url: string;
+  duration_seconds: number;
+  duration_formatted: string;
+  language?: string;
+  published_at?: string;
+  view_count: number;
+  relevance_score: number;
+  relevance_explanation: string;
+  is_uncertain: boolean;
+  video_url: string;
+}
+
+export interface TopicResourceMapping {
+  topic_id: string;
+  topic_title: string;
+  module_id: string;
+  module_title: string;
+  resource?: VideoResource | null;
+  match_status: 'relevant' | 'candidate_only' | 'no_resource' | 'needs_review';
+  match_confidence: 'high' | 'medium' | 'low' | 'uncertain';
+  relevance_notes?: string;
+  rejected_channels: string[];
+}
+
+export interface ChannelCoverageSummary {
+  channel_title: string;
+  topics_covered: number;
+  topic_ids: string[];
+  is_primary: boolean;
+  percentage_of_course: number;
+}
+
+export interface CoverageMetrics {
+  total_topics: number;
+  topics_with_candidates: number;
+  topics_with_relevant: number;
+  topics_with_no_resource: number;
+  topics_needing_review: number;
+  coverage_percentage: number;
+}
+
+export interface ResourceDiscoveryResponse {
+  status: string;
+  syllabus_id: string;
+  course_name?: string;
+  coverage: CoverageMetrics;
+  selected_channels: ChannelCoverageSummary[];
+  requires_third_channel_approval: boolean;
+  third_channel_candidates: string[];
+  strategy_explanation: string;
+  topic_resources: TopicResourceMapping[];
+  is_fallback: boolean;
+  discovery_engine: string;
+  message: string;
+}
+
+export interface AlternativeResourceItem {
+  video: VideoResource;
+  recommendation_reason: string;
+  is_current: boolean;
+}
+
+export interface AlternativeResourcesResponse {
+  topic_id: string;
+  topic_title: string;
+  current_channel?: string;
+  rejected_channels: string[];
+  alternatives: AlternativeResourceItem[];
+  message: string;
+}
+
+export interface ReplaceChannelRequest {
+  rejected_channel: string;
+  selected_video_id: string;
+  reason?: string;
+}
+
 export interface UserPreferences {
   preferredLanguage: string;
   lessonStyle: string;
