@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Compass,
   CheckCircle2,
@@ -10,15 +10,20 @@ import {
   Sparkles,
   ArrowRight,
   TrendingUp,
-  FileText
+  FileText,
+  GraduationCap,
+  BookOpen
 } from 'lucide-react';
 import type { 
   NavigationTab, 
   SyllabusUploadResponse, 
   SyllabusAnalysisResponse,
   StudyPlanResponse,
-  ResourceDiscoveryResponse 
+  ResourceDiscoveryResponse,
+  Course,
+  SemesterOverview,
 } from '../types';
+import { apiService } from '../services/api';
 
 interface ProgressPageProps {
   uploadedSyllabus: SyllabusUploadResponse | null;
@@ -26,6 +31,9 @@ interface ProgressPageProps {
   studyPlan?: StudyPlanResponse | null;
   discoveryData?: ResourceDiscoveryResponse | null;
   onNavigate: (tab: NavigationTab) => void;
+  activeCourse?: Course | null;
+  courses?: Course[];
+  onSelectCourse?: (c: Course) => void;
 }
 
 export const ProgressPage: React.FC<ProgressPageProps> = ({
@@ -34,9 +42,30 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
   studyPlan,
   discoveryData,
   onNavigate,
+  activeCourse,
+  courses = [],
+  onSelectCourse,
 }) => {
+  const [viewMode, setViewMode] = useState<'semester' | 'course'>('semester');
+  const [semesterOverview, setSemesterOverview] = useState<SemesterOverview | null>(null);
   const [timeRange, setTimeRange] = useState<'7days' | '30days' | 'all'>('7days');
   const [isFilterOpen, setIsFilterOpen] = useState(false);
+
+  useEffect(() => {
+    let isMounted = true;
+    const fetchSemesterData = async () => {
+      try {
+        const data = await apiService.getSemesterOverview();
+        if (isMounted) setSemesterOverview(data);
+      } catch (err) {
+        // Fallback gracefully
+      }
+    };
+    fetchSemesterData();
+    return () => {
+      isMounted = false;
+    };
+  }, [activeCourse?.id]);
 
   const hasRealSyllabus = Boolean(analyzedSyllabus || uploadedSyllabus);
 
@@ -149,11 +178,300 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto pb-16">
+      {/* Page Header & View Mode Switcher */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-[#152342]">
+        <div>
+          <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight m-0">
+            {viewMode === 'semester' ? 'Semester Academic Dashboard' : 'Course Progress Report'}
+          </h2>
+          <p className="text-xs sm:text-sm text-slate-400 mt-1 m-0">
+            {viewMode === 'semester'
+              ? 'Aggregated semester analytics, milestone timeline, and multi-course status.'
+              : `Tracking learning pace, topic mastery, and gaps for ${activeCourse?.course_name || 'selected syllabus'}.`}
+          </p>
+        </div>
+
+        {/* View Mode Toggle Pill */}
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          <div className="flex bg-[#0c162e] p-1 rounded-2xl border border-[#1b2b52] text-xs">
+            <button
+              onClick={() => setViewMode('semester')}
+              className={`px-3.5 py-1.5 rounded-xl font-medium transition cursor-pointer flex items-center gap-1.5 ${
+                viewMode === 'semester'
+                  ? 'bg-blue-600 text-white font-semibold shadow-md'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <GraduationCap className="w-3.5 h-3.5" />
+              <span>Semester Overview</span>
+            </button>
+            <button
+              onClick={() => setViewMode('course')}
+              className={`px-3.5 py-1.5 rounded-xl font-medium transition cursor-pointer flex items-center gap-1.5 ${
+                viewMode === 'course'
+                  ? 'bg-blue-600 text-white font-semibold shadow-md'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              <span>{activeCourse ? `${activeCourse.course_code || 'Course'} Report` : 'Course Report'}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {viewMode === 'semester' ? (
+        /* ================= SEMESTER OVERVIEW VIEW ================= */
+        <div className="space-y-6">
+          {/* Overdue Tasks Alert Banner */}
+          {(semesterOverview?.overdue_tasks_count || 0) > 0 && (
+            <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
+                <div>
+                  <p className="font-bold text-white m-0">
+                    {semesterOverview?.overdue_tasks_count} Overdue Study Task(s) Across Your Courses
+                  </p>
+                  <p className="text-[11px] text-amber-300/80 m-0">
+                    Review your study schedule to complete or adaptively reschedule overdue sessions.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => onNavigate('study-plan')}
+                className="px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 font-semibold text-xs border border-amber-500/30 transition cursor-pointer"
+              >
+                Go to Schedule
+              </button>
+            </div>
+          )}
+
+          {/* Top 4 Semester Summary Cards */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3.5 sm:gap-4">
+            {/* Card 1: Enrolled Courses */}
+            <div className="rounded-2xl bg-[#0b1429]/80 border border-[#18284e] p-4 sm:p-5 flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                  Enrolled Courses
+                </span>
+                <div className="w-8 h-8 rounded-xl bg-blue-600/15 border border-blue-500/20 flex items-center justify-center text-blue-400">
+                  <GraduationCap className="w-4 h-4" />
+                </div>
+              </div>
+              <div className="mt-3">
+                <span className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
+                  {semesterOverview?.total_courses ?? courses.length}
+                </span>
+                <p className="text-[11px] text-slate-400 mt-1">Active college subjects</p>
+              </div>
+            </div>
+
+            {/* Card 2: Verified Topics */}
+            <div className="rounded-2xl bg-[#0b1429]/80 border border-[#18284e] p-4 sm:p-5 flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                  Verified Topics
+                </span>
+                <div className="w-8 h-8 rounded-xl bg-indigo-600/15 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
+                  <Layers className="w-4 h-4" />
+                </div>
+              </div>
+              <div className="mt-3">
+                <span className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
+                  {semesterOverview?.total_topics ?? totalTopics}
+                </span>
+                <p className="text-[11px] text-slate-400 mt-1">Curriculum topics mapped</p>
+              </div>
+            </div>
+
+            {/* Card 3: Completed Tasks */}
+            <div className="rounded-2xl bg-[#0b1429]/80 border border-[#18284e] p-4 sm:p-5 flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                  Tasks Completed
+                </span>
+                <div className="w-8 h-8 rounded-xl bg-emerald-600/15 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+                  <CheckCircle2 className="w-4 h-4" />
+                </div>
+              </div>
+              <div className="mt-3">
+                <span className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
+                  {semesterOverview?.completed_tasks ?? completedTasks}
+                </span>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  of {semesterOverview?.total_tasks ?? totalTasks} total tasks
+                </p>
+              </div>
+            </div>
+
+            {/* Card 4: Overall Progress */}
+            <div className="rounded-2xl bg-[#0b1429]/80 border border-[#18284e] p-4 sm:p-5 flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                  Semester Mastery
+                </span>
+                <div className="w-8 h-8 rounded-xl bg-cyan-600/15 border border-cyan-500/20 flex items-center justify-center text-cyan-400">
+                  <TrendingUp className="w-4 h-4" />
+                </div>
+              </div>
+              <div className="mt-3">
+                <span className="text-2xl sm:text-3xl font-extrabold text-blue-400 tracking-tight">
+                  {semesterOverview?.overall_percentage ?? studyProgressPercent}%
+                </span>
+                <p className="text-[11px] text-slate-400 mt-1">Weighted progress average</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Main 2-Column Section */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            {/* Left: Course-by-Course Breakdown Cards (7 cols) */}
+            <div className="lg:col-span-7 space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-base font-bold text-white flex items-center gap-2">
+                  <GraduationCap className="w-5 h-5 text-blue-400" />
+                  Course-by-Course Progress
+                </h3>
+                <button
+                  onClick={() => onNavigate('courses')}
+                  className="text-xs text-blue-400 hover:text-blue-300 font-semibold cursor-pointer"
+                >
+                  Manage Courses →
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                {(semesterOverview?.courses || courses).filter(c => !c.is_archived).map((c) => (
+                  <div
+                    key={c.id}
+                    className="p-4 rounded-2xl bg-[#0b1429] border border-[#18284e] hover:border-slate-600 transition flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+                  >
+                    <div className="space-y-1.5 flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        {c.course_code && (
+                          <span className="px-2 py-0.5 rounded-md bg-blue-600/20 text-blue-400 border border-blue-500/30 text-[10px] font-mono font-bold">
+                            {c.course_code}
+                          </span>
+                        )}
+                        <h4 className="text-sm font-bold text-white truncate">{c.course_name}</h4>
+                      </div>
+
+                      {/* Progress Track */}
+                      <div className="space-y-1 max-w-md">
+                        <div className="flex items-center justify-between text-[11px] text-slate-400">
+                          <span>{c.completed_tasks} of {c.total_tasks || c.total_topics} completed</span>
+                          <span className="font-semibold text-blue-400">{c.progress_percentage}%</span>
+                        </div>
+                        <div className="w-full h-1.5 rounded-full bg-[#132247] overflow-hidden">
+                          <div
+                            className="h-full bg-gradient-to-r from-blue-600 to-indigo-500 rounded-full"
+                            style={{ width: `${c.progress_percentage}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      {c.next_assessment && (
+                        <div className="flex items-center gap-1.5 text-[11px] text-slate-400 pt-0.5">
+                          <Calendar className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                          <span className="text-slate-300 font-medium truncate">{c.next_assessment.name}</span>
+                          <span className="text-blue-400 font-mono font-semibold">
+                            (in {c.next_assessment.days_remaining}d)
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    <button
+                      onClick={() => {
+                        if (onSelectCourse) onSelectCourse(c);
+                        setViewMode('course');
+                      }}
+                      className="px-3.5 py-2 rounded-xl bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 text-xs font-semibold shrink-0 transition cursor-pointer self-start sm:self-auto"
+                    >
+                      View Report
+                    </button>
+                  </div>
+                ))}
+
+                {(semesterOverview?.courses || courses).length === 0 && (
+                  <div className="p-8 text-center rounded-2xl bg-[#0b1429] border border-[#18284e] text-xs text-slate-400">
+                    No active courses found. Upload a syllabus to start tracking academic progress.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Right: Upcoming Assessment Milestones (5 cols) */}
+            <div className="lg:col-span-5 space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-base font-bold text-white flex items-center gap-2">
+                  <Calendar className="w-5 h-5 text-blue-400" />
+                  Upcoming Assessment Milestones
+                </h3>
+              </div>
+
+              <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-4 space-y-3">
+                {semesterOverview?.upcoming_assessments && semesterOverview.upcoming_assessments.length > 0 ? (
+                  semesterOverview.upcoming_assessments.map((a, idx) => (
+                    <div
+                      key={idx}
+                      className="p-3 rounded-xl bg-[#070b14] border border-[#18284e] space-y-1.5"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 truncate pr-2">
+                          {a.course_code && (
+                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-blue-300 font-mono text-[10px] font-bold">
+                              {a.course_code}
+                            </span>
+                          )}
+                          <span className="text-xs font-bold text-white truncate">{a.name}</span>
+                        </div>
+                        <span className="px-2 py-0.5 rounded-full bg-blue-600/20 text-blue-400 border border-blue-500/30 text-[10px] font-mono font-semibold shrink-0">
+                          {a.days_remaining >= 0 ? `${a.days_remaining}d away` : 'Past'}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[11px] text-slate-400">
+                        <span className="truncate">{a.course_name}</span>
+                        <span className="font-mono text-[10px] text-slate-500 shrink-0">{a.exam_date}</span>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="p-6 text-center text-xs text-slate-400 space-y-1">
+                    <CheckCircle2 className="w-6 h-6 text-emerald-400 mx-auto mb-2" />
+                    <p className="font-semibold text-white m-0">No upcoming exams pending</p>
+                    <p className="text-[11px] text-slate-500 m-0">
+                      Add milestone dates in Course Settings to track revision timelines.
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        /* ================= INDIVIDUAL COURSE PROGRESS VIEW ================= */
+        <div className="space-y-6">
+          <div className="flex items-center justify-between p-3.5 rounded-2xl bg-[#0b1429] border border-[#18284e]">
+            <div className="flex items-center gap-2">
+              <BookOpen className="w-4 h-4 text-blue-400" />
+              <span className="text-xs text-slate-300">
+                Detailed report for: <strong className="text-white">{activeCourse?.course_name || 'Active Course'}</strong>
+              </span>
+            </div>
+            <button
+              onClick={() => setViewMode('semester')}
+              className="text-xs text-blue-400 hover:text-blue-300 font-semibold cursor-pointer"
+            >
+              ← Back to Semester Overview
+            </button>
+          </div>
       {/* Page Header with Time Filter Dropdown */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight m-0">
-            Your Progress Overview
+            Course Detailed Progress
           </h2>
           <p className="text-xs sm:text-sm text-slate-400 mt-1 m-0">
             Track your learning, spot gaps, and stay on top of your goals.
@@ -413,6 +731,8 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
           </div>
         </div>
       </div>
+        </div>
+      )}
     </div>
   );
 };

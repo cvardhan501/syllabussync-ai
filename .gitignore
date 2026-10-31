@@ -29,7 +29,12 @@ htmlcov/
 
 # Environment Variables
 .env
+.env.*
+!.env.example
 *.env.local
+.env.local
+env.local
+*.local
 
 # Database
 *.db

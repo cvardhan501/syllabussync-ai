@@ -337,8 +337,9 @@ def test_disliked_channel_replacement_and_persistence():
     """Verify alternative channel discovery, rejection exclusion, and single-topic replacement."""
     s_id = create_sample_syllabus("Database Systems")
 
-    # 1. Discover initial resources using dev fallback
-    disc_res = client.post(f"/api/syllabus/{s_id}/discover-resources")
+    # 1. Discover initial resources using dev fallback (patching api key to empty)
+    with patch.object(settings, "youtube_api_key", ""):
+        disc_res = client.post(f"/api/syllabus/{s_id}/discover-resources")
     assert disc_res.status_code == 200
     disc_data = disc_res.json()
     first_mapping = disc_data["topic_resources"][0]
@@ -346,7 +347,8 @@ def test_disliked_channel_replacement_and_persistence():
     initial_channel = first_mapping["resource"]["channel_title"]
 
     # 2. Query alternatives for this topic
-    alt_res = client.get(f"/api/syllabus/{s_id}/topics/{target_topic_id}/alternatives")
+    with patch.object(settings, "youtube_api_key", ""):
+        alt_res = client.get(f"/api/syllabus/{s_id}/topics/{target_topic_id}/alternatives")
     assert alt_res.status_code == 200
     alt_data = alt_res.json()
     assert alt_data["topic_id"] == target_topic_id
@@ -392,8 +394,9 @@ def test_sqlite_persistence_and_retrieval():
     """Verify discovered resources, coverage audit, and channels persist across requests."""
     s_id = create_sample_syllabus("Artificial Intelligence")
 
-    # Discover
-    disc_res = client.post(f"/api/syllabus/{s_id}/discover-resources")
+    # Discover with dev fallback
+    with patch.object(settings, "youtube_api_key", ""):
+        disc_res = client.post(f"/api/syllabus/{s_id}/discover-resources")
     assert disc_res.status_code == 200
     disc_data = disc_res.json()
 

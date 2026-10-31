@@ -35,6 +35,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const navItems: { id: NavigationTab; label: string; icon: React.FC<{ className?: string }> }[] = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+    { id: 'courses', label: 'My Courses', icon: GraduationCap },
     { id: 'syllabus', label: 'My Syllabus', icon: BookOpen },
     { id: 'videos', label: 'Video Library', icon: PlaySquare },
     { id: 'study-plan', label: 'Study Plan', icon: CalendarDays },

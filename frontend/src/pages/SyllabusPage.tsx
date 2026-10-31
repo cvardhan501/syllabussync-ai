@@ -8,12 +8,14 @@ import {
   FileCode, 
   Check, 
   RefreshCw,
-  Layers
+  Layers,
+  Sparkles
 } from 'lucide-react';
-import type { SyllabusUploadResponse, SyllabusAnalysisResponse } from '../types';
+import type { SyllabusUploadResponse, SyllabusAnalysisResponse, Course } from '../types';
 import { apiService, ApiErrorResponse } from '../services/api';
 import { TopicReviewEditor } from '../components/TopicReviewEditor';
 import { RobotMascotIllustration } from '../components/Illustrations';
+import { SyllabusSetupWizard } from '../components/SyllabusSetupWizard';
 
 interface SyllabusPageProps {
   uploadedSyllabus: SyllabusUploadResponse | null;
@@ -21,6 +23,7 @@ interface SyllabusPageProps {
   analyzedSyllabus: SyllabusAnalysisResponse | null;
   onAnalysisComplete: (data: SyllabusAnalysisResponse | null) => void;
   onNavigateToStudyPlan: () => void;
+  onCourseCreated?: (course: Course) => void;
 }
 
 const MAX_SIZE_MB = 10;
@@ -33,6 +36,7 @@ export const SyllabusPage: React.FC<SyllabusPageProps> = ({
   analyzedSyllabus,
   onAnalysisComplete,
   onNavigateToStudyPlan,
+  onCourseCreated,
 }) => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -42,6 +46,7 @@ export const SyllabusPage: React.FC<SyllabusPageProps> = ({
   const [activeTab, setActiveTab] = useState<'editor' | 'raw'>('editor');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [isWizardOpen, setIsWizardOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Stepper simulation during analysis
@@ -104,39 +109,47 @@ export const SyllabusPage: React.FC<SyllabusPageProps> = ({
     setIsDragging(false);
   };
 
-  const handleUploadAndAnalyze = async () => {
+  const handleUploadAndOpenWizard = async () => {
     if (!selectedFile) return;
 
     setIsUploading(true);
+    setErrorMessage(null);
+
+    try {
+      const uploadRes = await apiService.uploadSyllabus(selectedFile);
+      onSyllabusUploaded(uploadRes);
+      setIsWizardOpen(true);
+    } catch (err: any) {
+      if (err instanceof ApiErrorResponse) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage(err.message || 'Failed to parse syllabus. Ensure backend server is running.');
+      }
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const handleWizardSubmit = async (wizardData: any) => {
     setIsAnalyzing(true);
     setErrorMessage(null);
 
     try {
-      const analysisResult = await apiService.analyzeSyllabus(selectedFile);
-      onAnalysisComplete(analysisResult);
-      onSyllabusUploaded({
-        status: 'success',
-        syllabus_id: analysisResult.syllabus_id,
-        filename: analysisResult.filename,
-        file_type: analysisResult.file_type as any,
-        file_size_bytes: selectedFile.size,
-        char_count: analysisResult.char_count,
-        word_count: analysisResult.word_count,
-        unit_count: analysisResult.modules.length,
-        unit_label: 'modules',
-        preview_text: `Course: ${analysisResult.course_name || 'N/A'}\nModules: ${analysisResult.modules.length}\nTotal Topics: ${analysisResult.total_topics_count}`,
-        full_text_length: analysisResult.char_count,
-        message: analysisResult.message,
-      });
+      const result = await apiService.setupAndAnalyzeSyllabus(wizardData);
+      onAnalysisComplete(result.analysis);
+      if (onCourseCreated && result.course) {
+        onCourseCreated(result.course);
+      }
+      setIsWizardOpen(false);
+      setSelectedFile(null);
       setActiveTab('editor');
     } catch (err: any) {
       if (err instanceof ApiErrorResponse) {
         setErrorMessage(err.message);
       } else {
-        setErrorMessage(err.message || 'Failed to process syllabus. Ensure backend server is running.');
+        setErrorMessage(err.message || 'Failed to analyze syllabus with Strands Agent.');
       }
     } finally {
-      setIsUploading(false);
       setIsAnalyzing(false);
     }
   };
@@ -145,6 +158,8 @@ export const SyllabusPage: React.FC<SyllabusPageProps> = ({
     onSyllabusUploaded(null);
     onAnalysisComplete(null);
     setSelectedFile(null);
+    setIsWizardOpen(false);
+    setActiveTab('editor');
     setErrorMessage(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -413,11 +428,21 @@ export const SyllabusPage: React.FC<SyllabusPageProps> = ({
               </button>
 
               <button
-                onClick={handleUploadAndAnalyze}
+                onClick={handleUploadAndOpenWizard}
                 disabled={isUploading}
-                className="px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 text-white font-semibold text-xs sm:text-sm transition shadow-lg shadow-blue-600/30 cursor-pointer"
+                className="px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 text-white font-semibold text-xs sm:text-sm transition shadow-lg shadow-blue-600/30 cursor-pointer flex items-center gap-2"
               >
-                Upload & Analyze
+                {isUploading ? (
+                  <>
+                    <div className="w-4 h-4 rounded-full border-2 border-t-white border-r-transparent animate-spin" />
+                    <span>Parsing Document...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-4 h-4" />
+                    <span>Configure & Analyze</span>
+                  </>
+                )}
               </button>
             </div>
           </div>
@@ -434,6 +459,16 @@ export const SyllabusPage: React.FC<SyllabusPageProps> = ({
           </div>
         </div>
       )}
+
+      {/* Pre-Analysis Syllabus Setup Wizard Modal */}
+      <SyllabusSetupWizard
+        isOpen={isWizardOpen}
+        uploadedSyllabus={uploadedSyllabus}
+        onClose={() => setIsWizardOpen(false)}
+        onSubmit={handleWizardSubmit}
+        isAnalyzing={isAnalyzing}
+        analysisStep={analysisStep}
+      />
     </div>
   );
 };

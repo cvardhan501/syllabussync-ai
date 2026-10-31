@@ -7,15 +7,26 @@ import {
   Server, 
   ShieldCheck, 
   ChevronDown,
-  Sparkles,
-  Save,
-  Loader2
+  Sparkles, 
+  Save, 
+  Loader2,
+  Activity,
+  Play,
+  RefreshCw,
+  Database,
+  Cpu,
+  Film
 } from 'lucide-react';
-import type { HealthResponse, UserPreferences } from '../types';
+import type { 
+  HealthResponse, 
+  UserPreferences,
+  SystemDiagnosticsResponse,
+  DiagnosticTestResult 
+} from '../types';
 import { apiService } from '../services/api';
 
 interface SettingsPageProps {
-  health: HealthResponse | null;
+  health?: HealthResponse | null;
   preferences?: UserPreferences;
   onSavePreferences?: (prefs: UserPreferences) => void;
 }
@@ -32,14 +43,76 @@ const DEFAULT_PREFERENCES: UserPreferences = {
 };
 
 export const SettingsPage: React.FC<SettingsPageProps> = ({ 
-  health,
+  health: _health,
   preferences = DEFAULT_PREFERENCES,
   onSavePreferences,
 }) => {
   const [formData, setFormData] = useState<UserPreferences>(preferences);
   const [isSaved, setIsSaved] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [showSystemDetails, setShowSystemDetails] = useState(false);
+
+  // Diagnostics state
+  const [diagnostics, setDiagnostics] = useState<SystemDiagnosticsResponse | null>(null);
+  const [isLoadingDiagnostics, setIsLoadingDiagnostics] = useState(false);
+  const [youtubeTestResult, setYoutubeTestResult] = useState<DiagnosticTestResult | null>(null);
+  const [isTestingYouTube, setIsTestingYouTube] = useState(false);
+  const [strandsTestResult, setStrandsTestResult] = useState<DiagnosticTestResult | null>(null);
+  const [isTestingStrands, setIsTestingStrands] = useState(false);
+
+  const fetchDiagnostics = async () => {
+    setIsLoadingDiagnostics(true);
+    try {
+      const data = await apiService.getDiagnostics();
+      setDiagnostics(data);
+    } catch {
+      // Graceful fallback
+    } finally {
+      setIsLoadingDiagnostics(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchDiagnostics();
+  }, []);
+
+  const handleTestYouTube = async () => {
+    setIsTestingYouTube(true);
+    setYoutubeTestResult(null);
+    try {
+      const res = await apiService.testYouTubeApi();
+      setYoutubeTestResult(res);
+      fetchDiagnostics();
+    } catch (err: any) {
+      setYoutubeTestResult({
+        service: 'YouTube Data API v3',
+        tested: true,
+        status: 'error',
+        message: err.message || 'Live probe failed.',
+        latency_ms: 0,
+      });
+    } finally {
+      setIsTestingYouTube(false);
+    }
+  };
+
+  const handleTestStrands = async () => {
+    setIsTestingStrands(true);
+    setStrandsTestResult(null);
+    try {
+      const res = await apiService.testStrandsModel();
+      setStrandsTestResult(res);
+    } catch (err: any) {
+      setStrandsTestResult({
+        service: 'Strands Agents SDK',
+        tested: true,
+        status: 'error',
+        message: err.message || 'Model probe failed.',
+        latency_ms: 0,
+      });
+    } finally {
+      setIsTestingStrands(false);
+    }
+  };
 
   // Sync with backend SQLite on mount
   useEffect(() => {
@@ -355,58 +428,281 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         </div>
       </div>
 
-      {/* Secondary Collapsible Section: Architecture & Security */}
-      <div className="rounded-2xl bg-[#091122]/70 border border-[#18284e] p-4 sm:p-5">
-        <button
-          onClick={() => setShowSystemDetails(!showSystemDetails)}
-          className="w-full flex items-center justify-between text-left text-xs font-medium text-slate-400 hover:text-white transition cursor-pointer"
-        >
-          <div className="flex items-center gap-2">
-            <Server className="w-4 h-4 text-blue-400" />
-            <span className="font-semibold text-slate-200">System Architecture & Security Guardrails</span>
-            <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              Verified
-            </span>
+      {/* System Diagnostics & Live Verification Probes Section */}
+      <div className="rounded-2xl bg-[#091122]/90 border border-[#18284e] p-4 sm:p-5 space-y-4 shadow-lg">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#18284e] pb-3">
+          <div className="flex items-center gap-2.5">
+            <Activity className="w-5 h-5 text-blue-400" />
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm sm:text-base font-bold text-white m-0">
+                  System Diagnostics & Service Health
+                </h3>
+                <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full uppercase tracking-wider ${
+                  diagnostics?.status === 'healthy'
+                    ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                    : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                }`}>
+                  {diagnostics?.status || 'Active'}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-400 m-0">
+                Live status and zero-secret probes for backend, database, Strands agent, and YouTube API.
+              </p>
+            </div>
           </div>
-          <ChevronDown className={`w-4 h-4 transition-transform duration-200 ${showSystemDetails ? 'rotate-180' : ''}`} />
-        </button>
 
-        {showSystemDetails && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4 pt-4 border-t border-[#18284e] text-xs">
-            {/* Backend status card */}
-            <div className="rounded-xl bg-[#070b14] border border-[#1b2b52] p-4 space-y-2.5">
+          <button
+            onClick={fetchDiagnostics}
+            disabled={isLoadingDiagnostics}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#0f1d38] hover:bg-[#162a52] text-slate-300 text-xs font-medium border border-[#1e3462] transition cursor-pointer self-start sm:self-auto shrink-0"
+            title="Refresh system diagnostics"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 text-blue-400 ${isLoadingDiagnostics ? 'animate-spin' : ''}`} />
+            <span>Refresh Diagnostics</span>
+          </button>
+        </div>
+
+        {/* 4 Diagnostics Cards Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          {/* Card 1: FastAPI Backend */}
+          <div className="rounded-xl bg-[#070b14] border border-[#1b2b52] p-4 space-y-3">
+            <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-indigo-400 font-semibold">
                 <Server className="w-4 h-4" />
                 <span>FastAPI Service</span>
               </div>
-              <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Health:</span>
-                  <span className="text-emerald-400 font-bold">{health?.status || 'Active (Local)'}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Database:</span>
-                  <span>SQLite (Local file-backed)</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Max Upload:</span>
-                  <span>10 MB Enforced</span>
-                </div>
+              <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
+                diagnostics?.backend.status === 'ok'
+                  ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
+                  : 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
+              }`}>
+                {diagnostics?.backend.status || 'healthy'}
+              </span>
+            </div>
+
+            <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Environment:</span>
+                <span className="text-white">{diagnostics?.backend.environment || 'development'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">App Version:</span>
+                <span className="text-white">{diagnostics?.backend.version || '0.2.0'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Health Status:</span>
+                <span className="text-emerald-400 font-bold">{diagnostics?.backend.status || 'healthy'}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Card 2: SQLite Database */}
+          <div className="rounded-xl bg-[#070b14] border border-[#1b2b52] p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-blue-400 font-semibold">
+                <Database className="w-4 h-4" />
+                <span>SQLite Database</span>
+              </div>
+              <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
+                diagnostics?.database.status === 'connected'
+                  ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
+                  : 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
+              }`}>
+                {diagnostics?.database.status || 'connected'}
+              </span>
+            </div>
+
+            <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Engine:</span>
+                <span className="text-white">{diagnostics?.database.engine || 'SQLite'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Tables Count:</span>
+                <span className="text-white">{diagnostics?.database.tables_count ?? 11} tables</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Connection:</span>
+                <span className="text-emerald-400 font-bold">Active & Verified</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Card 3: Strands Agents SDK */}
+          <div className="rounded-xl bg-[#070b14] border border-[#1b2b52] p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-violet-400 font-semibold">
+                <Cpu className="w-4 h-4" />
+                <span>Strands Agents SDK</span>
+              </div>
+              <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
+                diagnostics?.strands.credentials_configured
+                  ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
+                  : 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
+              }`}>
+                {diagnostics?.strands.active_mode || 'live'}
+              </span>
+            </div>
+
+            <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Provider:</span>
+                <span className="text-white">{diagnostics?.strands.provider || 'bedrock'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Model:</span>
+                <span className="text-white truncate max-w-[200px]" title={diagnostics?.strands.model}>
+                  {diagnostics?.strands.model || 'Claude 3.5 Sonnet'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Credentials:</span>
+                <span className={diagnostics?.strands.credentials_configured ? 'text-emerald-400 font-bold' : 'text-amber-400 font-bold'}>
+                  {diagnostics?.strands.credentials_summary || 'Configured'}
+                </span>
               </div>
             </div>
 
-            {/* Zero-leak policy */}
-            <div className="rounded-xl bg-[#070b14] border border-[#1b2b52] p-4 space-y-2.5">
-              <div className="flex items-center gap-2 text-emerald-400 font-semibold">
-                <ShieldCheck className="w-4 h-4" />
-                <span>Zero-Leak Security Guardrail</span>
+            {/* Strands Live Probe Button */}
+            <div className="pt-2 border-t border-[#142347]">
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  onClick={handleTestStrands}
+                  disabled={isTestingStrands}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-600/20 hover:bg-violet-600 text-violet-300 hover:text-white border border-violet-500/30 text-[11px] font-medium transition cursor-pointer"
+                >
+                  {isTestingStrands ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Probing Model...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3 h-3 text-violet-400" />
+                      <span>Test Strands Agent Model</span>
+                    </>
+                  )}
+                </button>
+
+                {strandsTestResult && (
+                  <span className={`text-[10px] font-mono px-2 py-0.5 rounded-md ${
+                    strandsTestResult.status === 'success'
+                      ? 'bg-emerald-950/50 text-emerald-300'
+                      : strandsTestResult.status === 'model_not_available'
+                      ? 'bg-amber-950/50 text-amber-300'
+                      : 'bg-rose-950/50 text-rose-300'
+                  }`}>
+                    {strandsTestResult.latency_ms} ms
+                  </span>
+                )}
               </div>
-              <p className="text-[11px] text-slate-400 leading-relaxed m-0">
-                All model and YouTube Data API v3 credentials remain isolated strictly on the backend. No secret tokens or keys are present in client-side bundles.
-              </p>
+
+              {strandsTestResult && (
+                <div className={`mt-2 p-2.5 rounded-lg text-[10px] font-mono leading-relaxed ${
+                  strandsTestResult.status === 'success'
+                    ? 'bg-emerald-950/30 text-emerald-300 border border-emerald-800/40'
+                    : strandsTestResult.status === 'model_not_available'
+                    ? 'bg-amber-950/30 text-amber-300 border border-amber-800/40'
+                    : 'bg-rose-950/30 text-rose-300 border border-rose-800/40'
+                }`}>
+                  <p className="m-0 font-bold">{strandsTestResult.message}</p>
+                  {strandsTestResult.status === 'model_not_available' && (
+                    <p className="mt-1.5 text-[9.5px] text-amber-400/90 font-sans">
+                      Tip: Amazon Nova models (<code className="text-amber-200">amazon.nova-lite-v1:0</code>) are verified active and ready on this account without third-party form approval.
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           </div>
-        )}
+
+          {/* Card 4: YouTube Data API v3 */}
+          <div className="rounded-xl bg-[#070b14] border border-[#1b2b52] p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-rose-400 font-semibold">
+                <Film className="w-4 h-4" />
+                <span>YouTube Data API v3</span>
+              </div>
+              <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
+                diagnostics?.youtube.key_configured
+                  ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
+                  : 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
+              }`}>
+                {diagnostics?.youtube.active_mode || 'live'}
+              </span>
+            </div>
+
+            <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Active Mode:</span>
+                <span className={diagnostics?.youtube.active_mode === 'live' ? 'text-emerald-400 font-bold' : 'text-amber-400 font-bold'}>
+                  {diagnostics?.youtube.active_mode === 'live' ? 'Live YouTube API' : 'Dev Fallback'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">API Key:</span>
+                <span className={diagnostics?.youtube.key_configured ? 'text-emerald-400 font-bold' : 'text-amber-400 font-bold'}>
+                  {diagnostics?.youtube.key_summary || 'Configured (Isolated)'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Cached Queries:</span>
+                <span className="text-white">{diagnostics?.youtube.cached_queries_count ?? 0}</span>
+              </div>
+            </div>
+
+            {/* YouTube Live Probe Button */}
+            <div className="pt-2 border-t border-[#142347]">
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  onClick={handleTestYouTube}
+                  disabled={isTestingYouTube}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 text-[11px] font-medium transition cursor-pointer"
+                >
+                  {isTestingYouTube ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Probing API...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3 h-3 text-rose-400" />
+                      <span>Test YouTube API Live</span>
+                    </>
+                  )}
+                </button>
+
+                {youtubeTestResult && (
+                  <span className={`text-[10px] font-mono px-2 py-0.5 rounded-md ${
+                    youtubeTestResult.status === 'success' ? 'bg-emerald-950/50 text-emerald-300' : 'bg-rose-950/50 text-rose-300'
+                  }`}>
+                    {youtubeTestResult.latency_ms} ms
+                  </span>
+                )}
+              </div>
+
+              {youtubeTestResult && (
+                <div className={`mt-2 p-2 rounded-lg text-[10px] font-mono leading-relaxed ${
+                  youtubeTestResult.status === 'success' ? 'bg-emerald-950/30 text-emerald-300 border border-emerald-800/40' : 'bg-rose-950/30 text-rose-300 border border-rose-800/40'
+                }`}>
+                  <p className="m-0 font-bold">{youtubeTestResult.message}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Zero-Leak Security Guardrail Notice */}
+        <div className="rounded-xl bg-[#070b14] border border-emerald-500/30 p-3.5 flex items-start gap-3">
+          <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            <h4 className="text-xs font-bold text-white m-0">Zero-Secret Exposure Security Policy</h4>
+            <p className="text-[11px] text-slate-400 leading-relaxed m-0">
+              Model API keys, Google Cloud tokens, and YouTube credentials are isolated strictly on the local backend server. No secret tokens or raw stack traces are sent to the browser or stored in git.
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

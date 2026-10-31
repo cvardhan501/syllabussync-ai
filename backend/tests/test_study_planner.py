@@ -269,3 +269,4 @@ def test_user_settings_persistence():
     assert saved["exam_date"] == "2026-06-01"
     assert saved["study_days"] == ["Mon", "Wed", "Fri"]
     assert saved["deadline_alerts"] is False
+

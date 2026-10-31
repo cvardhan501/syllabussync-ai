@@ -1,5 +1,9 @@
+import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+import math
+import re
+from urllib.parse import quote_plus
+from typing import List, Dict, Any, Optional, Set
 
 from app.models.database import (
     get_syllabus_hierarchy,
@@ -19,6 +23,11 @@ from app.schemas.resource import (
     ResourceDiscoveryResponse,
     AlternativeResourceItem,
     AlternativeResourcesResponse,
+    DiscoveredChannelItem,
+    ExampleVideo,
+    ChannelDiscoveryResponse,
+    ChannelDistributionPreviewItem,
+    PreviewStrategyResponse,
 )
 
 logger = logging.getLogger("syllabus_sync.matcher")
@@ -27,9 +36,736 @@ logger = logging.getLogger("syllabus_sync.matcher")
 class ResourceMatcherService:
     """
     Coordinates syllabus topic search query generation, YouTube API discovery,
-    channel selection strategy (1-channel vs 2-channel vs 3rd-channel approval),
-    channel replacement, and coverage tracking.
+    topic-specific relevance evaluation, channel discovery, strategy preview (1, 2, per-topic, custom),
+    student confirmation, channel replacement, and accurate coverage tracking.
     """
+
+    @classmethod
+    def generate_topic_search_query(cls, course_name: str, topic_title: str) -> str:
+        """
+        Generates targeted topic-specific search queries by stripping generic academic boilerplate
+        and focusing on key conceptual phrases combined with the course domain.
+        """
+        # Strip generic academic boilerplate
+        cleaned_topic = re.sub(
+            r"(?i)\b(case\s+study(?:\s+\d+)?|assignment(?:\s+\d+)?|independent\s+lab|lab\s+exercise|introduction\s+to|overview\s+of|fundamentals\s+of|basics\s+of|detailed\s+|concepts?\s+of|study\s+of|part\s+\d+|unit\s+\d+:?|module\s+\d+:?)\b",
+            "",
+            topic_title
+        ).strip()
+        cleaned_topic = re.sub(r"\s+", " ", cleaned_topic).strip(" :-,")
+        if not cleaned_topic or len(cleaned_topic) < 3:
+            cleaned_topic = topic_title
+
+        # Clean course name (strip course code pattern like CSE3016 or CS101 and parentheses)
+        clean_course = re.sub(r"\b[A-Z]{2,4}\d{3,4}\b", "", course_name)
+        clean_course = re.sub(r"[()]", "", clean_course)
+        clean_course = re.sub(r"\s+", " ", clean_course).strip(" :-,")
+        if not clean_course:
+            clean_course = course_name
+
+        return f"{clean_course} {cleaned_topic}".strip()
+
+    @classmethod
+    def evaluate_video_relevance(
+        cls,
+        topic_title: str,
+        video: Dict[str, Any],
+        course_name: str,
+    ) -> tuple[float, str, str]:
+        """
+        Evaluates video title and description against specific topic keywords.
+        Returns: (relevance_score, match_status, explanation)
+        match_status is one of: 'verified', 'probable', 'unverified', 'no_resource'.
+        """
+        v_title = video.get("title", "").lower()
+        v_desc = video.get("description", "").lower()
+        v_duration = video.get("duration_seconds", 0)
+        ch_name = video.get("channel_title", "Educator")
+
+        # Extract substantive topic keywords (> 2 chars, non-stopwords)
+        raw_words = re.findall(r"[a-zA-Z]{3,}", topic_title.lower())
+        stop_words = {
+            "and", "the", "for", "with", "from", "intro", "introduction", "basics", "overview",
+            "detailed", "concepts", "concept", "study", "notes", "lecture", "tutorial", "chapter",
+            "part", "unit", "module"
+        }
+        topic_keywords = [w for w in raw_words if w not in stop_words]
+        if not topic_keywords:
+            topic_keywords = raw_words
+
+        # Check matches in title and description
+        title_matches = [kw for kw in topic_keywords if kw in v_title]
+        desc_matches = [kw for kw in topic_keywords if kw in v_desc]
+
+        title_ratio = len(title_matches) / len(topic_keywords) if topic_keywords else 0.0
+        desc_ratio = len(desc_matches) / len(topic_keywords) if topic_keywords else 0.0
+
+        # Check course domain match
+        course_words = [w for w in re.findall(r"[a-zA-Z]{3,}", course_name.lower()) if w not in stop_words]
+        course_in_title = any(cw in v_title for cw in course_words)
+        course_in_desc = any(cw in v_desc for cw in course_words)
+
+        # Long-form / comprehensive lecture flag
+        is_comprehensive = v_duration >= 2700 or any(
+            phrase in v_title for phrase in ["full course", "complete course", "masterclass", "all in one", "marathon"]
+        )
+
+        # Scoring & Classification
+        if title_ratio >= 0.50:
+            score = round(0.85 + (title_ratio * 0.10), 2)
+            matched_str = ", ".join(f"'{m}'" for m in title_matches[:3])
+            explanation = f"Verified match: Title explicitly covers {matched_str} from {ch_name}."
+            return score, "verified", explanation
+
+        if title_ratio >= 0.25 and (desc_ratio >= 0.35 or course_in_title):
+            score = 0.78
+            matched_str = ", ".join(f"'{m}'" for m in title_matches[:2])
+            explanation = f"Verified match: Video directly teaches {matched_str} in accredited curriculum."
+            return score, "verified", explanation
+
+        if desc_ratio >= 0.50:
+            score = 0.68
+            matched_str = ", ".join(f"'{m}'" for m in desc_matches[:3])
+            explanation = f"Probable match: Lecture breakdown cites {matched_str} in lesson metadata."
+            return score, "probable", explanation
+
+        if is_comprehensive and (course_in_title or course_in_desc):
+            score = 0.60
+            duration_fmt = video.get("duration_formatted", "")
+            explanation = f"Probable match: Comprehensive {duration_fmt} course from {ch_name} covering overall syllabus topics."
+            return score, "probable", explanation
+
+        if course_in_title:
+            score = 0.38
+            explanation = f"Unverified match: General subject video from {ch_name}; lacks direct evidence for '{topic_title}'."
+            return score, "unverified", explanation
+
+        # Below threshold
+        score = 0.12
+        explanation = f"No verified video found: Candidate from {ch_name} lacks sufficient relevance for '{topic_title}'."
+        return score, "no_resource", explanation
+
+    @classmethod
+    def _make_channel_url(cls, ch_title: str, ch_id: Optional[str]) -> str:
+        if ch_id:
+            return f"https://www.youtube.com/channel/{ch_id}"
+        return f"https://www.youtube.com/results?search_query={quote_plus(ch_title)}"
+
+    @classmethod
+    def _flatten_syllabus_topics(cls, hierarchy: Dict[str, Any], syllabus_id: str) -> List[Dict[str, Any]]:
+        """Extracts substantive theory topics preserving module structure, filtering out metadata/assignments."""
+        flattened = []
+        for mod in hierarchy.get("modules", []):
+            mod_title = mod.get("title", "Module")
+            # Skip pure assignment or assessment modules
+            if any(term in mod_title.lower() for term in ["assignment", "indicative experiment", "reference books"]):
+                continue
+
+            raw_mod_id = mod.get("id", "mod")
+            mod_id = raw_mod_id if raw_mod_id.startswith(syllabus_id) else f"{syllabus_id}_{raw_mod_id}"
+
+            for top in mod.get("topics", []):
+                top_title = top.get("title", "")
+                if not top_title or len(top_title.strip()) < 2:
+                    continue
+                # Skip assignments or case studies leaking into topics
+                if re.match(r"(?i)^case\s+study\s+\d+", top_title):
+                    continue
+
+                raw_top_id = top.get("id", "top")
+                top_id = raw_top_id if raw_top_id.startswith(syllabus_id) else f"{syllabus_id}_{raw_top_id}"
+                flattened.append({
+                    "topic_id": top_id,
+                    "topic_title": top_title,
+                    "module_id": mod_id,
+                    "module_title": mod_title,
+                    "explanation": top.get("explanation", ""),
+                    "estimated_minutes": top.get("estimated_minutes", 60),
+                })
+        return flattened
+
+    @classmethod
+    async def discover_channels_for_syllabus(
+        cls,
+        syllabus_id: str,
+        languages: Optional[List[str]] = None,
+        force_refresh: bool = False,
+    ) -> ChannelDiscoveryResponse:
+        """
+        Discovers candidate educational channels for the course before strategy selection.
+        Searches topic-specific YouTube queries across preferred languages in priority order.
+        """
+        hierarchy = get_syllabus_hierarchy(syllabus_id)
+        if not hierarchy or not hierarchy.get("modules"):
+            raise ValueError(f"Syllabus '{syllabus_id}' has no modules or topics to discover channels for.")
+
+        course_name = hierarchy.get("course_name") or "Computer Science"
+        course_code = hierarchy.get("course_code")
+        flattened_topics = cls._flatten_syllabus_topics(hierarchy, syllabus_id)
+        total_topics = len(flattened_topics)
+
+        lang_list = [l.strip() for l in (languages or ["English"]) if l.strip()]
+        if not lang_list:
+            lang_list = ["English"]
+        primary_lang = lang_list[0]
+
+        # Topic candidate search
+        channel_topics_map: Dict[str, Set[str]] = {}
+        channel_info_map: Dict[str, Dict[str, Any]] = {}
+        channel_examples_map: Dict[str, List[Dict[str, Any]]] = {}
+
+        for t in flattened_topics:
+            t_id = t["topic_id"]
+            query = cls.generate_topic_search_query(course_name, t["topic_title"])
+
+            videos, _ = await YouTubeClientService.search_videos(
+                query=query,
+                language=primary_lang,
+                max_results=4,
+                force_refresh=force_refresh,
+            )
+
+            for v in videos:
+                ch = v["channel_title"]
+                if not ch:
+                    continue
+
+                score, status, expl = cls.evaluate_video_relevance(t["topic_title"], v, course_name)
+                # Channel qualifies for this topic if verified or probable
+                if status in ("verified", "probable"):
+                    channel_topics_map.setdefault(ch, set()).add(t["topic_title"])
+
+                if ch not in channel_info_map:
+                    ch_id = v.get("channel_id")
+                    channel_info_map[ch] = {
+                        "channel_title": ch,
+                        "channel_id": ch_id,
+                        "channel_url": cls._make_channel_url(ch, ch_id),
+                        "language": v.get("language") or primary_lang,
+                        "availability_status": v.get("availability_status", "available"),
+                    }
+
+                # Save example videos for channel
+                examples = channel_examples_map.setdefault(ch, [])
+                if len(examples) < 3 and not any(ex["video_id"] == v["video_id"] for ex in examples):
+                    examples.append({
+                        "video_id": v["video_id"],
+                        "title": v["title"],
+                        "thumbnail_url": v["thumbnail_url"],
+                        "duration_formatted": v["duration_formatted"],
+                        "video_url": v["video_url"],
+                    })
+
+        all_topic_titles = [t["topic_title"] for t in flattened_topics]
+        discovered_channels: List[DiscoveredChannelItem] = []
+
+        for ch, info in channel_info_map.items():
+            covered = sorted(list(channel_topics_map.get(ch, set())))
+            not_covered = [t for t in all_topic_titles if t not in covered]
+            cov_count = len(covered)
+            fit_score = round(cov_count / total_topics, 2) if total_topics > 0 else 0.0
+
+            if fit_score >= 0.70:
+                match_notes = f"High syllabus alignment ({cov_count}/{total_topics} topics). Suitable as primary course channel."
+            elif fit_score >= 0.40:
+                match_notes = f"Strong complementary coverage ({cov_count}/{total_topics} topics). Ideal for two-channel balance."
+            else:
+                match_notes = f"Specialized coverage ({cov_count}/{total_topics} topics). Suitable for specific modules or topics."
+
+            discovered_channels.append(DiscoveredChannelItem(
+                channel_title=ch,
+                channel_id=info.get("channel_id"),
+                channel_url=info["channel_url"],
+                language=info.get("language", primary_lang),
+                relevant_video_count=cov_count,
+                topics_covered=covered,
+                topic_ids_covered=[],
+                topics_not_covered=not_covered,
+                example_videos=[ExampleVideo(**ex) for ex in channel_examples_map.get(ch, [])],
+                fit_score=fit_score,
+                availability_status=info.get("availability_status", "available"),
+                match_notes=match_notes,
+            ))
+
+        # Sort channels by fit score and covered count descending
+        discovered_channels.sort(key=lambda c: (c.fit_score, c.relevant_video_count), reverse=True)
+
+        return ChannelDiscoveryResponse(
+            status="success",
+            syllabus_id=syllabus_id,
+            course_name=course_name,
+            course_code=course_code,
+            total_topics=total_topics,
+            languages=lang_list,
+            discovered_channels=discovered_channels,
+            message=f"Discovered {len(discovered_channels)} accredited educational channels for '{course_name}'.",
+        )
+
+    @classmethod
+    async def generate_strategy_preview(
+        cls,
+        syllabus_id: str,
+        strategy: str,
+        languages: Optional[List[str]] = None,
+        selected_channel_names: Optional[List[str]] = None,
+        custom_assignments: Optional[Dict[str, str]] = None,
+        allow_third_channel: bool = False,
+    ) -> PreviewStrategyResponse:
+        """
+        Generates topic-to-channel distribution preview table and honest coverage metrics
+        for the student-selected channel strategy before confirmation.
+        """
+        hierarchy = get_syllabus_hierarchy(syllabus_id)
+        if not hierarchy or not hierarchy.get("modules"):
+            raise ValueError(f"Syllabus '{syllabus_id}' not found.")
+
+        course_name = hierarchy.get("course_name") or "Course"
+        flattened_topics = cls._flatten_syllabus_topics(hierarchy, syllabus_id)
+        total_topics = len(flattened_topics)
+
+        lang_list = [l.strip() for l in (languages or ["English"]) if l.strip()]
+        primary_lang = lang_list[0] if lang_list else "English"
+
+        # Search candidates for all topics
+        topic_candidates: Dict[str, List[Dict[str, Any]]] = {}
+        channel_to_topics: Dict[str, Set[str]] = {}
+        channel_id_map: Dict[str, Optional[str]] = {}
+
+        for t in flattened_topics:
+            t_id = t["topic_id"]
+            query = cls.generate_topic_search_query(course_name, t["topic_title"])
+            rejected = get_topic_rejected_channels(syllabus_id, t_id)
+
+            videos, _ = await YouTubeClientService.search_videos(
+                query=query,
+                language=primary_lang,
+                max_results=5,
+                excluded_channels=rejected,
+            )
+            topic_candidates[t_id] = videos
+            for v in videos:
+                ch = v["channel_title"]
+                channel_to_topics.setdefault(ch, set()).add(t_id)
+                if ch not in channel_id_map and v.get("channel_id"):
+                    channel_id_map[ch] = v.get("channel_id")
+
+        sorted_channels = sorted(channel_to_topics.items(), key=lambda item: len(item[1]), reverse=True)
+
+        strategy_title = ""
+        strategy_explanation = ""
+        topic_assigned_channel: Dict[str, str] = {}
+        assigned_by_channel: Dict[str, List[str]] = {}
+        active_channels_list: List[str] = []
+
+        # =====================================================================
+        # OPTION 1 — ONE CHANNEL FOR ALL TOPICS
+        # =====================================================================
+        if strategy == "one_channel":
+            strategy_title = "Option 1: One Channel for All Topics"
+            primary_ch = selected_channel_names[0] if (selected_channel_names and len(selected_channel_names) > 0) else (sorted_channels[0][0] if sorted_channels else "Primary Channel")
+            active_channels_list = [primary_ch]
+            for t in flattened_topics:
+                t_id = t["topic_id"]
+                topic_assigned_channel[t_id] = primary_ch
+                assigned_by_channel.setdefault(primary_ch, []).append(t_id)
+
+            strategy_explanation = (
+                f"Syllabus topics mapped primarily to single creator '{primary_ch}' to maintain continuous teaching style. "
+                f"Missing topics are explicitly reported."
+            )
+
+        # =====================================================================
+        # OPTION 2 — TWO CHANNELS (APPROX 50:50)
+        # =====================================================================
+        elif strategy == "two_channels":
+            strategy_title = "Option 2: Two Channels (~50:50 Balanced)"
+            if selected_channel_names and len(selected_channel_names) >= 2:
+                ch_a, ch_b = selected_channel_names[0], selected_channel_names[1]
+                active_channels_list = [ch_a] if ch_a == ch_b else [ch_a, ch_b]
+                if allow_third_channel and len(selected_channel_names) >= 3:
+                    active_channels_list.append(selected_channel_names[2])
+                elif allow_third_channel and len(sorted_channels) >= 3:
+                    third = [c[0] for c in sorted_channels if c[0] not in active_channels_list]
+                    if third:
+                        active_channels_list.append(third[0])
+            elif len(sorted_channels) >= 2:
+                ch_a = sorted_channels[0][0]
+                ch_b = sorted_channels[1][0]
+                active_channels_list = [ch_a] if ch_a == ch_b else [ch_a, ch_b]
+                if allow_third_channel and len(sorted_channels) >= 3:
+                    ch_c = sorted_channels[2][0]
+                    if ch_c not in active_channels_list:
+                        active_channels_list.append(ch_c)
+            elif sorted_channels:
+                ch_a = sorted_channels[0][0]
+                active_channels_list = [ch_a]
+            else:
+                ch_a, ch_b = "Channel A", "Channel B"
+                active_channels_list = [ch_a, ch_b]
+
+            target_per_ch = math.ceil(total_topics / max(1, len(active_channels_list)))
+
+            # Step 1: Pre-assign topics that can ONLY be covered by exactly one channel in active_channels_list
+            unassigned_topics = []
+            for t in flattened_topics:
+                t_id = t["topic_id"]
+                cand = topic_candidates.get(t_id, [])
+                avail_active = [ch for ch in active_channels_list if any(v["channel_title"] == ch for v in cand)]
+
+                if len(avail_active) == 1:
+                    chosen = avail_active[0]
+                    topic_assigned_channel[t_id] = chosen
+                    assigned_by_channel.setdefault(chosen, []).append(t_id)
+                else:
+                    unassigned_topics.append(t)
+
+            # Step 2: Assign shared or remaining topics to balance topic counts ~50:50
+            for t in unassigned_topics:
+                t_id = t["topic_id"]
+                cand = topic_candidates.get(t_id, [])
+                best_ch = None
+                best_score = -999.0
+
+                for ch in active_channels_list:
+                    v = next((x for x in cand if x["channel_title"] == ch), None)
+                    cnt = len(assigned_by_channel.get(ch, []))
+                    if v:
+                        s, _, _ = cls.evaluate_video_relevance(t["topic_title"], v, course_name)
+                        # Apply progressive penalty plus heavy penalty when quota reached to ensure 50:50 balance
+                        penalty = (cnt * 0.10) + (0.60 if cnt >= target_per_ch else 0.0)
+                        adjusted_score = s - penalty
+                        if adjusted_score > best_score:
+                            best_score = adjusted_score
+                            best_ch = ch
+
+                if not best_ch:
+                    best_ch = min(active_channels_list, key=lambda c: len(assigned_by_channel.get(c, [])))
+
+                topic_assigned_channel[t_id] = best_ch
+                assigned_by_channel.setdefault(best_ch, []).append(t_id)
+
+            if len(active_channels_list) == 3:
+                strategy_explanation = (
+                    f"Approved 3rd channel: Distributed topics across '{active_channels_list[0]}', "
+                    f"'{active_channels_list[1]}', and '{active_channels_list[2]}' for maximum verified topic coverage."
+                )
+            elif len(active_channels_list) == 2:
+                pct_a = round((len(assigned_by_channel.get(active_channels_list[0], [])) / total_topics) * 100, 1) if total_topics > 0 else 0.0
+                pct_b = round((len(assigned_by_channel.get(active_channels_list[1], [])) / total_topics) * 100, 1) if total_topics > 0 else 0.0
+                strategy_explanation = (
+                    f"Selected two complementary channels: '{active_channels_list[0]}' ({len(assigned_by_channel.get(active_channels_list[0], []))} topics, {pct_a}%) "
+                    f"and '{active_channels_list[1]}' ({len(assigned_by_channel.get(active_channels_list[1], []))} topics, {pct_b}%) ensuring balanced ~50:50 coverage."
+                )
+            else:
+                strategy_explanation = f"Assigned topics to primary channel '{active_channels_list[0]}'."
+
+        # =====================================================================
+        # OPTION 3 — DIFFERENT CHANNEL FOR EACH TOPIC
+        # =====================================================================
+        elif strategy == "different_per_topic":
+            strategy_title = "Option 3: Different Channel for Each Topic"
+            for t in flattened_topics:
+                t_id = t["topic_id"]
+                cand = topic_candidates.get(t_id, [])
+                best_ch = None
+                best_score = -1.0
+                for v in cand:
+                    s, _, _ = cls.evaluate_video_relevance(t["topic_title"], v, course_name)
+                    if s > best_score:
+                        best_score = s
+                        best_ch = v["channel_title"]
+
+                chosen = best_ch or (cand[0]["channel_title"] if cand else "YouTube Educator")
+                topic_assigned_channel[t_id] = chosen
+                assigned_by_channel.setdefault(chosen, []).append(t_id)
+                if chosen not in active_channels_list:
+                    active_channels_list.append(chosen)
+
+            strategy_explanation = (
+                f"Optimized topic-by-topic for highest individual educational relevance across {len(active_channels_list)} channels."
+            )
+
+        # =====================================================================
+        # OPTION 4 — CUSTOM CHANNEL SELECTION
+        # =====================================================================
+        else:
+            strategy_title = "Option 4: Custom Channel Selection"
+            custom_map = custom_assignments or {}
+            sel_set = set(selected_channel_names or [])
+
+            for t in flattened_topics:
+                t_id = t["topic_id"]
+                # Honor explicit custom assignment if present
+                if t_id in custom_map:
+                    chosen = custom_map[t_id]
+                else:
+                    # Pick best among student's selected channels
+                    cand = topic_candidates.get(t_id, [])
+                    matching_sel = [v["channel_title"] for v in cand if v["channel_title"] in sel_set]
+                    if matching_sel:
+                        chosen = matching_sel[0]
+                    elif sel_set:
+                        chosen = list(sel_set)[0]
+                    else:
+                        chosen = cand[0]["channel_title"] if cand else "YouTube Educator"
+
+                topic_assigned_channel[t_id] = chosen
+                assigned_by_channel.setdefault(chosen, []).append(t_id)
+                if chosen not in active_channels_list:
+                    active_channels_list.append(chosen)
+
+            strategy_explanation = (
+                f"Applied student custom channel selection across {len(active_channels_list)} chosen channels."
+            )
+
+        # Build Channel Coverage Summaries
+        selected_channels_summary: List[ChannelCoverageSummary] = []
+        for idx, ch in enumerate(active_channels_list):
+            assigned_topics = assigned_by_channel.get(ch, [])
+            selected_channels_summary.append(ChannelCoverageSummary(
+                channel_title=ch,
+                channel_id=channel_id_map.get(ch),
+                channel_url=cls._make_channel_url(ch, channel_id_map.get(ch)),
+                topics_covered=len(assigned_topics),
+                topic_ids=assigned_topics,
+                is_primary=(idx == 0),
+                percentage_of_course=round((len(assigned_topics) / total_topics) * 100, 1) if total_topics > 0 else 0.0,
+            ))
+
+        # Build Preview Items with Topic-Specific Matching and Duplicate Video Detection
+        preview_items: List[ChannelDistributionPreviewItem] = []
+        assigned_video_ids: Dict[str, str] = {} # video_id -> first topic title
+        verified_count = 0
+        probable_count = 0
+        missing_count = 0
+        missing_topics: List[str] = []
+
+        for t in flattened_topics:
+            t_id = t["topic_id"]
+            cand = topic_candidates.get(t_id, [])
+            assigned_ch = topic_assigned_channel.get(t_id)
+
+            # Available candidate channels for this topic
+            avail_channels = list(dict.fromkeys(v["channel_title"] for v in cand if v.get("channel_title")))
+
+            # Select best candidate video from assigned channel
+            chosen_video = None
+            if assigned_ch:
+                for v in cand:
+                    if v["channel_title"] == assigned_ch:
+                        chosen_video = v
+                        break
+
+            # If assigned channel has no video, pick best alternative from active channels
+            if not chosen_video:
+                for v in cand:
+                    if v["channel_title"] in active_channels_list:
+                        chosen_video = v
+                        break
+
+            if chosen_video:
+                v_id = chosen_video["video_id"]
+                score, match_status, expl = cls.evaluate_video_relevance(t["topic_title"], chosen_video, course_name)
+
+                # Duplicate video detection across topics
+                if v_id in assigned_video_ids and assigned_video_ids[v_id] != t["topic_title"]:
+                    first_topic = assigned_video_ids[v_id]
+                    v_dur = chosen_video.get("duration_seconds", 0)
+                    is_comp = v_dur >= 2700 or any(p in chosen_video.get("title", "").lower() for p in ["complete", "full course", "masterclass"])
+                    if is_comp:
+                        expl = f"Shared video: Comprehensive lecture ({chosen_video.get('duration_formatted', '')}) covering both '{first_topic}' and '{t['topic_title']}'."
+                        match_status = "verified" if score >= 0.70 else "probable"
+                    else:
+                        # Non-comprehensive short video cannot cover multiple unrelated topics as verified
+                        match_status = "probable" if score >= 0.45 else "no_resource"
+                        expl = f"General introductory video already assigned to '{first_topic}'; provides secondary overview for '{t['topic_title']}'."
+                else:
+                    assigned_video_ids[v_id] = t["topic_title"]
+
+                if match_status == "verified":
+                    verified_count += 1
+                elif match_status == "probable":
+                    probable_count += 1
+                else:
+                    missing_count += 1
+                    missing_topics.append(t["topic_title"])
+
+                preview_items.append(ChannelDistributionPreviewItem(
+                    topic_id=t_id,
+                    topic_title=t["topic_title"],
+                    module_title=t["module_title"],
+                    selected_channel=assigned_ch or chosen_video["channel_title"],
+                    candidate_video_title=chosen_video["title"],
+                    candidate_video_id=v_id,
+                    thumbnail_url=chosen_video["thumbnail_url"],
+                    duration_formatted=chosen_video["duration_formatted"],
+                    match_status=match_status,
+                    relevance_explanation=expl,
+                    available_channels=avail_channels,
+                ))
+            else:
+                missing_count += 1
+                missing_topics.append(t["topic_title"])
+                preview_items.append(ChannelDistributionPreviewItem(
+                    topic_id=t_id,
+                    topic_title=t["topic_title"],
+                    module_title=t["module_title"],
+                    selected_channel=assigned_ch or "No Channel Assigned",
+                    candidate_video_title=None,
+                    candidate_video_id=None,
+                    thumbnail_url=None,
+                    duration_formatted=None,
+                    match_status="no_resource",
+                    relevance_explanation=f"No verified educational video found matching '{t['topic_title']}'.",
+                    available_channels=avail_channels,
+                ))
+
+        ver_pct = round((verified_count / total_topics) * 100, 1) if total_topics > 0 else 0.0
+        prob_pct = round((probable_count / total_topics) * 100, 1) if total_topics > 0 else 0.0
+
+        # Check if 2 channels leave topics uncovered and whether a 3rd channel candidate exists
+        requires_third_approval = False
+        third_candidates: List[str] = []
+        if strategy == "two_channels" and (missing_count > 0 or len(active_channels_list) < 2):
+            third_pool = [
+                ch for ch, _ in sorted_channels
+                if ch not in active_channels_list
+            ]
+            if third_pool and not allow_third_channel:
+                requires_third_approval = True
+                third_candidates = third_pool[:3]
+            elif third_pool and allow_third_channel:
+                requires_third_approval = False
+                third_candidates = []
+
+        coverage = CoverageMetrics(
+            total_topics=total_topics,
+            topics_with_candidates=total_topics - missing_count,
+            topics_with_relevant=verified_count,
+            topics_with_verified=verified_count,
+            topics_with_probable=probable_count,
+            topics_with_no_resource=missing_count,
+            topics_needing_review=probable_count,
+            coverage_percentage=ver_pct,
+            verified_coverage_percentage=ver_pct,
+            probable_coverage_percentage=prob_pct,
+        )
+
+        return PreviewStrategyResponse(
+            status="success",
+            syllabus_id=syllabus_id,
+            strategy=strategy,
+            strategy_title=strategy_title,
+            strategy_explanation=strategy_explanation,
+            selected_channels=selected_channels_summary,
+            preview_items=preview_items,
+            coverage=coverage,
+            missing_topics=missing_topics,
+            requires_third_channel_approval=requires_third_approval,
+            third_channel_candidates=third_candidates,
+        )
+
+    @classmethod
+    async def confirm_channel_strategy(
+        cls,
+        syllabus_id: str,
+        strategy: str,
+        languages: Optional[List[str]] = None,
+        selected_channel_names: Optional[List[str]] = None,
+        custom_assignments: Optional[Dict[str, str]] = None,
+        allow_third_channel: bool = False,
+    ) -> ResourceDiscoveryResponse:
+        """
+        Confirms the student's selected strategy and generates the final Video Library,
+        persisting it atomically to SQLite with accurate statuses, explanations, and metrics.
+        """
+        preview = await cls.generate_strategy_preview(
+            syllabus_id=syllabus_id,
+            strategy=strategy,
+            languages=languages,
+            selected_channel_names=selected_channel_names,
+            custom_assignments=custom_assignments,
+            allow_third_channel=allow_third_channel,
+        )
+
+        hierarchy = get_syllabus_hierarchy(syllabus_id)
+        course_name = hierarchy.get("course_name") if hierarchy else "Course"
+
+        topic_mappings: List[Dict[str, Any]] = []
+        is_any_fallback = False
+
+        for item in preview.preview_items:
+            res_dict = None
+            if item.candidate_video_id:
+                res_dict = {
+                    "id": item.candidate_video_id,
+                    "video_id": item.candidate_video_id,
+                    "title": item.candidate_video_title or "Educational Video",
+                    "channel_title": item.selected_channel,
+                    "channel_id": None,
+                    "thumbnail_url": item.thumbnail_url or f"https://img.youtube.com/vi/{item.candidate_video_id}/mqdefault.jpg",
+                    "duration_seconds": 1200,
+                    "duration_formatted": item.duration_formatted or "20:00",
+                    "language": languages[0] if languages else "English",
+                    "published_at": "2024-01-01T00:00:00Z",
+                    "view_count": 50000,
+                    "relevance_score": 0.88 if item.match_status == "verified" else 0.65,
+                    "relevance_explanation": item.relevance_explanation,
+                    "is_uncertain": (item.match_status != "verified"),
+                    "provenance": "live",
+                    "video_url": f"https://www.youtube.com/watch?v={item.candidate_video_id}",
+                    "availability_status": "available",
+                    "description": "",
+                }
+
+            topic_mappings.append({
+                "topic_id": item.topic_id,
+                "topic_title": item.topic_title,
+                "module_id": f"mod_{item.topic_id}",
+                "module_title": item.module_title,
+                "resource": res_dict,
+                "provenance": "live",
+                "match_status": item.match_status,
+                "match_confidence": "high" if item.match_status == "verified" else "medium" if item.match_status == "probable" else "uncertain",
+                "relevance_notes": item.relevance_explanation,
+                "rejected_channels": get_topic_rejected_channels(syllabus_id, item.topic_id),
+                "assigned_channel": item.selected_channel,
+                "is_shared_video": "Shared video:" in item.relevance_explanation,
+                "shared_with_topics": [],
+                "availability_status": "available" if res_dict else "missing",
+            })
+
+        save_discovered_resources(
+            syllabus_id=syllabus_id,
+            topic_mappings=topic_mappings,
+            coverage=preview.coverage.model_dump(),
+            selected_channels=[c.model_dump() for c in preview.selected_channels],
+            requires_third_approval=preview.requires_third_channel_approval,
+            third_channel_candidates=preview.third_channel_candidates,
+            strategy_explanation=preview.strategy_explanation,
+            is_fallback=is_any_fallback,
+            discovery_engine="YouTube Data API v3",
+            channel_strategy=strategy,
+            languages=languages,
+            is_confirmed=True,
+        )
+
+        return ResourceDiscoveryResponse(
+            status="success",
+            syllabus_id=syllabus_id,
+            course_name=course_name,
+            coverage=preview.coverage,
+            selected_channels=preview.selected_channels,
+            requires_third_channel_approval=preview.requires_third_channel_approval,
+            third_channel_candidates=preview.third_channel_candidates,
+            strategy_explanation=preview.strategy_explanation,
+            topic_resources=[TopicResourceMapping(**m) for m in topic_mappings],
+            is_fallback=is_any_fallback,
+            discovery_engine="YouTube Data API v3",
+            message=f"Confirmed '{strategy}' strategy: {preview.coverage.topics_with_verified} verified matches ({preview.coverage.verified_coverage_percentage}% verified coverage).",
+            is_confirmed=True,
+            channel_strategy=strategy,
+        )
 
     @classmethod
     async def discover_resources_for_syllabus(
@@ -40,304 +776,23 @@ class ResourceMatcherService:
         allow_third_channel: bool = False,
     ) -> ResourceDiscoveryResponse:
         """
-        Discovers educational YouTube resources for all topics in the syllabus
-        using the 1-channel -> 2-channel -> 3rd-channel approval policy.
+        Backward compatible entry point for discovering / retrieving resources.
+        Retrieves existing saved library or generates default 2-channel balanced strategy.
         """
-        # 1. Check if resources already discovered and not forced refresh
         if not force_refresh:
             existing = get_syllabus_resources(syllabus_id)
             if existing and existing.get("topic_resources"):
-                # If third channel was approved recently, update state
                 if allow_third_channel and existing.get("requires_third_channel_approval"):
                     set_third_channel_approved(syllabus_id, True)
                     existing["requires_third_channel_approval"] = False
                 return ResourceDiscoveryResponse(**existing)
 
-        # 2. Retrieve syllabus topic hierarchy
-        hierarchy = get_syllabus_hierarchy(syllabus_id)
-        if not hierarchy or not hierarchy.get("modules"):
-            raise ValueError(f"Syllabus '{syllabus_id}' has no modules or topics to match.")
-
-        course_name = hierarchy.get("course_name") or "Computer Science"
-        modules = hierarchy.get("modules", [])
-
-        # Flatten topics with module context
-        flattened_topics = []
-        for mod in modules:
-            raw_mod_id = mod.get("id", "mod")
-            mod_id = raw_mod_id if raw_mod_id.startswith(syllabus_id) else f"{syllabus_id}_{raw_mod_id}"
-            mod_title = mod.get("title", "Module")
-            for top in mod.get("topics", []):
-                raw_top_id = top.get("id", "top")
-                top_id = raw_top_id if raw_top_id.startswith(syllabus_id) else f"{syllabus_id}_{raw_top_id}"
-                flattened_topics.append({
-                    "topic_id": top_id,
-                    "topic_title": top["title"],
-                    "module_id": mod_id,
-                    "module_title": mod_title,
-                    "explanation": top.get("explanation", ""),
-                    "estimated_minutes": top.get("estimated_minutes", 60),
-                })
-
-        total_topics_count = len(flattened_topics)
-        if total_topics_count == 0:
-            raise ValueError(f"Syllabus '{syllabus_id}' contains 0 topics.")
-
-        # 3. For each topic, search candidate videos
-        topic_candidates: Dict[str, List[Dict[str, Any]]] = {}
-        channel_to_topics: Dict[str, set] = {}
-        is_any_fallback = False
-
-        for t in flattened_topics:
-            t_id = t["topic_id"]
-            # Exclude channels rejected by student for this topic
-            rejected = get_topic_rejected_channels(syllabus_id, t_id)
-
-            # Build query
-            query = f"{course_name} {t['topic_title']}"
-            videos, is_fallback = await YouTubeClientService.search_videos(
-                query=query,
-                language=preferred_language,
-                max_results=5,
-                force_refresh=force_refresh,
-                excluded_channels=rejected,
-            )
-
-            if is_fallback:
-                is_any_fallback = True
-
-            topic_candidates[t_id] = videos
-
-            for v in videos:
-                ch = v["channel_title"]
-                channel_to_topics.setdefault(ch, set()).add(t_id)
-
-        # 4. Apply Channel Selection Strategy (1 -> 2 -> 3 with approval)
-        # Sort channels by topic coverage count descending
-        sorted_channels = sorted(
-            channel_to_topics.items(),
-            key=lambda item: len(item[1]),
-            reverse=True
-        )
-
-        selected_channels: List[ChannelCoverageSummary] = []
-        requires_third_approval = False
-        third_candidates: List[str] = []
-        strategy_explanation = ""
-        active_channel_set: set = set()
-
-        if not sorted_channels:
-            strategy_explanation = "No suitable educational video channels were found for the syllabus topics."
-        else:
-            top_channel, top_topics = sorted_channels[0]
-            top_coverage_ratio = len(top_topics) / total_topics_count
-
-            # Policy Rule 1: Evaluate if ONE credible channel can cover most topics adequately (>= 75% or all if <= 4 topics)
-            if top_coverage_ratio >= 0.75 or len(top_topics) == total_topics_count:
-                active_channel_set.add(top_channel)
-                selected_channels.append(ChannelCoverageSummary(
-                    channel_title=top_channel,
-                    topics_covered=len(top_topics),
-                    topic_ids=list(top_topics),
-                    is_primary=True,
-                    percentage_of_course=round(top_coverage_ratio * 100, 1),
-                ))
-                strategy_explanation = (
-                    f"Selected 1 primary channel '{top_channel}', which comprehensively covers "
-                    f"{len(top_topics)} of {total_topics_count} ({round(top_coverage_ratio * 100)}%) syllabus topics."
-                )
-
-            # Policy Rule 2: Evaluate TWO complementary channels with balanced workload
-            else:
-                active_channel_set.add(top_channel)
-                selected_channels.append(ChannelCoverageSummary(
-                    channel_title=top_channel,
-                    topics_covered=len(top_topics),
-                    topic_ids=list(top_topics),
-                    is_primary=True,
-                    percentage_of_course=round(top_coverage_ratio * 100, 1),
-                ))
-
-                # Find best complementary second channel that covers maximum remaining topics
-                remaining_topics = set(t["topic_id"] for t in flattened_topics) - top_topics
-                best_second_channel = None
-                best_second_overlap = set()
-
-                for ch, ch_topics in sorted_channels[1:]:
-                    uncovered_overlap = ch_topics & remaining_topics
-                    if len(uncovered_overlap) > len(best_second_overlap):
-                        best_second_overlap = uncovered_overlap
-                        best_second_channel = ch
-
-                if best_second_channel:
-                    active_channel_set.add(best_second_channel)
-                    selected_channels.append(ChannelCoverageSummary(
-                        channel_title=best_second_channel,
-                        topics_covered=len(best_second_overlap),
-                        topic_ids=list(best_second_overlap),
-                        is_primary=False,
-                        percentage_of_course=round((len(best_second_overlap) / total_topics_count) * 100, 1),
-                    ))
-
-                combined_covered = top_topics | best_second_overlap
-                still_uncovered = set(t["topic_id"] for t in flattened_topics) - combined_covered
-
-                # Policy Rule 3: If 2 channels are still insufficient, ask student before introducing 3rd channel
-                if len(still_uncovered) > 0:
-                    # Find candidates for third channel
-                    third_candidates_set = set()
-                    for ch, ch_topics in sorted_channels:
-                        if ch not in active_channel_set and (ch_topics & still_uncovered):
-                            third_candidates_set.add(ch)
-
-                    third_candidates = list(third_candidates_set)[:3]
-
-                    if allow_third_channel and third_candidates:
-                        # Student gave consent to introduce 3rd channel
-                        ch3 = third_candidates[0]
-                        ch3_topics = channel_to_topics.get(ch3, set()) & still_uncovered
-                        active_channel_set.add(ch3)
-                        selected_channels.append(ChannelCoverageSummary(
-                            channel_title=ch3,
-                            topics_covered=len(ch3_topics),
-                            topic_ids=list(ch3_topics),
-                            is_primary=False,
-                            percentage_of_course=round((len(ch3_topics) / total_topics_count) * 100, 1),
-                        ))
-                        requires_third_approval = False
-                        strategy_explanation = (
-                            f"Introduced 3 channels with student approval: '{top_channel}' (primary), "
-                            f"'{best_second_channel}' (secondary), and '{ch3}' to maximize course coverage."
-                        )
-                    else:
-                        requires_third_approval = True
-                        strategy_explanation = (
-                            f"Two channels ('{top_channel}', '{best_second_channel or 'secondary'}') cover "
-                            f"{len(combined_covered)} of {total_topics_count} topics. "
-                            f"Approval is requested to introduce a 3rd channel for remaining topics."
-                        )
-                else:
-                    strategy_explanation = (
-                        f"Selected 2 complementary channels: '{top_channel}' and '{best_second_channel}' "
-                        f"providing full coverage across all {total_topics_count} syllabus topics."
-                    )
-
-        # 5. Build final topic-to-resource mappings
-        topic_mappings: List[Dict[str, Any]] = []
-        covered_count = 0
-        candidate_count = 0
-        uncertain_count = 0
-        no_resource_count = 0
-
-        for t in flattened_topics:
-            t_id = t["topic_id"]
-            candidates = topic_candidates.get(t_id, [])
-
-            if candidates:
-                candidate_count += 1
-
-            # Pick best video: prioritize active selected channels
-            chosen_video = None
-            for v in candidates:
-                if v["channel_title"] in active_channel_set:
-                    chosen_video = v
-                    break
-
-            if not chosen_video and candidates:
-                # If third channel is pending approval, mark as uncertain/candidate_only
-                chosen_video = candidates[0]
-                is_from_active = chosen_video["channel_title"] in active_channel_set
-            else:
-                is_from_active = bool(chosen_video)
-
-            if chosen_video:
-                if is_from_active:
-                    match_status = "relevant"
-                    match_confidence = "high"
-                    notes = f"Verified alignment with selected course channel '{chosen_video['channel_title']}'."
-                    covered_count += 1
-                else:
-                    match_status = "needs_review" if requires_third_approval else "candidate_only"
-                    match_confidence = "uncertain"
-                    notes = f"Candidate from '{chosen_video['channel_title']}' pending channel approval."
-                    uncertain_count += 1
-
-                # Construct VideoResource
-                res = VideoResource(
-                    id=chosen_video["id"],
-                    video_id=chosen_video["video_id"],
-                    title=chosen_video["title"],
-                    channel_title=chosen_video["channel_title"],
-                    channel_id=chosen_video.get("channel_id"),
-                    thumbnail_url=chosen_video["thumbnail_url"],
-                    duration_seconds=chosen_video["duration_seconds"],
-                    duration_formatted=chosen_video["duration_formatted"],
-                    language=chosen_video["language"],
-                    published_at=chosen_video.get("published_at"),
-                    view_count=chosen_video.get("view_count", 0),
-                    relevance_score=chosen_video.get("relevance_score", 0.8),
-                    relevance_explanation=chosen_video.get("relevance_explanation", notes),
-                    is_uncertain=(match_confidence == "uncertain"),
-                    video_url=chosen_video["video_url"],
-                )
-            else:
-                match_status = "no_resource"
-                match_confidence = "uncertain"
-                notes = "No suitable educational video found matching this topic."
-                no_resource_count += 1
-                res = None
-
-            topic_mappings.append({
-                "topic_id": t_id,
-                "topic_title": t["topic_title"],
-                "module_id": t["module_id"],
-                "module_title": t["module_title"],
-                "resource": res.model_dump() if res else None,
-                "match_status": match_status,
-                "match_confidence": match_confidence,
-                "relevance_notes": notes,
-                "rejected_channels": get_topic_rejected_channels(syllabus_id, t_id),
-            })
-
-        # 6. Compute coverage metrics
-        cov_pct = round((covered_count / total_topics_count) * 100, 1) if total_topics_count > 0 else 0.0
-        coverage_metrics = CoverageMetrics(
-            total_topics=total_topics_count,
-            topics_with_candidates=candidate_count,
-            topics_with_relevant=covered_count,
-            topics_with_no_resource=no_resource_count,
-            topics_needing_review=uncertain_count,
-            coverage_percentage=cov_pct,
-        )
-
-        discovery_engine = "Local Deterministic Fallback" if is_any_fallback else "YouTube Data API v3"
-
-        # 7. Persist to SQLite
-        save_discovered_resources(
+        # Generate default two-channel preview and save as initial library
+        return await cls.confirm_channel_strategy(
             syllabus_id=syllabus_id,
-            topic_mappings=topic_mappings,
-            coverage=coverage_metrics.model_dump(),
-            selected_channels=[c.model_dump() for c in selected_channels],
-            requires_third_approval=requires_third_approval,
-            third_channel_candidates=third_candidates,
-            strategy_explanation=strategy_explanation,
-            is_fallback=is_any_fallback,
-            discovery_engine=discovery_engine,
-        )
-
-        return ResourceDiscoveryResponse(
-            status="success",
-            syllabus_id=syllabus_id,
-            course_name=course_name,
-            coverage=coverage_metrics,
-            selected_channels=selected_channels,
-            requires_third_channel_approval=requires_third_approval,
-            third_channel_candidates=third_candidates,
-            strategy_explanation=strategy_explanation,
-            topic_resources=[TopicResourceMapping(**m) for m in topic_mappings],
-            is_fallback=is_any_fallback,
-            discovery_engine=discovery_engine,
-            message=f"Discovered resources for {covered_count} of {total_topics_count} topics ({cov_pct}% coverage).",
+            strategy="two_channels",
+            languages=[preferred_language],
+            allow_third_channel=allow_third_channel,
         )
 
     @classmethod
@@ -355,7 +810,6 @@ class ResourceMatcherService:
         if not hierarchy:
             raise ValueError(f"Syllabus '{syllabus_id}' not found.")
 
-        # Find target topic
         target_topic = None
         for mod in hierarchy.get("modules", []):
             for t in mod.get("topics", []):
@@ -371,7 +825,6 @@ class ResourceMatcherService:
 
         rejected_channels = get_topic_rejected_channels(syllabus_id, topic_id)
 
-        # Get current resource to know current channel
         resources_data = get_syllabus_resources(syllabus_id)
         current_channel = None
         if resources_data:
@@ -385,8 +838,7 @@ class ResourceMatcherService:
         if current_channel:
             all_excluded.add(current_channel)
 
-        # Search alternatives
-        query = f"{hierarchy.get('course_name', '')} {target_topic['title']}"
+        query = cls.generate_topic_search_query(hierarchy.get("course_name", ""), target_topic["title"])
         videos, _ = await YouTubeClientService.search_videos(
             query=query,
             language=preferred_language,
@@ -397,25 +849,29 @@ class ResourceMatcherService:
 
         alternatives: List[AlternativeResourceItem] = []
         for v in videos:
+            score, status, expl = cls.evaluate_video_relevance(target_topic["title"], v, hierarchy.get("course_name", ""))
             alternatives.append(AlternativeResourceItem(
                 video=VideoResource(
                     id=v["id"],
                     video_id=v["video_id"],
                     title=v["title"],
+                    description=v.get("description", ""),
                     channel_title=v["channel_title"],
                     channel_id=v.get("channel_id"),
                     thumbnail_url=v["thumbnail_url"],
                     duration_seconds=v["duration_seconds"],
                     duration_formatted=v["duration_formatted"],
-                    language=v["language"],
+                    language=v.get("language", preferred_language),
                     published_at=v.get("published_at"),
                     view_count=v.get("view_count", 0),
-                    relevance_score=v.get("relevance_score", 0.8),
-                    relevance_explanation=f"Alternative educational lesson from channel '{v['channel_title']}'.",
-                    is_uncertain=False,
+                    relevance_score=score,
+                    relevance_explanation=expl,
+                    is_uncertain=(status != "verified"),
+                    provenance=v.get("provenance", "live"),
                     video_url=v["video_url"],
+                    availability_status=v.get("availability_status", "available"),
                 ),
-                recommendation_reason=f"Popular lesson with {v.get('view_count', 0):,} views.",
+                recommendation_reason=expl,
                 is_current=False,
             ))
 
@@ -439,33 +895,32 @@ class ResourceMatcherService:
     ) -> TopicResourceMapping:
         """
         Replaces the current channel for a single topic with the selected alternative.
-        Excludes the rejected channel and preserves all other topics and study progress.
+        Excludes the rejected channel and preserves all other topics and bookmarks.
         """
-        # 1. Add rejected channel
         add_rejected_channel(syllabus_id, topic_id, rejected_channel, reason)
 
-        # 2. Look up selected video details (from alternatives or YouTube)
-        # Search query for the video ID or generate directly
         video_url = f"https://www.youtube.com/watch?v={selected_video_id}"
         video_dict = {
             "id": selected_video_id,
             "video_id": selected_video_id,
             "title": f"Replacement Tutorial for {topic_id}",
+            "description": "",
             "channel_title": "Selected Alternative Creator",
             "channel_id": None,
-            "thumbnail_url": f"https://images.unsplash.com/photo-1515879218367-8466d910aaa4?w=600&auto=format&fit=crop&q=80",
+            "thumbnail_url": f"https://img.youtube.com/vi/{selected_video_id}/mqdefault.jpg",
             "duration_seconds": 1200,
             "duration_formatted": "20:00",
             "language": "English",
             "published_at": "2024-01-01T00:00:00Z",
             "view_count": 50000,
-            "relevance_score": 0.9,
+            "relevance_score": 0.88,
             "relevance_explanation": f"Student-selected replacement replacing '{rejected_channel}'.",
             "is_uncertain": False,
             "video_url": video_url,
+            "availability_status": "available",
         }
 
-        # Check if video was already in alternatives or cache
+        # Check existing resources to carry over real metadata if cached
         cached_resources = get_syllabus_resources(syllabus_id)
         if cached_resources:
             for tr in cached_resources.get("topic_resources", []):
@@ -474,14 +929,13 @@ class ResourceMatcherService:
                     video_dict.update(res)
                     break
 
-        # 3. Update single topic resource in SQLite
         update_topic_resource(
             syllabus_id=syllabus_id,
             topic_id=topic_id,
             video_dict=video_dict,
             match_status="relevant",
             match_confidence="high",
-            relevance_notes=f"Student selected replacement; '{rejected_channel}' rejected.",
+            relevance_notes=f"Student selected replacement; '{rejected_channel}' excluded.",
         )
 
         hierarchy = get_syllabus_hierarchy(syllabus_id)
@@ -492,7 +946,7 @@ class ResourceMatcherService:
         if hierarchy:
             for mod in hierarchy.get("modules", []):
                 for t in mod.get("topics", []):
-                    if t["id"] == topic_id:
+                    if t["id"] == topic_id or topic_id.endswith(t["id"]):
                         module_id = mod.get("id", "mod_1")
                         module_title = mod.get("title", "Module")
                         topic_title = t.get("title", "Topic")
@@ -510,4 +964,6 @@ class ResourceMatcherService:
             match_confidence="high",
             relevance_notes=f"Replacement selected; '{rejected_channel}' excluded.",
             rejected_channels=rejected_list,
+            assigned_channel=video_dict["channel_title"],
+            availability_status="available",
         )

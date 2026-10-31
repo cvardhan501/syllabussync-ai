@@ -1,5 +1,6 @@
 from typing import List, Optional, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+import datetime
 
 
 class TaskItemSchema(BaseModel):
@@ -42,9 +43,24 @@ class StudyPlanCreateRequest(BaseModel):
     start_date: Optional[str] = Field(default=None, description="Plan start date (defaults to today)")
     preserve_completed: bool = Field(default=True, description="Preserve completed tasks when regenerating")
 
+    @field_validator("exam_date")
+    @classmethod
+    def validate_exam_date(cls, v: str) -> str:
+        try:
+            d = datetime.date.fromisoformat(v)
+            if d < datetime.date.today():
+                raise ValueError("Exam date cannot be in the past.")
+        except ValueError as err:
+            if "Exam date cannot be in the past" in str(err):
+                raise
+            raise ValueError("Invalid date format. Expected YYYY-MM-DD.")
+        return v
+
 
 class StudyPlanResponse(BaseModel):
     id: str = Field(description="Unique identifier of the study plan")
+    owner_user_id: Optional[str] = Field(default=None, description="Owner user UUID")
+    course_id: Optional[str] = Field(default=None, description="Associated course ID")
     syllabus_id: str = Field(description="Associated syllabus ID")
     course_name: Optional[str] = Field(default=None, description="Course name")
     title: str = Field(description="Study plan title")
@@ -92,3 +108,4 @@ class UserSettingsSchema(BaseModel):
     study_reminders: bool = Field(default=True)
     deadline_alerts: bool = Field(default=True)
     auto_save_progress: bool = Field(default=True)
+

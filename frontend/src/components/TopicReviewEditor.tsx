@@ -11,13 +11,21 @@ import {
   Check, 
   Loader2,
   ArrowRight,
-  ChevronRight
+  ChevronRight,
+  ChevronDown,
+  Split,
+  GitMerge,
+  BookOpen,
+  GraduationCap,
+  X
 } from 'lucide-react';
 import type { 
   SyllabusAnalysisResponse, 
   ModuleItem, 
   TopicItem, 
-  TopicUpdateRequest 
+  TopicUpdateRequest,
+  ValidationReport,
+  ValidationWarning
 } from '../types';
 import { apiService, ApiErrorResponse } from '../services/api';
 
@@ -27,6 +35,15 @@ interface TopicReviewEditorProps {
   onConfirmTopics: () => void;
   onViewSource?: () => void;
 }
+
+const cleanModuleTitle = (title: string): string => {
+  return title.replace(/^(?:Module|Unit|Chapter|Part)\s*\d+[\s:—\-]+/i, '').trim() || title.trim();
+};
+
+const formatModuleTitle = (index: number, title: string): string => {
+  const clean = cleanModuleTitle(title);
+  return `Module ${index + 1} — ${clean}`;
+};
 
 export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
   analysisData,
@@ -41,6 +58,20 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
   );
   const [ambiguousSections] = useState<string[]>(analysisData.ambiguous_sections);
   const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
+  const [newSubtopicInputs, setNewSubtopicInputs] = useState<{ [topicId: string]: string }>({});
+
+  // Quality Validation & Metadata State
+  const [validationReport, setValidationReport] = useState<ValidationReport | undefined>(analysisData.validation_report);
+  const [showValidationDetails, setShowValidationDetails] = useState(false);
+  const [showMetadataDrawer, setShowMetadataDrawer] = useState(false);
+  const [showLowConfidenceModal, setShowLowConfidenceModal] = useState(false);
+  const [splitModalData, setSplitModalData] = useState<{
+    moduleId: string;
+    topicId: string;
+    originalTitle: string;
+    splitTitle1: string;
+    splitTitle2: string;
+  } | null>(null);
 
   // UI state
   const [isSaving, setIsSaving] = useState(false);
@@ -56,6 +87,17 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
     title: string;
   } | null>(null);
 
+  // Helpers for warnings
+  const getTopicWarnings = (topicId: string): ValidationWarning[] => {
+    if (!validationReport?.warnings) return [];
+    return validationReport.warnings.filter((w) => w.topic_id === topicId);
+  };
+
+  const getModuleWarnings = (moduleId: string): ValidationWarning[] => {
+    if (!validationReport?.warnings) return [];
+    return validationReport.warnings.filter((w) => w.module_id === moduleId && !w.topic_id);
+  };
+
   // Active Module
   const activeModule = modules.find((m) => m.id === activeModuleId) || modules[0];
 
@@ -65,7 +107,7 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
     const newModId = `mod_custom_${Date.now()}`;
     const newModule: ModuleItem = {
       id: newModId,
-      title: `Module ${nextIdx}: New Unit`,
+      title: `Module ${nextIdx} — New Unit`,
       order_index: modules.length,
       topics: [
         {
@@ -102,11 +144,13 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
     updated[index] = updated[targetIdx];
     updated[targetIdx] = temp;
 
-    updated.forEach((m, idx) => {
-      m.order_index = idx;
-    });
+    const renumbered = updated.map((m, idx) => ({
+      ...m,
+      title: formatModuleTitle(idx, m.title),
+      order_index: idx,
+    }));
 
-    setModules(updated);
+    setModules(renumbered);
     setIsDirty(true);
   };
 
@@ -181,6 +225,71 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
     setIsDirty(true);
   };
 
+  // Subtopic Management
+  const handleAddSubtopic = (moduleId: string, topicId: string, title: string) => {
+    if (!title.trim()) return;
+    setModules((prev) =>
+      prev.map((mod) => {
+        if (mod.id !== moduleId) return mod;
+        return {
+          ...mod,
+          topics: mod.topics.map((t) => {
+            if (t.id !== topicId) return t;
+            const newSub = {
+              id: `sub_${Date.now()}`,
+              title: title.trim(),
+            };
+            return {
+              ...t,
+              subtopics: [...(t.subtopics || []), newSub],
+            };
+          }),
+        };
+      })
+    );
+    setIsDirty(true);
+  };
+
+  const handleDeleteSubtopic = (moduleId: string, topicId: string, subIdx: number) => {
+    setModules((prev) =>
+      prev.map((mod) => {
+        if (mod.id !== moduleId) return mod;
+        return {
+          ...mod,
+          topics: mod.topics.map((t) => {
+            if (t.id !== topicId) return t;
+            const updatedSubs = [...(t.subtopics || [])];
+            updatedSubs.splice(subIdx, 1);
+            return {
+              ...t,
+              subtopics: updatedSubs,
+            };
+          }),
+        };
+      })
+    );
+    setIsDirty(true);
+  };
+
+  // Auto-Balance Topics in Module based on official duration
+  const handleAutoBalance = () => {
+    if (!activeModule?.official_minutes || activeModule.topics.length === 0) return;
+    const count = activeModule.topics.length;
+    const base = Math.floor(activeModule.official_minutes / count);
+    const rem = activeModule.official_minutes % count;
+    setModules((prev) =>
+      prev.map((mod) => {
+        if (mod.id !== activeModule.id) return mod;
+        const updated = mod.topics.map((t, i) => ({
+          ...t,
+          estimated_minutes: base + (i < rem ? 1 : 0),
+        }));
+        return { ...mod, topics: updated };
+      })
+    );
+    setIsDirty(true);
+  };
+
   // Delete Confirmation
   const confirmDelete = () => {
     if (!deleteTarget) return;
@@ -192,9 +301,14 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
         return;
       }
       const remaining = modules.filter((m) => m.id !== deleteTarget.moduleId);
-      setModules(remaining);
-      if (activeModuleId === deleteTarget.moduleId && remaining[0]) {
-        setActiveModuleId(remaining[0].id);
+      const renumbered = remaining.map((m, idx) => ({
+        ...m,
+        title: formatModuleTitle(idx, m.title),
+        order_index: idx,
+      }));
+      setModules(renumbered);
+      if (activeModuleId === deleteTarget.moduleId && renumbered[0]) {
+        setActiveModuleId(renumbered[0].id);
       }
     } else if (deleteTarget.type === 'topic' && deleteTarget.topicId) {
       setModules((prev) =>
@@ -212,20 +326,139 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
     setDeleteTarget(null);
   };
 
+  // Merge Topic with Previous Topic
+  const handleMergeTopicWithPrevious = (moduleId: string, topicIndex: number) => {
+    if (topicIndex === 0) return;
+    setModules((prev) =>
+      prev.map((mod) => {
+        if (mod.id !== moduleId) return mod;
+        const prevTopic = mod.topics[topicIndex - 1];
+        const currTopic = mod.topics[topicIndex];
+        const mergedTopic: TopicItem = {
+          ...prevTopic,
+          title: `${prevTopic.title} & ${currTopic.title}`,
+          explanation: [prevTopic.explanation, currTopic.explanation].filter(Boolean).join(' '),
+          estimated_minutes: prevTopic.estimated_minutes + currTopic.estimated_minutes,
+          subtopics: [...(prevTopic.subtopics || []), ...(currTopic.subtopics || [])],
+          prerequisites: Array.from(new Set([...(prevTopic.prerequisites || []), ...(currTopic.prerequisites || [])])),
+        };
+        const updatedTopics = [...mod.topics];
+        updatedTopics.splice(topicIndex - 1, 2, mergedTopic);
+        updatedTopics.forEach((t, i) => {
+          t.order_index = i;
+        });
+        return { ...mod, topics: updatedTopics };
+      })
+    );
+    setIsDirty(true);
+  };
+
+  // Open Topic Split Modal
+  const handleOpenSplitModal = (moduleId: string, topic: TopicItem) => {
+    let part1 = topic.title;
+    let part2 = 'Continued';
+    const delimiters = [' & ', ' and ', ' - ', ' – ', ', ', '; '];
+    for (const d of delimiters) {
+      if (topic.title.includes(d)) {
+        const parts = topic.title.split(d);
+        if (parts.length >= 2 && parts[0].trim() && parts[1].trim()) {
+          part1 = parts[0].trim();
+          part2 = parts.slice(1).join(d).trim();
+          break;
+        }
+      }
+    }
+    setSplitModalData({
+      moduleId,
+      topicId: topic.id,
+      originalTitle: topic.title,
+      splitTitle1: part1,
+      splitTitle2: part2,
+    });
+  };
+
+  // Confirm Split Action
+  const handleConfirmSplit = () => {
+    if (!splitModalData) return;
+    const { moduleId, topicId, splitTitle1, splitTitle2 } = splitModalData;
+    setModules((prev) =>
+      prev.map((mod) => {
+        if (mod.id !== moduleId) return mod;
+        const topicIdx = mod.topics.findIndex((t) => t.id === topicId);
+        if (topicIdx === -1) return mod;
+        const curr = mod.topics[topicIdx];
+        const halfMinutes = Math.max(15, Math.round(curr.estimated_minutes / 2));
+        const t1: TopicItem = {
+          ...curr,
+          title: splitTitle1.trim() || `${curr.title} (Part 1)`,
+          estimated_minutes: halfMinutes,
+        };
+        const t2: TopicItem = {
+          ...curr,
+          id: `top_split_${Date.now()}`,
+          title: splitTitle2.trim() || `${curr.title} (Part 2)`,
+          estimated_minutes: halfMinutes,
+          order_index: topicIdx + 1,
+        };
+        const updated = [...mod.topics];
+        updated.splice(topicIdx, 1, t1, t2);
+        updated.forEach((t, i) => {
+          t.order_index = i;
+        });
+        return { ...mod, topics: updated };
+      })
+    );
+    setIsDirty(true);
+    setSplitModalData(null);
+  };
+
+  // Confirmation Gate for Structure
+  const handleConfirmStructure = () => {
+    if (validationReport?.needs_confirmation) {
+      setShowLowConfidenceModal(true);
+    } else {
+      onConfirmTopics();
+    }
+  };
+
   // Save changes to SQLite backend
   const handleSave = async () => {
     setIsSaving(true);
     setErrorMessage(null);
     setSaveSuccess(false);
 
+    const normalizedModules = modules.map((mod, mIdx) => ({
+      ...mod,
+      title: formatModuleTitle(mIdx, mod.title),
+      order_index: mIdx,
+      topics: mod.topics.map((t, tIdx) => ({
+        ...t,
+        order_index: tIdx,
+      })),
+    }));
+
     const payload: TopicUpdateRequest = {
       course_name: courseName,
-      modules,
+      course_code: analysisData.course_code,
+      credits: analysisData.credits,
+      course_objectives: analysisData.course_objectives,
+      course_outcomes: analysisData.course_outcomes,
+      prerequisites: analysisData.prerequisites,
+      textbooks: analysisData.textbooks,
+      reference_books: analysisData.reference_books,
+      online_resources: analysisData.online_resources,
+      assignments: analysisData.assignments,
+      lab_experiments: analysisData.lab_experiments,
+      has_lab_component: analysisData.has_lab_component,
+      assessment_info: analysisData.assessment_info,
+      modules: normalizedModules,
       ambiguous_sections: ambiguousSections,
+      validation_report: validationReport,
     };
 
     try {
       const updated = await apiService.updateSyllabusTopics(analysisData.syllabus_id, payload);
+      setValidationReport(updated.validation_report);
       onUpdateSuccess(updated);
       setIsDirty(false);
       setSaveSuccess(true);
@@ -320,15 +553,20 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
-          {analysisData.is_fallback ? (
-            <span className="text-[11px] font-mono px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1.5">
-              <AlertTriangle className="w-3 h-3 text-amber-400" />
-              <span>Dev Fallback Mode</span>
+          {analysisData.ai_status === 'completed' || (!analysisData.is_fallback && !analysisData.ai_status) ? (
+            <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1.5 shadow-xs">
+              <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Analysis completed</span>
+            </span>
+          ) : analysisData.ai_status === 'temporarily_unavailable' ? (
+            <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1.5 shadow-xs" title={analysisData.ai_status_message || 'AI analysis temporarily unavailable'}>
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+              <span>AI analysis temporarily unavailable</span>
             </span>
           ) : (
-            <span className="text-[11px] font-mono px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1.5">
-              <Sparkles className="w-3 h-3 text-emerald-400" />
-              <span>Strands Agents Verified</span>
+            <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-blue-500/15 text-blue-300 border border-blue-500/30 flex items-center gap-1.5 shadow-xs" title={analysisData.ai_status_message || 'Local syllabus extraction available'}>
+              <BookOpen className="w-3.5 h-3.5 text-blue-400" />
+              <span>Local syllabus extraction available</span>
             </span>
           )}
         </div>
@@ -347,20 +585,262 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
         </div>
       )}
 
-      {/* Ambiguous Sections Alert */}
-      {ambiguousSections.length > 0 && (
-        <div className="rounded-2xl bg-amber-950/20 border border-amber-800/40 p-4 space-y-1.5">
-          <div className="flex items-center gap-2 text-amber-400 font-semibold text-xs">
-            <AlertTriangle className="w-4 h-4 shrink-0" />
-            <span>Syllabus Notes / Ambiguities:</span>
+      {/* Structural Validation Report Banner */}
+      {validationReport && (
+        <div className={`rounded-2xl border p-4 space-y-3 transition ${
+          validationReport.quality_score >= 80
+            ? 'bg-[#081726]/80 border-emerald-500/30'
+            : validationReport.quality_score >= 60
+            ? 'bg-[#1a1406]/80 border-amber-500/30'
+            : 'bg-[#21090d]/80 border-rose-500/30'
+        }`}>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold text-xs shrink-0 ${
+                validationReport.quality_score >= 80
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                  : validationReport.quality_score >= 60
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                  : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+              }`}>
+                {validationReport.quality_score}%
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h4 className="text-xs sm:text-sm font-bold text-white m-0">
+                    Syllabus Intelligence Audit
+                  </h4>
+                  <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                    validationReport.quality_score >= 80
+                      ? 'bg-emerald-500/15 text-emerald-300'
+                      : validationReport.quality_score >= 60
+                      ? 'bg-amber-500/15 text-amber-300'
+                      : 'bg-rose-500/15 text-rose-300'
+                  }`}>
+                    {validationReport.quality_score >= 80 ? 'High Quality' : validationReport.quality_score >= 60 ? 'Needs Review' : 'Critical Defects Detected'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 m-0 mt-0.5">
+                  {validationReport.summary}
+                </p>
+              </div>
+            </div>
+
+            {validationReport.warnings.length > 0 && (
+              <button
+                onClick={() => setShowValidationDetails(!showValidationDetails)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#0f1d38] hover:bg-[#162a52] text-slate-300 text-xs font-medium border border-[#1e3462] transition cursor-pointer self-start sm:self-auto shrink-0"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                <span>{validationReport.warnings.length} Audit Issue{validationReport.warnings.length > 1 ? 's' : ''}</span>
+                <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showValidationDetails ? 'rotate-180' : ''}`} />
+              </button>
+            )}
           </div>
-          <ul className="text-xs text-amber-200/90 space-y-1 pl-5 list-disc m-0">
-            {ambiguousSections.map((sec, idx) => (
-              <li key={idx} className="leading-relaxed">{sec}</li>
-            ))}
-          </ul>
+
+          {/* Collapsible Warnings Details */}
+          {showValidationDetails && validationReport.warnings.length > 0 && (
+            <div className="pt-3 border-t border-slate-800/60 space-y-2">
+              {validationReport.warnings.map((w, idx) => (
+                <div
+                  key={idx}
+                  className="rounded-xl bg-[#070e1c] border border-slate-800 p-2.5 flex items-start justify-between gap-3 text-xs"
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${
+                      w.severity === 'error' ? 'text-rose-400' : 'text-amber-400'
+                    }`} />
+                    <div className="space-y-0.5">
+                      <p className="font-semibold text-slate-200 m-0">
+                        {w.message}
+                      </p>
+                      {w.suggested_action && (
+                        <p className="text-[11px] text-slate-400 m-0">
+                          <span className="text-blue-400 font-medium">Recommended action:</span> {w.suggested_action}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded-sm bg-slate-800 text-slate-400 shrink-0">
+                    {w.code}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
+
+      {/* Separated Course Metadata & Objectives Section */}
+      {(analysisData.course_objectives?.length || analysisData.course_outcomes?.length || analysisData.textbooks?.length || analysisData.reference_books?.length || analysisData.online_resources?.length || analysisData.assignments?.length || analysisData.lab_experiments?.length || analysisData.credits) && (
+        <div className="rounded-2xl bg-[#091224] border border-[#16274e] p-4">
+          <button
+            onClick={() => setShowMetadataDrawer(!showMetadataDrawer)}
+            className="w-full flex items-center justify-between text-left cursor-pointer group"
+          >
+            <div className="flex items-center gap-2.5">
+              <BookOpen className="w-4 h-4 text-blue-400" />
+              <span className="text-xs font-bold text-slate-200 group-hover:text-white transition">
+                Course Syllabus Specifications & Literature
+              </span>
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-300 border border-blue-500/25">
+                Segregated from Topics
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 text-xs text-slate-400 group-hover:text-slate-200">
+              <span className="text-[11px] font-mono">
+                {((analysisData.course_objectives?.length || 0) + (analysisData.course_outcomes?.length || 0) + (analysisData.textbooks?.length || 0) + (analysisData.reference_books?.length || 0) + (analysisData.online_resources?.length || 0) + (analysisData.assignments?.length || 0) + (analysisData.lab_experiments?.length || 0))} items
+              </span>
+              <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showMetadataDrawer ? 'rotate-180' : ''}`} />
+            </div>
+          </button>
+
+          {showMetadataDrawer && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4 pt-4 border-t border-[#16274e] text-xs">
+              {analysisData.credits && (
+                <div className="col-span-full rounded-xl bg-[#070e1c] border border-[#17274b] p-3 flex items-center justify-between">
+                  <span className="text-slate-400 font-semibold">Course Credits & Term:</span>
+                  <span className="text-white font-mono font-bold">{analysisData.credits}</span>
+                </div>
+              )}
+
+              {analysisData.course_objectives && analysisData.course_objectives.length > 0 && (
+                <div className="rounded-xl bg-[#070e1c] border border-[#17274b] p-3.5 space-y-2">
+                  <div className="flex items-center gap-1.5 text-blue-400 font-semibold text-xs">
+                    <GraduationCap className="w-4 h-4" />
+                    <span>Course Objectives ({analysisData.course_objectives.length})</span>
+                  </div>
+                  <ul className="text-[11px] text-slate-300 space-y-1.5 pl-4 list-disc m-0">
+                    {analysisData.course_objectives.map((obj, i) => (
+                      <li key={i} className="leading-relaxed">{obj}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {analysisData.course_outcomes && analysisData.course_outcomes.length > 0 && (
+                <div className="rounded-xl bg-[#070e1c] border border-[#17274b] p-3.5 space-y-2">
+                  <div className="flex items-center gap-1.5 text-emerald-400 font-semibold text-xs">
+                    <Check className="w-4 h-4" />
+                    <span>Expected Course Outcomes ({analysisData.course_outcomes.length})</span>
+                  </div>
+                  <ul className="text-[11px] text-slate-300 space-y-1.5 pl-4 list-disc m-0">
+                    {analysisData.course_outcomes.map((co, i) => (
+                      <li key={i} className="leading-relaxed">{co}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {analysisData.assignments && analysisData.assignments.length > 0 && (
+                <div className="rounded-xl bg-[#070e1c] border border-[#17274b] p-3.5 space-y-2">
+                  <div className="flex items-center gap-1.5 text-indigo-400 font-semibold text-xs">
+                    <BookOpen className="w-4 h-4" />
+                    <span>Assignments & Case Studies ({analysisData.assignments.length})</span>
+                  </div>
+                  <ul className="text-[11px] text-slate-300 space-y-1.5 pl-4 list-disc m-0">
+                    {analysisData.assignments.map((asgn, i) => (
+                      <li key={i} className="leading-relaxed">{asgn}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {analysisData.textbooks && analysisData.textbooks.length > 0 && (
+                <div className="rounded-xl bg-[#070e1c] border border-[#17274b] p-3.5 space-y-2">
+                  <div className="flex items-center gap-1.5 text-amber-400 font-semibold text-xs">
+                    <BookOpen className="w-4 h-4" />
+                    <span>Prescribed Textbooks ({analysisData.textbooks.length})</span>
+                  </div>
+                  <ul className="text-[11px] text-slate-300 space-y-1.5 pl-4 list-disc m-0">
+                    {analysisData.textbooks.map((tb, i) => (
+                      <li key={i} className="leading-relaxed">{tb}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {analysisData.reference_books && analysisData.reference_books.length > 0 && (
+                <div className="rounded-xl bg-[#070e1c] border border-[#17274b] p-3.5 space-y-2">
+                  <div className="flex items-center gap-1.5 text-purple-400 font-semibold text-xs">
+                    <BookOpen className="w-4 h-4" />
+                    <span>Reference Books ({analysisData.reference_books.length})</span>
+                  </div>
+                  <ul className="text-[11px] text-slate-300 space-y-1.5 pl-4 list-disc m-0">
+                    {analysisData.reference_books.map((rb, i) => (
+                      <li key={i} className="leading-relaxed">{rb}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {analysisData.online_resources && analysisData.online_resources.length > 0 && (
+                <div className="rounded-xl bg-[#070e1c] border border-[#17274b] p-3.5 space-y-2">
+                  <div className="flex items-center gap-1.5 text-cyan-400 font-semibold text-xs">
+                    <BookOpen className="w-4 h-4" />
+                    <span>Online & Web Resources ({analysisData.online_resources.length})</span>
+                  </div>
+                  <ul className="text-[11px] text-slate-300 space-y-1.5 pl-4 list-disc m-0">
+                    {analysisData.online_resources.map((url, i) => (
+                      <li key={i} className="leading-relaxed font-mono truncate">
+                        <a href={url.startsWith('http') ? url : `https://${url}`} target="_blank" rel="noreferrer" className="text-cyan-400 hover:underline">
+                          {url}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {analysisData.lab_experiments && analysisData.lab_experiments.length > 0 && (
+                <div className="col-span-full rounded-xl bg-[#070e1c] border border-[#17274b] p-3.5 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5 text-emerald-400 font-semibold text-xs">
+                      <GraduationCap className="w-4 h-4" />
+                      <span>Indicative Lab Experiments ({analysisData.lab_experiments.length})</span>
+                    </div>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">
+                      Segregated from Theory
+                    </span>
+                  </div>
+                  <ol className="text-[11px] text-slate-300 space-y-1.5 pl-4 list-decimal m-0 max-h-48 overflow-y-auto">
+                    {analysisData.lab_experiments.map((exp, i) => (
+                      <li key={i} className="leading-relaxed">{exp}</li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Ambiguous Sections Alert (Document Ambiguities Only — Never Technical Diagnostics) */}
+      {(() => {
+        const cleanAmbiguities = ambiguousSections.filter(
+          (sec) =>
+            !sec.includes('[DEVELOPMENT FALLBACK') &&
+            !sec.includes('MODEL_TOOL_USE_ERROR') &&
+            !sec.includes('modelStreamErrorException') &&
+            !sec.includes('CONFIG_MISSING') &&
+            !sec.includes('AUTHORIZATION_FAILURE') &&
+            !sec.includes('MODEL_NOT_AVAILABLE')
+        );
+        if (cleanAmbiguities.length === 0) return null;
+        return (
+          <div className="rounded-2xl bg-amber-950/20 border border-amber-800/40 p-4 space-y-1.5">
+            <div className="flex items-center gap-2 text-amber-400 font-semibold text-xs">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>Syllabus Notes / Ambiguities:</span>
+            </div>
+            <ul className="text-xs text-amber-200/90 space-y-1 pl-5 list-disc m-0">
+              {cleanAmbiguities.map((sec, idx) => (
+                <li key={idx} className="leading-relaxed">{sec}</li>
+              ))}
+            </ul>
+          </div>
+        );
+      })()}
 
       {/* Two-Pane Layout (Matches Screen 4 Exactly) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
@@ -370,6 +850,7 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
             {modules.map((mod, mIdx) => {
               const isSelected = mod.id === activeModule?.id;
               const modMinutes = mod.topics.reduce((acc, t) => acc + t.estimated_minutes, 0);
+              const modWarnings = getModuleWarnings(mod.id);
 
               return (
                 <div
@@ -382,9 +863,16 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
                   }`}
                 >
                   <div className="min-w-0 space-y-0.5">
-                    <p className={`text-xs font-bold truncate m-0 ${isSelected ? 'text-white' : 'text-slate-200'}`}>
-                      {mod.title}
-                    </p>
+                    <div className="flex items-center gap-1.5">
+                      <p className={`text-xs font-bold truncate m-0 ${isSelected ? 'text-white' : 'text-slate-200'}`}>
+                        {mod.title}
+                      </p>
+                      {modWarnings.length > 0 && (
+                        <span title={modWarnings[0].message}>
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        </span>
+                      )}
+                    </div>
                     <p className="text-[11px] text-slate-400 m-0">
                       {mod.topics.length} topics • {modMinutes} min
                     </p>
@@ -432,46 +920,85 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
 
         {/* Right Pane: Selected Module Detail & Topics (7 cols) */}
         <div className="lg:col-span-7 rounded-2xl bg-[#0b1429] border border-[#18284e] p-5 space-y-4">
-          {activeModule ? (
-            <>
-              {/* Active Module Header */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[#18284e]">
-                <div className="flex-1 min-w-0">
-                  <input
-                    type="text"
-                    value={activeModule.title}
-                    onChange={(e) => handleUpdateModuleTitle(activeModule.id, e.target.value)}
-                    className="font-bold text-sm sm:text-base text-white bg-transparent border-b border-transparent hover:border-slate-700 focus:border-blue-500 focus:outline-hidden px-1 py-0.5 rounded-sm transition w-full"
-                    title="Click to edit module title"
-                  />
-                  <p className="text-[11px] text-slate-400 mt-0.5 m-0 px-1">
-                    {activeModule.topics.length} topics • {activeModule.topics.reduce((acc, t) => acc + t.estimated_minutes, 0)} min
-                  </p>
+          {activeModule ? (() => {
+            const allocatedMinutes = activeModule.topics.reduce((acc, t) => acc + t.estimated_minutes, 0);
+            const hasMismatch = Boolean(activeModule.official_minutes && allocatedMinutes !== activeModule.official_minutes);
+
+            return (
+              <>
+                {/* Active Module Header */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[#18284e]">
+                  <div className="flex-1 min-w-0">
+                    <input
+                      type="text"
+                      value={activeModule.title}
+                      onChange={(e) => handleUpdateModuleTitle(activeModule.id, e.target.value)}
+                      className="font-bold text-sm sm:text-base text-white bg-transparent border-b border-transparent hover:border-slate-700 focus:border-blue-500 focus:outline-hidden px-1 py-0.5 rounded-sm transition w-full"
+                      title="Click to edit module title"
+                    />
+                    <div className="flex items-center gap-2 mt-1 px-1">
+                      <p className="text-[11px] text-slate-400 m-0">
+                        {activeModule.topics.length} topics • {allocatedMinutes} min allocated
+                      </p>
+                      {activeModule.official_minutes && (
+                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-300 border border-blue-500/30 font-mono">
+                          Official: {activeModule.official_hours ? `${activeModule.official_hours}h / ` : ''}{activeModule.official_minutes} min
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    {hasMismatch && (
+                      <button
+                        onClick={handleAutoBalance}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-xs font-medium transition cursor-pointer"
+                        title="Distribute official module hours evenly across topics"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Auto-Balance</span>
+                      </button>
+                    )}
+                    <button
+                      onClick={() => handleAddTopic(activeModule.id)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 text-xs font-medium transition cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Add Topic</span>
+                    </button>
+                    <button
+                      onClick={() =>
+                        setDeleteTarget({
+                          type: 'module',
+                          moduleId: activeModule.id,
+                          title: activeModule.title,
+                        })
+                      }
+                      className="p-1.5 rounded-xl text-rose-400 hover:text-rose-300 hover:bg-rose-950/30 transition cursor-pointer"
+                      title="Delete this module"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
 
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    onClick={() => handleAddTopic(activeModule.id)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 text-xs font-medium transition cursor-pointer"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Add Topic</span>
-                  </button>
-                  <button
-                    onClick={() =>
-                      setDeleteTarget({
-                        type: 'module',
-                        moduleId: activeModule.id,
-                        title: activeModule.title,
-                      })
-                    }
-                    className="p-1.5 rounded-xl text-rose-400 hover:text-rose-300 hover:bg-rose-950/30 transition cursor-pointer"
-                    title="Delete this module"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
+                {/* Duration warning alert */}
+                {hasMismatch && (
+                  <div className="rounded-xl bg-amber-950/30 border border-amber-800/40 p-2.5 text-xs text-amber-300 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />
+                      <span>
+                        Topic duration total ({allocatedMinutes} min) {allocatedMinutes < activeModule.official_minutes! ? 'falls short of' : 'exceeds'} official module delivery ({activeModule.official_minutes} min).
+                      </span>
+                    </div>
+                    <button
+                      onClick={handleAutoBalance}
+                      className="text-[11px] underline font-semibold text-amber-200 hover:text-white cursor-pointer shrink-0"
+                    >
+                      Auto-Balance to {activeModule.official_minutes}m
+                    </button>
+                  </div>
+                )}
 
               {/* Topics inside Active Module */}
               <div className="space-y-2.5">
@@ -497,8 +1024,8 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
                         <div className="flex items-center justify-between gap-3">
                           {/* Topic Number & Title */}
                           <div className="flex items-center gap-2.5 flex-1 min-w-0">
-                            <span className="w-5 h-5 rounded-md bg-[#111e3b] text-slate-400 text-[11px] font-mono flex items-center justify-center shrink-0">
-                              {tIdx + 1}
+                            <span className="w-6 h-5 rounded-md bg-[#111e3b] text-blue-300 text-[11px] font-mono font-semibold flex items-center justify-center shrink-0">
+                              {tIdx + 1}.
                             </span>
 
                             <input
@@ -572,6 +1099,25 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
                               <ArrowDown className="w-3.5 h-3.5" />
                             </button>
 
+                            {/* Merge with previous */}
+                            <button
+                              onClick={() => handleMergeTopicWithPrevious(activeModule.id, tIdx)}
+                              disabled={tIdx === 0}
+                              className="p-1 text-slate-500 hover:text-amber-400 disabled:opacity-20 cursor-pointer"
+                              title={tIdx === 0 ? "Cannot merge first topic" : "Merge with previous topic"}
+                            >
+                              <GitMerge className="w-3.5 h-3.5" />
+                            </button>
+
+                            {/* Split topic */}
+                            <button
+                              onClick={() => handleOpenSplitModal(activeModule.id, topic)}
+                              className="p-1 text-slate-500 hover:text-blue-400 cursor-pointer"
+                              title="Split topic into parts"
+                            >
+                              <Split className="w-3.5 h-3.5" />
+                            </button>
+
                             {/* Edit toggle */}
                             <button
                               onClick={() => setEditingTopicId(isEditing ? null : topic.id)}
@@ -600,6 +1146,82 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
                             </button>
                           </div>
                         </div>
+
+                        {/* Nested Subtopics Display & Fast Addition */}
+                        <div className="pt-1 space-y-1.5">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {topic.subtopics && topic.subtopics.length > 0 && (
+                              <>
+                                <span className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">Subtopics:</span>
+                                {topic.subtopics.map((sub, sIdx) => (
+                                  <span
+                                    key={sub.id || sIdx}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#132247] text-slate-300 text-[11px] border border-[#1f366e]"
+                                  >
+                                    <span>{sub.title}</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteSubtopic(activeModule.id, topic.id, sIdx)}
+                                      className="text-slate-500 hover:text-rose-400 cursor-pointer ml-0.5"
+                                      title="Remove subtopic"
+                                    >
+                                      <X className="w-2.5 h-2.5" />
+                                    </button>
+                                  </span>
+                                ))}
+                              </>
+                            )}
+                            {/* Inline Add Subtopic Input */}
+                            <div className="inline-flex items-center gap-1">
+                              <input
+                                type="text"
+                                placeholder="+ Add subtopic..."
+                                value={newSubtopicInputs[topic.id] || ''}
+                                onChange={(e) => setNewSubtopicInputs({ ...newSubtopicInputs, [topic.id]: e.target.value })}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    const val = (newSubtopicInputs[topic.id] || '').trim();
+                                    if (val) {
+                                      handleAddSubtopic(activeModule.id, topic.id, val);
+                                      setNewSubtopicInputs({ ...newSubtopicInputs, [topic.id]: '' });
+                                    }
+                                  }
+                                }}
+                                className="text-[10px] bg-[#091122] border border-[#182a52] hover:border-slate-700 focus:border-blue-500 focus:outline-hidden rounded-md px-2 py-0.5 text-slate-300 placeholder:text-slate-600 transition w-28"
+                              />
+                              {(newSubtopicInputs[topic.id] || '').trim() && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const val = (newSubtopicInputs[topic.id] || '').trim();
+                                    if (val) {
+                                      handleAddSubtopic(activeModule.id, topic.id, val);
+                                      setNewSubtopicInputs({ ...newSubtopicInputs, [topic.id]: '' });
+                                    }
+                                  }}
+                                  className="text-[10px] text-blue-400 hover:text-blue-300 px-1 py-0.5 font-bold cursor-pointer"
+                                >
+                                  Add
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Validation Warnings for Topic */}
+                        {getTopicWarnings(topic.id).map((tw, idx) => (
+                          <div
+                            key={idx}
+                            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-950/30 border border-amber-800/40 text-[11px] text-amber-300"
+                          >
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                            <span className="font-medium">{tw.message}</span>
+                            {tw.suggested_action && (
+                              <span className="text-slate-400">({tw.suggested_action})</span>
+                            )}
+                          </div>
+                        ))}
 
                         {/* Expanded Edit Form for Explanation & Prerequisites */}
                         {isEditing && (
@@ -655,7 +1277,7 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
                 </div>
 
                 <button
-                  onClick={onConfirmTopics}
+                  onClick={handleConfirmStructure}
                   className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-md shadow-blue-600/30 transition cursor-pointer self-start sm:self-auto shrink-0 flex items-center gap-1.5"
                 >
                   <span>Confirm Structure</span>
@@ -663,7 +1285,7 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
                 </button>
               </div>
             </>
-          ) : (
+          ); })() : (
             <div className="p-8 text-center text-slate-400 text-xs">
               Select or add a module to view its topics.
             </div>
@@ -702,6 +1324,129 @@ export const TopicReviewEditor: React.FC<TopicReviewEditorProps> = ({
                 className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-medium transition cursor-pointer shadow-md shadow-rose-600/30"
               >
                 Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Split Topic Modal */}
+      {splitModalData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-xs">
+          <div className="rounded-2xl bg-[#0c162e] border border-[#1d2f58] p-6 max-w-lg w-full space-y-4 shadow-2xl">
+            <div className="flex items-center gap-3 text-blue-400">
+              <div className="w-10 h-10 rounded-xl bg-blue-950/60 flex items-center justify-center">
+                <Split className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="text-base font-bold text-white m-0">
+                  Split Topic
+                </h4>
+                <p className="text-[11px] text-slate-400 m-0">
+                  Divide into two focused learning topics with balanced study times.
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-3 pt-1">
+              <div>
+                <label className="text-xs text-slate-400 font-semibold block mb-1">
+                  Topic Part 1 Title:
+                </label>
+                <input
+                  type="text"
+                  value={splitModalData.splitTitle1}
+                  onChange={(e) =>
+                    setSplitModalData({ ...splitModalData, splitTitle1: e.target.value })
+                  }
+                  className="w-full text-xs text-white bg-[#070e20] border border-[#1b2b52] rounded-xl px-3 py-2 focus:outline-hidden focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-slate-400 font-semibold block mb-1">
+                  Topic Part 2 Title:
+                </label>
+                <input
+                  type="text"
+                  value={splitModalData.splitTitle2}
+                  onChange={(e) =>
+                    setSplitModalData({ ...splitModalData, splitTitle2: e.target.value })
+                  }
+                  className="w-full text-xs text-white bg-[#070e20] border border-[#1b2b52] rounded-xl px-3 py-2 focus:outline-hidden focus:border-blue-500"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                onClick={() => setSplitModalData(null)}
+                className="px-4 py-2 rounded-xl bg-[#111e3b] hover:bg-[#182a52] text-slate-300 text-xs font-medium cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmSplit}
+                className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition cursor-pointer shadow-md shadow-blue-600/30"
+              >
+                Split Topic
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Low Confidence Confirmation Modal */}
+      {showLowConfidenceModal && validationReport && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-xs">
+          <div className="rounded-2xl bg-[#0c162e] border border-amber-600/40 p-6 max-w-lg w-full space-y-4 shadow-2xl">
+            <div className="flex items-center gap-3 text-amber-400">
+              <div className="w-10 h-10 rounded-xl bg-amber-950/60 flex items-center justify-center">
+                <AlertTriangle className="w-5 h-5 text-amber-400" />
+              </div>
+              <div>
+                <h4 className="text-base font-bold text-white m-0">
+                  Syllabus Quality Audit Notice
+                </h4>
+                <p className="text-[11px] text-amber-300/80 m-0">
+                  Quality Score: {validationReport.quality_score}/100 • {validationReport.warnings.length} warning(s)
+                </p>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-300 leading-relaxed m-0">
+              Antigravity detected potential issues in the extracted structure (e.g. topic fragments, metadata lines, or duration warnings). We recommend reviewing and merging flagged topics so that YouTube discovery produces the most accurate video matches.
+            </p>
+
+            <div className="max-h-40 overflow-y-auto space-y-1.5 p-2.5 rounded-xl bg-[#070e20] border border-[#18284e]">
+              {validationReport.warnings.slice(0, 5).map((w, i) => (
+                <div key={i} className="text-[11px] text-slate-300 flex items-start gap-1.5">
+                  <span className="text-amber-400 shrink-0">•</span>
+                  <span>{w.message}</span>
+                </div>
+              ))}
+              {validationReport.warnings.length > 5 && (
+                <p className="text-[10px] text-slate-500 m-0 pl-3">
+                  +{validationReport.warnings.length - 5} more issues
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                onClick={() => setShowLowConfidenceModal(false)}
+                className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold cursor-pointer shadow-sm"
+              >
+                Review & Edit Topics
+              </button>
+              <button
+                onClick={() => {
+                  setShowLowConfidenceModal(false);
+                  onConfirmTopics();
+                }}
+                className="px-4 py-2 rounded-xl bg-[#111e3b] hover:bg-[#182a52] text-slate-300 hover:text-white text-xs font-medium cursor-pointer"
+              >
+                Proceed Anyway
               </button>
             </div>
           </div>

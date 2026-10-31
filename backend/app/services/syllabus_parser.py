@@ -1,6 +1,6 @@
 import io
 import uuid
-from typing import Tuple
+from typing import Tuple, Optional
 from fastapi import HTTPException, UploadFile, status
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
@@ -54,7 +54,7 @@ class SyllabusParserService:
         return filename, extension
 
     @classmethod
-    async def extract_text_and_metadata(cls, file: UploadFile) -> Tuple[str, str, str, int, int, int, str, int, str, str]:
+    async def extract_text_and_metadata(cls, file: UploadFile, owner_user_id: Optional[str] = None) -> Tuple[str, str, str, int, int, int, str, int, str, str]:
         """
         Validates and extracts raw text from an UploadFile.
         Returns:
@@ -116,6 +116,7 @@ class SyllabusParserService:
             char_count=char_count,
             word_count=word_count,
             raw_text=full_text,
+            owner_user_id=owner_user_id,
         )
 
         return (
@@ -133,7 +134,7 @@ class SyllabusParserService:
         )
 
     @classmethod
-    async def parse_uploaded_file(cls, file: UploadFile) -> SyllabusUploadResponse:
+    async def parse_uploaded_file(cls, file: UploadFile, owner_user_id: Optional[str] = None) -> SyllabusUploadResponse:
         """Endpoint handler for POST /api/syllabus/upload."""
         (
             syllabus_id,
@@ -147,11 +148,27 @@ class SyllabusParserService:
             unit_label,
             preview,
             notes
-        ) = await cls.extract_text_and_metadata(file)
+        ) = await cls.extract_text_and_metadata(file, owner_user_id=owner_user_id)
+
+        # Extract candidate course name and code from header lines
+        course_name_sugg = None
+        course_code_sugg = None
+        try:
+            from app.services.syllabus_extractor import SyllabusStructureExtractor, ExtractedSyllabusData
+            lines = SyllabusStructureExtractor.clean_and_unwrap_lines(full_text)
+            temp_data = ExtractedSyllabusData()
+            SyllabusStructureExtractor._extract_header_metadata(lines[:25], temp_data)
+            if temp_data.course_name and temp_data.course_name != "Course Syllabus":
+                course_name_sugg = temp_data.course_name
+            if temp_data.course_code:
+                course_code_sugg = temp_data.course_code
+        except Exception:
+            pass
 
         return SyllabusUploadResponse(
             status="success",
             syllabus_id=syllabus_id,
+            owner_user_id=owner_user_id,
             filename=filename,
             file_type=file_type,  # type: ignore
             file_size_bytes=file_size,
@@ -162,6 +179,8 @@ class SyllabusParserService:
             preview_text=preview,
             full_text_length=char_count,
             extraction_notes=notes,
+            course_name_suggestion=course_name_sugg,
+            course_code_suggestion=course_code_sugg,
             message=f"Syllabus '{filename}' parsed successfully ({unit_count} {unit_label}, {word_count:,} words)."
         )
 
@@ -241,7 +260,21 @@ class SyllabusParserService:
             table_row_count = 0
             for table in doc.tables:
                 for row in table.rows:
-                    row_cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    seen_tc = set()
+                    row_cells = []
+                    for cell in row.cells:
+                        text = cell.text.strip()
+                        if not text:
+                            continue
+                        tc_elem = getattr(cell, '_tc', None)
+                        if tc_elem is not None:
+                            if tc_elem in seen_tc:
+                                continue
+                            seen_tc.add(tc_elem)
+                            row_cells.append(text)
+                        else:
+                            if not row_cells or row_cells[-1] != text:
+                                row_cells.append(text)
                     if row_cells:
                         extracted_chunks.append(" | ".join(row_cells))
                         table_row_count += 1

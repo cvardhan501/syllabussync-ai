@@ -1,7 +1,8 @@
 import logging
 from typing import Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
 
+from app.core.auth import get_current_user_id, verify_ownership
 from app.schemas.study_plan import (
     StudyPlanCreateRequest,
     StudyPlanResponse,
@@ -12,7 +13,12 @@ from app.schemas.study_plan import (
     UserSettingsSchema,
 )
 from app.services.study_planner import StudyPlannerService
-from app.models.database import get_user_settings, save_user_settings
+from app.models.database import (
+    get_user_settings,
+    save_user_settings,
+    get_syllabus_owner_id,
+    get_study_plan_owner_id,
+)
 
 logger = logging.getLogger("syllabus_sync.api.planner")
 
@@ -28,12 +34,16 @@ router = APIRouter(tags=["Study Planner"])
 async def create_study_plan(
     syllabus_id: str,
     payload: StudyPlanCreateRequest,
+    current_user_id: Optional[str] = Depends(get_current_user_id),
 ):
     """
     Generates a deterministic daily study timetable matching topics, video lectures,
     notes, and practice checkpoints into available days before the target exam date.
     Preserves completed tasks when regenerating.
     """
+    s_owner = get_syllabus_owner_id(syllabus_id)
+    verify_ownership(s_owner, current_user_id, resource_type="syllabus")
+
     try:
         return await StudyPlannerService.generate_or_update_plan(
             syllabus_id=syllabus_id,
@@ -42,6 +52,7 @@ async def create_study_plan(
             preferred_days=payload.preferred_days,
             start_date=payload.start_date,
             preserve_completed=payload.preserve_completed,
+            owner_user_id=current_user_id,
         )
     except ValueError as e:
         raise HTTPException(
@@ -56,8 +67,14 @@ async def create_study_plan(
     status_code=status.HTTP_200_OK,
     summary="Retrieve active study plan and daily tasks for a syllabus"
 )
-async def get_study_plan(syllabus_id: str):
+async def get_study_plan(
+    syllabus_id: str,
+    current_user_id: Optional[str] = Depends(get_current_user_id),
+):
     """Retrieves the active study plan and its grouped daily schedule."""
+    s_owner = get_syllabus_owner_id(syllabus_id)
+    verify_ownership(s_owner, current_user_id, resource_type="study plan")
+
     try:
         return await StudyPlannerService.get_plan_details(syllabus_id)
     except ValueError as e:
@@ -77,8 +94,12 @@ async def update_task_status(
     plan_id: str,
     task_id: str,
     payload: TaskStatusUpdateRequest,
+    current_user_id: Optional[str] = Depends(get_current_user_id),
 ):
     """Toggles task completion status and recalculates plan metrics."""
+    p_owner = get_study_plan_owner_id(plan_id)
+    verify_ownership(p_owner, current_user_id, resource_type="study plan")
+
     try:
         return await StudyPlannerService.toggle_task_completion(task_id, payload.completed)
     except ValueError as e:
@@ -98,8 +119,12 @@ async def save_task_notes(
     plan_id: str,
     task_id: str,
     payload: TaskNoteUpdateRequest,
+    current_user_id: Optional[str] = Depends(get_current_user_id),
 ):
     """Saves student notes on a specific task."""
+    p_owner = get_study_plan_owner_id(plan_id)
+    verify_ownership(p_owner, current_user_id, resource_type="study plan")
+
     try:
         return await StudyPlannerService.save_task_notes(task_id, payload.notes)
     except ValueError as e:
@@ -118,11 +143,15 @@ async def save_task_notes(
 async def reschedule_missed_tasks(
     plan_id: str,
     payload: Optional[RescheduleRequest] = None,
+    current_user_id: Optional[str] = Depends(get_current_user_id),
 ):
     """
     Identifies unfinished tasks from missed days and redistributes them into future
     available slots, respecting daily availability limits and updating shortfall calculations.
     """
+    p_owner = get_study_plan_owner_id(plan_id)
+    verify_ownership(p_owner, current_user_id, resource_type="study plan")
+
     req = payload or RescheduleRequest()
     try:
         return await StudyPlannerService.reschedule_missed_tasks(
@@ -147,9 +176,9 @@ async def reschedule_missed_tasks(
     status_code=status.HTTP_200_OK,
     summary="Retrieve saved student learning preferences"
 )
-async def get_settings():
+async def get_settings(current_user_id: Optional[str] = Depends(get_current_user_id)):
     """Retrieves persisted student learning and app settings."""
-    return get_user_settings()
+    return get_user_settings(user_id=current_user_id)
 
 
 @router.put(
@@ -158,7 +187,11 @@ async def get_settings():
     status_code=status.HTTP_200_OK,
     summary="Update and persist student learning preferences"
 )
-async def update_settings(payload: UserSettingsSchema):
+async def update_settings(
+    payload: UserSettingsSchema,
+    current_user_id: Optional[str] = Depends(get_current_user_id),
+):
     """Saves student preferences in SQLite."""
-    saved = save_user_settings(payload.model_dump())
+    saved = save_user_settings(payload.model_dump(), user_id=current_user_id)
     return saved
+

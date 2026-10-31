@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional
 
 from app.models.database import (
@@ -46,6 +47,63 @@ class StudyPlannerService:
         return dt.strftime("%d %b")
 
     @classmethod
+    def _topologically_sort_topics(cls, topics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Sorts topics respecting prerequisite dependencies (Kahn's algorithm).
+        Preserves natural document order for independent topics and handles cycles safely.
+        """
+        if not topics:
+            return []
+
+        id_to_idx: Dict[str, int] = {}
+        title_to_idx: Dict[str, int] = {}
+        for idx, t in enumerate(topics):
+            id_to_idx[t["topic_id"]] = idx
+            if t.get("raw_topic_id"):
+                id_to_idx[t["raw_topic_id"]] = idx
+            norm_title = re.sub(r"[^\w\s]", "", t["title"].lower()).strip()
+            title_to_idx[norm_title] = idx
+
+        in_degree = [0] * len(topics)
+        adj_list: Dict[int, List[int]] = {i: [] for i in range(len(topics))}
+
+        for i, t in enumerate(topics):
+            for prereq in t.get("prerequisites", []):
+                prereq_str = str(prereq).strip()
+                prereq_idx = None
+
+                if prereq_str in id_to_idx:
+                    prereq_idx = id_to_idx[prereq_str]
+                else:
+                    norm_p = re.sub(r"[^\w\s]", "", prereq_str.lower()).strip()
+                    if norm_p in title_to_idx:
+                        prereq_idx = title_to_idx[norm_p]
+
+                if prereq_idx is not None and prereq_idx != i:
+                    adj_list[prereq_idx].append(i)
+                    in_degree[i] += 1
+
+        ready = [i for i in range(len(topics)) if in_degree[i] == 0]
+        sorted_indices: List[int] = []
+
+        while ready:
+            curr = ready.pop(0)
+            sorted_indices.append(curr)
+
+            for neighbor in adj_list[curr]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    ready.append(neighbor)
+                    ready.sort()
+
+        if len(sorted_indices) < len(topics):
+            for i in range(len(topics)):
+                if i not in sorted_indices:
+                    sorted_indices.append(i)
+
+        return [topics[i] for i in sorted_indices]
+
+    @classmethod
     async def generate_or_update_plan(
         cls,
         syllabus_id: str,
@@ -54,6 +112,7 @@ class StudyPlannerService:
         preferred_days: Optional[List[str]] = None,
         start_date: Optional[str] = None,
         preserve_completed: bool = True,
+        owner_user_id: Optional[str] = None,
     ) -> StudyPlanResponse:
         """
         Generates a deterministic daily study schedule mapping topics and videos
@@ -68,6 +127,9 @@ class StudyPlannerService:
         today = datetime.date.today()
         plan_start = cls._parse_date(start_date) if start_date else today
         plan_exam = cls._parse_date(exam_date)
+
+        if plan_exam < today:
+            raise ValueError("Exam date cannot be in the past.")
 
         if plan_exam <= plan_start:
             raise ValueError(f"Exam date ({exam_date}) must be after the start date ({plan_start.isoformat()}).")
@@ -92,7 +154,7 @@ class StudyPlannerService:
                 completed_task_map[t["id"]] = t
 
         # Build list of planned tasks for all topics in sequential order
-        raw_tasks_to_schedule: List[Dict[str, Any]] = []
+        all_flattened_topics: List[Dict[str, Any]] = []
         modules = hierarchy.get("modules", [])
 
         for mod_idx, mod in enumerate(modules):
@@ -103,67 +165,85 @@ class StudyPlannerService:
             for top_idx, topic in enumerate(mod.get("topics", [])):
                 raw_top_id = topic.get("id") or f"top_{mod_idx+1}_{top_idx+1}"
                 top_id = f"{syllabus_id}_{raw_top_id}" if not raw_top_id.startswith(syllabus_id) else raw_top_id
-                top_title = topic.get("title", f"Topic {top_idx+1}")
-                difficulty = topic.get("difficulty", "medium")
-                est_min = topic.get("estimated_minutes", 60)
-
-                matched_video = topic_to_resource.get(top_id)
-
-                # Task 1: Video lecture
-                video_task_id = f"task_{top_id}_video"
-                # Video duration from matched metadata, bounded between 15 and 90 min
-                if matched_video and matched_video.get("duration_seconds"):
-                    v_min = max(15, min(90, matched_video["duration_seconds"] // 60))
-                else:
-                    v_min = max(20, min(60, est_min // 2))
-
-                raw_tasks_to_schedule.append({
-                    "id": video_task_id,
-                    "syllabus_id": syllabus_id,
+                all_flattened_topics.append({
+                    "topic_id": top_id,
+                    "raw_topic_id": raw_top_id,
                     "module_id": mod_id,
                     "module_title": mod_title,
-                    "topic_id": top_id,
-                    "topic_title": top_title,
-                    "title": f"Lecture: {top_title}",
-                    "task_type": "Video",
-                    "duration_minutes": v_min,
-                    "video_id": matched_video.get("video_id") if matched_video else None,
-                    "video_url": matched_video.get("video_url") if matched_video else None,
+                    "title": topic.get("title", f"Topic {top_idx+1}"),
+                    "difficulty": topic.get("difficulty", "medium"),
+                    "estimated_minutes": topic.get("estimated_minutes", 60),
+                    "prerequisites": topic.get("prerequisites", []),
                 })
 
-                # Task 2: Concept Study & Synthesis
-                study_task_id = f"task_{top_id}_study"
-                s_min = 25 if difficulty == "easy" else (35 if difficulty == "medium" else 45)
-                raw_tasks_to_schedule.append({
-                    "id": study_task_id,
-                    "syllabus_id": syllabus_id,
-                    "module_id": mod_id,
-                    "module_title": mod_title,
-                    "topic_id": top_id,
-                    "topic_title": top_title,
-                    "title": f"Study Notes: {top_title}",
-                    "task_type": "Study",
-                    "duration_minutes": s_min,
-                    "video_id": None,
-                    "video_url": None,
-                })
+        # Apply topological sort to ensure prerequisites precede dependent topics
+        ordered_topics = cls._topologically_sort_topics(all_flattened_topics)
 
-                # Task 3: Practice Checkpoint
-                practice_task_id = f"task_{top_id}_practice"
-                p_min = 20 if difficulty == "easy" else (30 if difficulty == "medium" else 45)
-                raw_tasks_to_schedule.append({
-                    "id": practice_task_id,
-                    "syllabus_id": syllabus_id,
-                    "module_id": mod_id,
-                    "module_title": mod_title,
-                    "topic_id": top_id,
-                    "topic_title": top_title,
-                    "title": f"Practice: {top_title}",
-                    "task_type": "Practice",
-                    "duration_minutes": p_min,
-                    "video_id": None,
-                    "video_url": None,
-                })
+        raw_tasks_to_schedule: List[Dict[str, Any]] = []
+        for topic in ordered_topics:
+            top_id = topic["topic_id"]
+            top_title = topic["title"]
+            difficulty = topic["difficulty"]
+            est_min = topic["estimated_minutes"]
+            mod_id = topic["module_id"]
+            mod_title = topic["module_title"]
+
+            matched_video = topic_to_resource.get(top_id)
+
+            # Task 1: Video lecture
+            video_task_id = f"task_{top_id}_video"
+            if matched_video and matched_video.get("duration_seconds"):
+                v_min = max(15, min(90, matched_video["duration_seconds"] // 60))
+            else:
+                v_min = max(20, min(60, est_min // 2))
+
+            raw_tasks_to_schedule.append({
+                "id": video_task_id,
+                "syllabus_id": syllabus_id,
+                "module_id": mod_id,
+                "module_title": mod_title,
+                "topic_id": top_id,
+                "topic_title": top_title,
+                "title": f"Lecture: {top_title}",
+                "task_type": "Video",
+                "duration_minutes": v_min,
+                "video_id": matched_video.get("video_id") if matched_video else None,
+                "video_url": matched_video.get("video_url") if matched_video else None,
+            })
+
+            # Task 2: Concept Study & Synthesis
+            study_task_id = f"task_{top_id}_study"
+            s_min = 25 if difficulty == "easy" else (35 if difficulty == "medium" else 45)
+            raw_tasks_to_schedule.append({
+                "id": study_task_id,
+                "syllabus_id": syllabus_id,
+                "module_id": mod_id,
+                "module_title": mod_title,
+                "topic_id": top_id,
+                "topic_title": top_title,
+                "title": f"Study Notes: {top_title}",
+                "task_type": "Study",
+                "duration_minutes": s_min,
+                "video_id": None,
+                "video_url": None,
+            })
+
+            # Task 3: Practice Checkpoint
+            practice_task_id = f"task_{top_id}_practice"
+            p_min = 20 if difficulty == "easy" else (30 if difficulty == "medium" else 45)
+            raw_tasks_to_schedule.append({
+                "id": practice_task_id,
+                "syllabus_id": syllabus_id,
+                "module_id": mod_id,
+                "module_title": mod_title,
+                "topic_id": top_id,
+                "topic_title": top_title,
+                "title": f"Practice: {top_title}",
+                "task_type": "Practice",
+                "duration_minutes": p_min,
+                "video_id": None,
+                "video_url": None,
+            })
 
         # Calculate Available Study Days before Exam
         available_calendar_dates: List[datetime.date] = []
@@ -268,6 +348,7 @@ class StudyPlannerService:
             "syllabus_id": syllabus_id,
             "title": f"Study Roadmap: {course_name}",
             "exam_date": exam_date,
+            "owner_user_id": owner_user_id or (existing_plan.get("owner_user_id") if existing_plan else None),
             "daily_target_minutes": daily_target_minutes,
             "preferred_days": preferred_days,
             "start_date": plan_start.isoformat(),
@@ -278,7 +359,7 @@ class StudyPlannerService:
             "total_planned_minutes": total_workload_minutes,
             "completed_minutes": sum(t["duration_minutes"] for t in scheduled_tasks if t["status"] == "completed"),
         }
-        save_study_plan(plan_dict)
+        save_study_plan(plan_dict, owner_user_id=owner_user_id)
 
         # Save Tasks to SQLite
         save_study_tasks(plan_id, scheduled_tasks, preserve_completed=preserve_completed)
@@ -358,6 +439,8 @@ class StudyPlannerService:
 
         return StudyPlanResponse(
             id=real_plan_id,
+            owner_user_id=plan.get("owner_user_id"),
+            course_id=plan.get("course_id"),
             syllabus_id=syllabus_id,
             course_name=course_name,
             title=plan["title"],
@@ -554,3 +637,4 @@ class StudyPlannerService:
             notes=updated.get("notes"),
             order_index=updated.get("order_index", 0),
         )
+

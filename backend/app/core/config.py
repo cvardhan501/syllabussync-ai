@@ -1,13 +1,53 @@
+import os
+from pathlib import Path
 from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
+ROOT_DIR = BACKEND_DIR.parent
 
 
 class Settings(BaseSettings):
     app_name: str = "SyllabusSync AI API"
-    app_version: "str" = "0.2.0"
+    app_version: str = "0.2.0"
     app_env: str = "development"
     api_port: int = 8000
     api_host: str = "0.0.0.0"
+
+    @property
+    def is_production(self) -> bool:
+        """Determines if running in a strict production environment."""
+        return self.app_env.strip().lower() in ("production", "prod")
+
+    @property
+    def is_development(self) -> bool:
+        """Determines if running in local development mode."""
+        return self.app_env.strip().lower() in ("development", "dev", "local")
+
+    @property
+    def is_testing(self) -> bool:
+        """Determines if running in automated test mode."""
+        return self.app_env.strip().lower() in ("test", "testing")
+
+    # Supabase Auth Configuration (JWT verification readiness)
+    supabase_jwt_secret: Optional[str] = None
+    supabase_project_url: Optional[str] = "https://qdlnupgdtgmhvkknjmlv.supabase.co"
+    supabase_jwks_url: Optional[str] = None
+    admin_api_key: Optional[str] = None
+
+    @property
+    def effective_jwks_url(self) -> str:
+        """Calculates the active Supabase JWKS endpoint for public key retrieval."""
+        if self.supabase_jwks_url and self.supabase_jwks_url.strip():
+            return self.supabase_jwks_url.strip()
+        base = (self.supabase_project_url or "https://qdlnupgdtgmhvkknjmlv.supabase.co").strip().rstrip("/")
+        return f"{base}/auth/v1/.well-known/jwks.json"
+
+    @property
+    def expected_jwt_issuer(self) -> str:
+        """Expected Supabase JWT issuer URL."""
+        base = (self.supabase_project_url or "https://qdlnupgdtgmhvkknjmlv.supabase.co").strip().rstrip("/")
+        return f"{base}/auth/v1"
     
     # CORS Configuration
     cors_origins: List[str] = [
@@ -30,6 +70,7 @@ class Settings(BaseSettings):
     # Strands Agents SDK Configuration
     strands_provider: str = "bedrock"
     strands_model: str = "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    strands_streaming: Optional[bool] = None
     
     # AWS Bedrock Credentials
     aws_access_key_id: Optional[str] = None
@@ -68,10 +109,27 @@ class Settings(BaseSettings):
         return False
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(
+            str(BACKEND_DIR / ".env"),
+            str(ROOT_DIR / ".env"),
+            ".env",
+        ),
         env_file_encoding="utf-8",
         extra="ignore"
     )
 
 
 settings = Settings()
+
+# Ensure AWS credentials from .env are exported into os.environ
+# so that boto3/botocore default session picks them up without triggering SSO login provider
+if settings.aws_access_key_id and "AWS_ACCESS_KEY_ID" not in os.environ:
+    os.environ["AWS_ACCESS_KEY_ID"] = settings.aws_access_key_id
+if settings.aws_secret_access_key and "AWS_SECRET_ACCESS_KEY" not in os.environ:
+    os.environ["AWS_SECRET_ACCESS_KEY"] = settings.aws_secret_access_key
+if settings.aws_region and "AWS_REGION" not in os.environ:
+    os.environ["AWS_REGION"] = settings.aws_region
+    os.environ["AWS_DEFAULT_REGION"] = settings.aws_region
+if settings.aws_session_token and "AWS_SESSION_TOKEN" not in os.environ:
+    os.environ["AWS_SESSION_TOKEN"] = settings.aws_session_token
+
