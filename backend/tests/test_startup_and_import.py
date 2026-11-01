@@ -113,3 +113,22 @@ class TestImportAndStartup:
 
         entrypoint = data.get("tool", {}).get("vercel", {}).get("entrypoint")
         assert entrypoint == "main:app", f"Expected 'main:app', got {entrypoint}"
+
+    def test_requirements_files_have_no_unsupported_includes_and_are_reconciled(self):
+        """Verifies that requirements.txt has no -r flags and matches backend/pyproject.toml."""
+        root_dir = Path(__file__).resolve().parent.parent.parent
+        root_req = root_dir / "requirements.txt"
+        backend_req = root_dir / "backend" / "requirements.txt"
+        backend_toml = root_dir / "backend" / "pyproject.toml"
+
+        assert root_req.exists()
+        assert backend_req.exists()
+        assert backend_toml.exists()
+
+        root_lines = [l.strip() for l in root_req.read_text(encoding="utf-8").splitlines() if l.strip() and not l.strip().startswith("#")]
+        backend_lines = [l.strip() for l in backend_req.read_text(encoding="utf-8").splitlines() if l.strip() and not l.strip().startswith("#")]
+
+        for line in root_lines + backend_lines:
+            assert not line.startswith("-r"), f"Found unsupported include '{line}' which crashes Vercel's WASM parser"
+
+        assert root_lines == backend_lines, "Root requirements.txt must match backend/requirements.txt exactly"
