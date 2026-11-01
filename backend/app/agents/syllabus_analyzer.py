@@ -32,9 +32,9 @@ Your task is to analyze course syllabus documents and extract a structured, educ
 Extraction Guidelines:
 1. Course Identity: Identify the course name, subject, and course code (e.g., CS101, MATH240, BIO200) if present.
 2. Modules/Units: Preserve the original ordering, titles, and terminology from the syllabus (e.g., "Week 1", "Module 1", "Unit 3", "Part I").
-3. Topics: Break each module into discrete, actionable study topics that a student can study in one session.
+3. Topics: Break each module into discrete, actionable study topics that a student can study in one session. Extract EVERY discrete topic separated by commas or semicolons (e.g. 'Object-Oriented Development and Modelling Concepts', 'Object-Oriented Methodology', 'Advanced Link and Association Concepts'). NEVER merge distinct syllabus topics or drop intermediate topics.
 4. Subtopics: Include subtopics only where explicitly detailed in the syllabus.
-5. Study Estimates: Provide an estimated study duration in minutes (typically 30 to 60 minutes per topic). Mark this clearly as an estimate.
+5. Study Estimates: When official delivery hours or minutes are specified for a module, ensure the sum of estimated_minutes across all topics in that module equals the official module delivery minutes (e.g. 6 hours = 360 minutes divided evenly across topics, such as 60 minutes for each of 6 topics). If not specified, provide an estimated study duration in minutes (typically 30 to 60 minutes per topic). Mark this clearly as an estimate.
 6. Difficulty: Assign a reasonable difficulty: 'easy', 'medium', or 'hard'.
 7. Prerequisites: Only list prerequisites when reasonably inferable or explicitly listed.
 8. Source Evidence: Cite a short excerpt or section heading from the syllabus.
@@ -428,7 +428,7 @@ class SyllabusAnalyzerAgent:
         if extracted_meta.has_lab_component:
             hierarchy.has_lab_component = True
 
-        # Backfill official hours on modules if missing
+        # Backfill official hours on modules if missing and auto-balance topic minutes
         for m_idx, mod in enumerate(hierarchy.modules):
             if m_idx < len(extracted_meta.modules):
                 ext_m = extracted_meta.modules[m_idx]
@@ -436,6 +436,16 @@ class SyllabusAnalyzerAgent:
                     mod.official_hours = ext_m.get("official_hours")
                 if mod.official_minutes is None and ext_m.get("official_minutes"):
                     mod.official_minutes = ext_m.get("official_minutes")
+
+            # Auto-balance topic durations to match official_minutes if official_minutes > 0
+            if mod.official_minutes and mod.topics:
+                curr_total = sum(t.estimated_minutes for t in mod.topics)
+                if curr_total != mod.official_minutes:
+                    n_topics = len(mod.topics)
+                    base = mod.official_minutes // n_topics
+                    remainder = mod.official_minutes % n_topics
+                    for t_i, t in enumerate(mod.topics):
+                        t.estimated_minutes = base + (1 if t_i < remainder else 0)
 
         cls._ensure_stable_ids(hierarchy)
         return hierarchy

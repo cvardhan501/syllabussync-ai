@@ -300,6 +300,13 @@ class SyllabusStructureExtractor:
         body = "\n".join(lines)
         body = re.sub(r'(?i)three\s+assignments\s+after\s+every\s+two\s+modules.*', '', body)
         body = re.sub(r'(?i)outline\s+of\s+the\s+assignment.*', '', body)
+
+        # Repair missing punctuation between category-closing words and a new capitalized topic list
+        body = re.sub(
+            r'(\bConcepts|\bModels|\bDiagrams|\bArchitecture|\bMethodology|\bMethodologies|\bPrinciples|\bTechniques|\bFoundations|\bMechanisms|\bPatterns)\s+([A-Z][a-z]+(?:\s*,\s*[A-Z]))',
+            r'\1, \2',
+            body
+        )
         return body.strip()
 
     @classmethod
@@ -399,6 +406,13 @@ class SyllabusStructureExtractor:
         if not body_clean:
             return []
 
+        # Repair missing punctuation between category-closing words and a new capitalized topic list
+        body_clean = re.sub(
+            r'(\bConcepts|\bModels|\bDiagrams|\bArchitecture|\bMethodology|\bMethodologies|\bPrinciples|\bTechniques|\bFoundations|\bMechanisms|\bPatterns)\s+([A-Z][a-z]+(?:\s*,\s*[A-Z]))',
+            r'\1, \2',
+            body_clean
+        )
+
         # Single statement like 'Guest lecture by Industry Experts.'
         if (len(body_clean.split(",")) == 1 and ";" not in body_clean and "." not in body_clean) or "guest lecture" in body_clean.lower():
             clean_stmt = re.sub(r'(?i)\(?case\s+study\s*\d+\)?', '', body_clean).strip(" .")
@@ -417,7 +431,35 @@ class SyllabusStructureExtractor:
             return s
 
         if ";" in prot_text:
-            raw_parts = [" ".join(p.split()).strip() for p in prot_text.split(";") if p.strip()]
+            semi_parts = [" ".join(p.split()).strip() for p in prot_text.split(";") if p.strip()]
+            expanded_parts = []
+            for sp in semi_parts:
+                if ":" in sp:
+                    expanded_parts.append(sp)
+                elif "," in sp and len(sp.split(",")) >= 3:
+                    # Comma-separated list of topics within a semicolon chunk
+                    c_tokens = [" ".join(c.split()).strip() for c in sp.split(",") if c.strip()]
+                    ti = 0
+                    while ti < len(c_tokens):
+                        tk = c_tokens[ti]
+                        if ti + 2 < len(c_tokens) and re.match(r'^(?:and|or)\s+', c_tokens[ti+2], re.I):
+                            expanded_parts.append(f"{c_tokens[ti]}, {c_tokens[ti+1]}, {c_tokens[ti+2]}")
+                            ti += 3
+                        elif ti + 1 < len(c_tokens) and re.match(r'^(?:and|or)\s+', c_tokens[ti+1], re.I):
+                            expanded_parts.append(f"{c_tokens[ti]}, {c_tokens[ti+1]}")
+                            ti += 2
+                        else:
+                            expanded_parts.append(tk)
+                            ti += 1
+                else:
+                    if expanded_parts and (
+                        sp.lower().startswith("navigation of")
+                        or (len(sp.split()) <= 4 and expanded_parts[-1].lower().startswith("a sample"))
+                    ):
+                        expanded_parts[-1] = f"{expanded_parts[-1]}; {sp}"
+                    else:
+                        expanded_parts.append(sp)
+            raw_parts = expanded_parts
         elif "," in prot_text:
             expanded_parts = []
             for p in prot_text.split(","):
@@ -436,7 +478,19 @@ class SyllabusStructureExtractor:
                             expanded_parts.append(sp_s)
                 else:
                     expanded_parts.append(p_s)
-            raw_parts = expanded_parts
+            c_parts = []
+            ti = 0
+            while ti < len(expanded_parts):
+                if ti + 2 < len(expanded_parts) and re.match(r'^(?:and|or)\s+', expanded_parts[ti+2], re.I):
+                    c_parts.append(f"{expanded_parts[ti]}, {expanded_parts[ti+1]}, {expanded_parts[ti+2]}")
+                    ti += 3
+                elif ti + 1 < len(expanded_parts) and re.match(r'^(?:and|or)\s+', expanded_parts[ti+1], re.I):
+                    c_parts.append(f"{expanded_parts[ti]}, {expanded_parts[ti+1]}")
+                    ti += 2
+                else:
+                    c_parts.append(expanded_parts[ti])
+                    ti += 1
+            raw_parts = c_parts
         elif " - " in prot_text:
             raw_parts = [" ".join(p.split()).strip() for p in prot_text.split(" - ") if p.strip()]
         else:
@@ -509,7 +563,7 @@ class SyllabusStructureExtractor:
                 prev["title"] += ", " + title
                 if top["subtopics"]:
                     prev["subtopics"].extend(top["subtopics"])
-            elif title in ("Avoidance", "Detection") and "Prevention" in prev["title"]:
+            elif title.startswith(("Avoidance", "Detection")) and "Prevention" in prev["title"]:
                 prev["title"] += ", " + title
                 if top["subtopics"]:
                     prev["subtopics"].extend(top["subtopics"])

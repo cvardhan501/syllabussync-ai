@@ -63,9 +63,21 @@ async def create_new_course(
     payload: CourseCreateRequest,
     current_user_id: Optional[str] = Depends(get_current_user_id),
 ):
+    if payload.syllabus_id:
+        s_record = get_syllabus_record(payload.syllabus_id)
+        if not s_record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Syllabus with ID '{payload.syllabus_id}' was not found."
+            )
+        verify_ownership(s_record.get("owner_user_id"), current_user_id, resource_type="syllabus")
+
     course_data = payload.model_dump()
-    if current_user_id and not course_data.get("owner_user_id"):
+    # Unconditionally enforce verified user ID; never trust client-supplied owner_user_id
+    if current_user_id:
         course_data["owner_user_id"] = current_user_id
+    else:
+        course_data["owner_user_id"] = "default_user"
     created = create_course(course_data, owner_user_id=current_user_id)
     if not created:
         raise HTTPException(
@@ -138,6 +150,8 @@ async def update_course_details(
     verify_ownership(course.get("owner_user_id"), current_user_id, resource_type="course")
 
     updates = payload.model_dump(exclude_unset=True)
+    # Strip any client-supplied owner_user_id to prevent ownership transfer or spoofing
+    updates.pop("owner_user_id", None)
     if "assessments" in updates and updates["assessments"] is not None:
         updates["assessments"] = [a for a in updates["assessments"]]
 
@@ -229,11 +243,13 @@ async def replace_syllabus(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Replacement syllabus '{payload.new_syllabus_id}' was not found."
         )
+    verify_ownership(new_s_record.get("owner_user_id"), current_user_id, resource_type="syllabus")
 
     updated = replace_course_syllabus(
         course_id=course_id,
         new_syllabus_id=payload.new_syllabus_id,
         preserve_matching_completions=payload.preserve_matching_completions,
+        owner_user_id=current_user_id,
     )
     if not updated:
         raise HTTPException(
@@ -269,7 +285,7 @@ async def setup_and_analyze_syllabus(
 
     # Enforce ownership if syllabus is owned by another user
     verify_ownership(s_record.get("owner_user_id"), current_user_id, resource_type="syllabus")
-    resolved_owner = current_user_id or s_record.get("owner_user_id") or payload.owner_user_id
+    resolved_owner = current_user_id or (str(s_record["owner_user_id"]) if s_record.get("owner_user_id") else None)
 
     raw_text = s_record["raw_text"]
     if not raw_text.strip():

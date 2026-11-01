@@ -15,7 +15,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.auth import verify_diagnostics_access
-from app.models.database import get_db_connection
+from app.models.database import get_db_connection, is_postgres
 from app.schemas.diagnostics import (
     BackendDiagnostic,
     DatabaseDiagnostic,
@@ -54,18 +54,24 @@ async def get_system_diagnostics():
     # 2. Database connectivity
     tables_list = []
     db_status = "connected"
+    engine_name = "PostgreSQL" if is_postgres() else "SQLite"
     try:
         with get_db_connection() as conn:
-            rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall()
+            if is_postgres():
+                rows = conn.execute(
+                    "SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                ).fetchall()
             tables_list = [r["name"] for r in rows]
     except Exception:
         db_status = "error"
 
     database_diag = DatabaseDiagnostic(
         status=db_status,
-        engine="SQLite",
+        engine=engine_name,
         tables_count=len(tables_list),
         tables=tables_list,
     )

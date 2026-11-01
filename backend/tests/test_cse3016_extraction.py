@@ -145,7 +145,20 @@ def test_cse3016_full_extraction_modules_and_hours():
     assert total_minutes == 2700
     assert total_minutes / 60 == 45.0
 
-    # 5. Check individual module durations
+    # 5. Check individual module durations and Module 1 6-topic extraction
+    m1_topics = data.modules[0]["topics"]
+    assert len(m1_topics) == 6
+    assert m1_topics[0]["title"] == "Object-Oriented Development and Modelling Concepts"
+    assert m1_topics[1]["title"] == "Object-Oriented Methodology"
+    assert m1_topics[2]["title"] == "Advanced Link and Association Concepts"
+    assert m1_topics[3]["title"] == "Generalization, Inheritance, and Grouping Constructs"
+    assert m1_topics[4]["title"] == "Sample Object Models"
+    assert m1_topics[5]["title"] == "A sample class model; Navigation of class models"
+
+    # All 6 topics receive 60 min each, summing to exactly 360 min
+    for t in m1_topics:
+        assert t["estimated_minutes"] == 60
+
     m1_mins = sum(t["estimated_minutes"] for t in data.modules[0]["topics"])
     assert m1_mins == 360  # 6.0 hours
 

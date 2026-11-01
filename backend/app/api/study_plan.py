@@ -18,6 +18,7 @@ from app.models.database import (
     save_user_settings,
     get_syllabus_owner_id,
     get_study_plan_owner_id,
+    get_task_owner_id,
 )
 
 logger = logging.getLogger("syllabus_sync.api.planner")
@@ -99,6 +100,8 @@ async def update_task_status(
     """Toggles task completion status and recalculates plan metrics."""
     p_owner = get_study_plan_owner_id(plan_id)
     verify_ownership(p_owner, current_user_id, resource_type="study plan")
+    t_owner = get_task_owner_id(task_id)
+    verify_ownership(t_owner, current_user_id, resource_type="study task")
 
     try:
         return await StudyPlannerService.toggle_task_completion(task_id, payload.completed)
@@ -124,6 +127,8 @@ async def save_task_notes(
     """Saves student notes on a specific task."""
     p_owner = get_study_plan_owner_id(plan_id)
     verify_ownership(p_owner, current_user_id, resource_type="study plan")
+    t_owner = get_task_owner_id(task_id)
+    verify_ownership(t_owner, current_user_id, resource_type="study task")
 
     try:
         return await StudyPlannerService.save_task_notes(task_id, payload.notes)

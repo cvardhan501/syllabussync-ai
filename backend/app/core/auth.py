@@ -405,8 +405,10 @@ async def get_current_user_id(
        - Never returns None in production; unauthenticated requests fail immediately.
 
     2. Development / Testing (!settings.is_production):
-       - If 'X-User-Id' is passed, it is trusted for local identity simulation.
-       - If Authorization Bearer is passed, verifies JWT or falls back to identifier string.
+       - If Authorization header is provided, it must be a valid, signed Supabase JWT.
+         Unverified tokens, forged signatures, or malformed tokens return HTTP 401 Unauthorized.
+         Unverified JWT decoding (verify_signature=False) is strictly forbidden.
+       - If no Authorization header is provided, 'X-User-Id' is permitted for local identity simulation.
        - If neither is provided, returns None (unauthenticated local development mode).
     """
     if settings.is_production:
@@ -440,7 +442,7 @@ async def get_current_user_id(
 
         try:
             return verify_supabase_jwt(token)
-        except ValueError as e:
+        except Exception as e:
             logger.warning(f"Production JWT verification failure: {e}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -448,31 +450,49 @@ async def get_current_user_id(
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-    # Development or Testing mode
+    # Development or Testing mode (!settings.is_production)
+    # If Authorization header is provided, strictly verify the Supabase JWT
+    if authorization and authorization.strip():
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication scheme: Bearer token is required.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        token = authorization[7:].strip()
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token: Token payload is empty.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        try:
+            return verify_supabase_jwt(token)
+        except Exception as e:
+            logger.warning(f"Development JWT verification failure: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid or expired authentication token: {str(e)}",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    # In development/testing, allow X-User-Id simulation when Authorization header is absent
     if x_user_id and x_user_id.strip():
         return x_user_id.strip()
-
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization[7:].strip()
-        # If token has 3 parts, attempt JWT verification
-        if token.count(".") == 2:
-            try:
-                return verify_supabase_jwt(token)
-            except Exception:
-                pass
-        if token:
-            return token
 
     return None
 
 
 def verify_ownership(
-    resource_owner_id: Optional[str],
-    current_user_id: Optional[str],
+    resource_owner_id: Optional[Any],
+    current_user_id: Optional[Any],
     resource_type: str = "resource",
 ) -> None:
     """
     Centrally enforces data ownership and multi-tenant access control.
+    Supports both str and uuid.UUID representations robustly.
 
     Access Rules:
     1. Production mode (settings.is_production):
@@ -489,14 +509,17 @@ def verify_ownership(
          If resource_owner_id != current_user_id:
              Raises HTTP 403 Forbidden.
     """
+    norm_owner = str(resource_owner_id).strip().lower() if resource_owner_id is not None else None
+    norm_current = str(current_user_id).strip().lower() if current_user_id is not None else None
+
     if settings.is_production:
-        if not current_user_id:
+        if not norm_current:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authentication required.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        if resource_owner_id is None:
+        if norm_owner is None:
             logger.warning(
                 f"Production security block: authenticated user '{current_user_id}' attempted to access "
                 f"unowned legacy {resource_type}."
@@ -505,7 +528,7 @@ def verify_ownership(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Access denied: Legacy unowned {resource_type}s cannot be accessed in production.",
             )
-        if resource_owner_id != current_user_id:
+        if norm_owner != norm_current:
             logger.warning(
                 f"Unauthorized access attempt: user '{current_user_id}' attempted to access "
                 f"{resource_type} owned by '{resource_owner_id}'."
@@ -516,8 +539,8 @@ def verify_ownership(
             )
     else:
         # Development / Testing mode
-        if resource_owner_id is not None and current_user_id is not None:
-            if resource_owner_id != current_user_id:
+        if norm_owner is not None and norm_current is not None:
+            if norm_owner != norm_current:
                 logger.warning(
                     f"Unauthorized access attempt: user '{current_user_id}' attempted to access "
                     f"{resource_type} owned by '{resource_owner_id}'."

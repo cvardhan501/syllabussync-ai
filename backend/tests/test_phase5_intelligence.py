@@ -308,29 +308,30 @@ def test_diagnostics_test_youtube_mocked():
     mock_response.status_code = 200
     mock_response.json.return_value = {"items": [{"id": {"videoId": "test_123"}}]}
 
-    with patch("httpx.AsyncClient.get", return_value=mock_response):
-        res = client.post("/api/diagnostics/test-youtube")
-        assert res.status_code == 200
-        data = res.json()
-        assert data["service"] == "youtube"
-        assert data["tested"] is True
-        assert data["status"] == "success"
-        assert "latency_ms" in data
-        assert "YouTube Data API v3 connection successful" in data["message"]
+    with patch.object(settings, "youtube_api_key", "mock_key_123"):
+        with patch("httpx.AsyncClient.get", return_value=mock_response):
+            res = client.post("/api/diagnostics/test-youtube")
+            assert res.status_code == 200
+            data = res.json()
+            assert data["service"] == "youtube"
+            assert data["tested"] is True
+            assert data["status"] == "success"
+            assert "latency_ms" in data
+            assert "YouTube Data API v3 connection successful" in data["message"]
 
-    # Test mocked 403 quota exceeded
-    mock_quota_resp = MagicMock()
-    mock_quota_resp.status_code = 403
-    mock_quota_resp.json.return_value = {
-        "error": {"errors": [{"reason": "quotaExceeded"}]}
-    }
+        # Test mocked 403 quota exceeded
+        mock_quota_resp = MagicMock()
+        mock_quota_resp.status_code = 403
+        mock_quota_resp.json.return_value = {
+            "error": {"errors": [{"reason": "quotaExceeded"}]}
+        }
 
-    with patch("httpx.AsyncClient.get", return_value=mock_quota_resp):
-        res = client.post("/api/diagnostics/test-youtube")
-        assert res.status_code == 200
-        data = res.json()
-        assert data["status"] == "quota_exceeded"
-        assert "quota exceeded" in data["message"].lower()
+        with patch("httpx.AsyncClient.get", return_value=mock_quota_resp):
+            res = client.post("/api/diagnostics/test-youtube")
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "quota_exceeded"
+            assert "quota exceeded" in data["message"].lower()
 
 
 def test_youtube_provenance_explicit_labeling():

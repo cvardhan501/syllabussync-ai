@@ -18,10 +18,13 @@ logger = logging.getLogger("syllabus_sync")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize database schema
+    # Startup: Initialize database schema safely
     logger.info("Initializing SyllabusSync AI database...")
-    init_db()
-    logger.info("Database initialized successfully.")
+    try:
+        init_db()
+        logger.info("Database initialized successfully.")
+    except Exception as e:
+        logger.error(f"Database initialization warning (non-fatal for serverless cold start): {e}")
     yield
     # Shutdown
     logger.info("Shutting down SyllabusSync AI backend.")

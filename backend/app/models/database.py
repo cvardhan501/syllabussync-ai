@@ -4,9 +4,261 @@ import json
 import datetime
 import uuid
 import re
+import logging
 from contextlib import contextmanager
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from app.core.config import settings
+
+logger = logging.getLogger("syllabus_sync.database")
+
+# Optional psycopg import with graceful fallback for local development environments
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
+
+
+def is_postgres() -> bool:
+    """Detects whether the configured database_url targets a PostgreSQL database."""
+    url = (getattr(settings, "database_url", "") or "").strip().lower()
+    return url.startswith("postgresql://") or url.startswith("postgres://") or url.startswith("postgresql+psycopg://")
+
+
+def _normalize_pg_url(url: str) -> str:
+    """Normalizes postgres connection string for psycopg3."""
+    normalized = url.strip()
+    if normalized.startswith("postgresql+psycopg://"):
+        normalized = "postgresql://" + normalized[len("postgresql+psycopg://"):]
+    elif normalized.startswith("postgres://"):
+        normalized = "postgresql://" + normalized[len("postgres://"):]
+    return normalized
+
+
+def _safe_json_loads(val: Any, default: Any = None) -> Any:
+    """Safely deserializes JSON data from either SQLite strings or PostgreSQL pre-deserialized JSONB objects."""
+    if val is None:
+        return default
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, (bytes, bytearray)):
+        try:
+            return json.loads(val.decode("utf-8"))
+        except Exception:
+            return default
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return default
+        try:
+            return json.loads(val)
+        except Exception:
+            return default
+    return default
+
+
+def _safe_json_dumps(val: Any) -> str:
+    """Safely serializes data to a JSON string."""
+    if isinstance(val, str):
+        return val
+    return json.dumps(val)
+
+
+def _to_date_str(val: Any) -> str:
+    """Converts a date, datetime, or string to YYYY-MM-DD string."""
+    if val is None:
+        return ""
+    if isinstance(val, (datetime.datetime, datetime.date)):
+        return val.isoformat()[:10]
+    return str(val)[:10]
+
+
+def _to_iso_str(val: Any) -> Optional[str]:
+    """Converts a timestamp, datetime, or string to an ISO-formatted string."""
+    if val is None:
+        return None
+    if isinstance(val, (datetime.datetime, datetime.date)):
+        return val.isoformat()
+    return str(val)
+
+
+
+def _normalize_uuid_or_none(val: Any) -> Optional[str]:
+    """Ensures owner_user_id is a valid UUID string for PostgreSQL uuid columns,
+    or None if empty/default_user, or maps deterministic test strings to UUID v5."""
+    if not val:
+        return None
+    val_str = str(val).strip()
+    if not val_str or val_str.lower() in ("default_user", "none", "null"):
+        return None
+    try:
+        parsed = uuid.UUID(val_str)
+        return str(parsed)
+    except ValueError:
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, val_str))
+
+def _safe_bool(val: Any) -> bool:
+    """Safely normalizes integer, string, or boolean values into Python bool."""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "t", "yes")
+    return bool(val)
+
+
+def _adapt_sql(sql: str) -> str:
+    """Adapts standard SQLite SQL statements for PostgreSQL execution:
+    - Converts '?' placeholders to '%s'
+    - Converts SQLite GROUP_CONCAT(...) to PostgreSQL STRING_AGG(..., ',')
+    - Converts boolean integer equality (is_archived = 0/1, is_primary = 1) to boolean expressions
+    """
+    if not is_postgres():
+        return sql
+
+    adapted = sql
+
+    # 1. Adapt GROUP_CONCAT(expr) -> STRING_AGG(expr, ',')
+    adapted = re.sub(
+        r'\bGROUP_CONCAT\s*\(\s*([^,\)]+?)\s*\)',
+        r"STRING_AGG(\1, ',')",
+        adapted,
+        flags=re.IGNORECASE
+    )
+
+    # 2. Adapt boolean comparisons
+    adapted = re.sub(r'\bis_archived\s*=\s*0\b', 'is_archived IS NOT TRUE', adapted, flags=re.IGNORECASE)
+    adapted = re.sub(r'\bis_archived\s*=\s*1\b', 'is_archived IS TRUE', adapted, flags=re.IGNORECASE)
+    adapted = re.sub(r'\bis_primary\s*=\s*1\b', 'is_primary IS TRUE', adapted, flags=re.IGNORECASE)
+    adapted = re.sub(r'\bis_primary\s*=\s*0\b', 'is_primary IS FALSE', adapted, flags=re.IGNORECASE)
+
+    # 3. Adapt ? placeholders to %s
+    # Safe because no query in the codebase uses ? inside string literals
+    # Remove invalid UUID empty-string checks for PostgreSQL
+    adapted = re.sub(r"\s*OR\s+owner_user_id\s*=\s*''", "", adapted, flags=re.IGNORECASE)
+    adapted = re.sub(r"\s*OR\s+owner_user_id\s*=\s*'default_user'", "", adapted, flags=re.IGNORECASE)
+    adapted = adapted.replace("?", "%s")
+
+    return adapted
+
+
+class RowDict(dict):
+    """Dictionary that also allows positional indexing row[0] for full SQLite row compatibility.
+    Normalizes uuid.UUID values into standard strings."""
+    def __init__(self, data=None, **kwargs):
+        if data:
+            if isinstance(data, dict):
+                normalized = {
+                    k: (str(v) if isinstance(v, uuid.UUID) else v)
+                    for k, v in data.items()
+                }
+                super().__init__(normalized, **kwargs)
+            else:
+                super().__init__(data, **kwargs)
+        else:
+            super().__init__(**kwargs)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
+class PgCursorWrapper:
+    """Wraps psycopg cursor to adapt queries, normalize placeholders and row returns."""
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql: str, params=None):
+        adapted_sql = _adapt_sql(sql)
+        if params is not None:
+            self._cur.execute(adapted_sql, params)
+        else:
+            self._cur.execute(adapted_sql)
+        return self
+
+    def executemany(self, sql: str, params_seq):
+        adapted_sql = _adapt_sql(sql)
+        self._cur.executemany(adapted_sql, params_seq)
+        return self
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        if row is None:
+            return None
+        return RowDict(row)
+
+    def fetchall(self):
+        rows = self._cur.fetchall()
+        return [RowDict(r) for r in rows]
+
+    def fetchmany(self, size=None):
+        rows = self._cur.fetchmany(size) if size is not None else self._cur.fetchmany()
+        return [RowDict(r) for r in rows]
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    @property
+    def description(self):
+        return self._cur.description
+
+    def __iter__(self):
+        for row in self._cur:
+            yield RowDict(row)
+
+
+class PgConnectionWrapper:
+    """Wraps psycopg connection to provide execute() and RowDict results matching sqlite3."""
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def execute(self, sql: str, params=None):
+        cur = self._conn.cursor()
+        adapted_sql = _adapt_sql(sql)
+        if params is not None:
+            cur.execute(adapted_sql, params)
+        else:
+            cur.execute(adapted_sql)
+        return PgCursorWrapper(cur)
+
+    def executemany(self, sql: str, params_seq):
+        cur = self._conn.cursor()
+        adapted_sql = _adapt_sql(sql)
+        cur.executemany(adapted_sql, params_seq)
+        return PgCursorWrapper(cur)
+
+    def cursor(self):
+        return PgCursorWrapper(self._conn.cursor())
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        else:
+            try:
+                self._conn.commit()
+            except Exception:
+                pass
 
 
 def get_db_path() -> str:
@@ -23,7 +275,51 @@ def get_db_path() -> str:
     return "syllabus_sync.db"
 
 
-def init_db():
+EXPECTED_TABLES = [
+    "syllabi",
+    "courses",
+    "course_assessments",
+    "modules",
+    "topics",
+    "study_plans",
+    "study_tasks",
+    "user_settings",
+    "video_resources",
+    "topic_resources",
+    "rejected_channels",
+    "youtube_search_cache",
+    "syllabus_coverage_summary",
+]
+
+
+def _validate_postgres_schema() -> None:
+    """Validates that the expected tables exist in PostgreSQL without running DDL or PRAGMA statements."""
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                """
+            )
+            existing = {row["table_name"] for row in cur.fetchall()}
+            missing = [t for t in EXPECTED_TABLES if t not in existing]
+            if missing:
+                logger.warning(
+                    f"PostgreSQL connection verified, but {len(missing)} expected table(s) missing: {missing}"
+                )
+            else:
+                logger.info(
+                    "PostgreSQL connection verified: all 13 expected tables exist in Supabase schema."
+                )
+    except Exception as e:
+        logger.error(f"PostgreSQL schema validation failed: {e}")
+        raise
+
+
+def _init_sqlite_schema() -> None:
     """Initializes SQLite schema and handles safe column migrations."""
     db_path = get_db_path()
     dirname = os.path.dirname(db_path)
@@ -32,7 +328,7 @@ def init_db():
 
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        
+
         # 1. Syllabi table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS syllabi (
@@ -53,24 +349,24 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
         # Add columns if migrating from Phase 1
         cursor.execute("PRAGMA table_info(syllabi)")
         existing_cols = {col[1] for col in cursor.fetchall()}
-        
-        for col_name, col_type in [
-            ("owner_user_id", "TEXT"),
-            ("course_id", "TEXT"),
-            ("course_name", "TEXT"),
-            ("course_code", "TEXT"),
-            ("analysis_json", "TEXT"),
-            ("is_fallback", "INTEGER DEFAULT 0"),
-            ("analysis_engine", "TEXT"),
-        ]:
-            if col_name not in existing_cols:
-                cursor.execute(f"ALTER TABLE syllabi ADD COLUMN {col_name} {col_type}")
+        if "course_name" not in existing_cols:
+            cursor.execute("ALTER TABLE syllabi ADD COLUMN course_name TEXT")
+        if "course_code" not in existing_cols:
+            cursor.execute("ALTER TABLE syllabi ADD COLUMN course_code TEXT")
+        if "owner_user_id" not in existing_cols:
+            cursor.execute("ALTER TABLE syllabi ADD COLUMN owner_user_id TEXT")
+        if "course_id" not in existing_cols:
+            cursor.execute("ALTER TABLE syllabi ADD COLUMN course_id TEXT")
+        if "is_fallback" not in existing_cols:
+            cursor.execute("ALTER TABLE syllabi ADD COLUMN is_fallback INTEGER DEFAULT 0")
+        if "analysis_engine" not in existing_cols:
+            cursor.execute("ALTER TABLE syllabi ADD COLUMN analysis_engine TEXT")
 
-        # 1b. Courses table (Multi-Course Academic System)
+        # 2. Courses table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS courses (
                 id TEXT PRIMARY KEY,
@@ -91,19 +387,23 @@ def init_db():
                 FOREIGN KEY (syllabus_id) REFERENCES syllabi (id) ON DELETE SET NULL
             )
         """)
-
         cursor.execute("PRAGMA table_info(courses)")
-        existing_course_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
+        course_cols = {col[1] for col in cursor.fetchall()}
+        for col_name, col_def in [
             ("owner_user_id", "TEXT"),
-            ("languages_json", "TEXT"),
-            ("channel_strategy", "TEXT DEFAULT 'two_channels'"),
-            ("is_library_confirmed", "INTEGER DEFAULT 0"),
+            ("language", "TEXT DEFAULT 'English'"),
+            ("lesson_style", "TEXT DEFAULT 'In-depth'"),
+            ("daily_study_availability", "TEXT DEFAULT '2-4 hours'"),
+            ("daily_target_minutes", "INTEGER DEFAULT 120"),
+            ("assessment_system_type", "TEXT DEFAULT 'autonomous'"),
+            ("assessment_scope", "TEXT DEFAULT 'both'"),
+            ("color_theme", "TEXT DEFAULT 'blue'"),
+            ("is_archived", "INTEGER DEFAULT 0"),
         ]:
-            if col_name not in existing_course_cols:
-                cursor.execute(f"ALTER TABLE courses ADD COLUMN {col_name} {col_type}")
+            if col_name not in course_cols:
+                cursor.execute(f"ALTER TABLE courses ADD COLUMN {col_name} {col_def}")
 
-        # 1c. Course Assessments table
+        # 3. Course Assessments table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS course_assessments (
                 id TEXT PRIMARY KEY,
@@ -119,7 +419,7 @@ def init_db():
             )
         """)
 
-        # 2. Modules table
+        # 4. Modules table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS modules (
                 id TEXT PRIMARY KEY,
@@ -132,17 +432,14 @@ def init_db():
                 FOREIGN KEY (syllabus_id) REFERENCES syllabi (id) ON DELETE CASCADE
             )
         """)
-
         cursor.execute("PRAGMA table_info(modules)")
-        existing_module_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
-            ("official_hours", "REAL"),
-            ("official_minutes", "INTEGER"),
-        ]:
-            if col_name not in existing_module_cols:
-                cursor.execute(f"ALTER TABLE modules ADD COLUMN {col_name} {col_type}")
+        mod_cols = {col[1] for col in cursor.fetchall()}
+        if "official_hours" not in mod_cols:
+            cursor.execute("ALTER TABLE modules ADD COLUMN official_hours REAL")
+        if "official_minutes" not in mod_cols:
+            cursor.execute("ALTER TABLE modules ADD COLUMN official_minutes INTEGER")
 
-        # 3. Topics table
+        # 5. Topics table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS topics (
                 id TEXT PRIMARY KEY,
@@ -162,22 +459,22 @@ def init_db():
                 FOREIGN KEY (module_id) REFERENCES modules (id) ON DELETE CASCADE
             )
         """)
-
-        # Add missing columns to topics table if migrating from Phase 1
         cursor.execute("PRAGMA table_info(topics)")
-        existing_topic_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
-            ("module_id", "TEXT"),
-            ("explanation", "TEXT"),
-            ("prerequisites_json", "TEXT"),
-            ("subtopics_json", "TEXT"),
-            ("source_evidence", "TEXT"),
-            ("confidence_notes", "TEXT"),
-        ]:
-            if col_name not in existing_topic_cols:
-                cursor.execute(f"ALTER TABLE topics ADD COLUMN {col_name} {col_type}")
-        
-        # 4. Study plan table
+        topic_cols = {col[1] for col in cursor.fetchall()}
+        if "estimated_minutes" not in topic_cols:
+            cursor.execute("ALTER TABLE topics ADD COLUMN estimated_minutes INTEGER DEFAULT 60")
+        if "difficulty_level" not in topic_cols:
+            cursor.execute("ALTER TABLE topics ADD COLUMN difficulty_level TEXT DEFAULT 'medium'")
+        if "prerequisites_json" not in topic_cols:
+            cursor.execute("ALTER TABLE topics ADD COLUMN prerequisites_json TEXT")
+        if "subtopics_json" not in topic_cols:
+            cursor.execute("ALTER TABLE topics ADD COLUMN subtopics_json TEXT")
+        if "source_evidence" not in topic_cols:
+            cursor.execute("ALTER TABLE topics ADD COLUMN source_evidence TEXT")
+        if "confidence_notes" not in topic_cols:
+            cursor.execute("ALTER TABLE topics ADD COLUMN confidence_notes TEXT")
+
+        # 6. Study plans table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS study_plans (
                 id TEXT PRIMARY KEY,
@@ -198,15 +495,16 @@ def init_db():
                 FOREIGN KEY (syllabus_id) REFERENCES syllabi (id) ON DELETE CASCADE
             )
         """)
-
-        # Add missing columns to study_plans if migrating
         cursor.execute("PRAGMA table_info(study_plans)")
-        existing_plan_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
+        plan_cols = {col[1] for col in cursor.fetchall()}
+        for col_name, col_def in [
             ("owner_user_id", "TEXT"),
             ("course_id", "TEXT"),
-            ("preferred_days_json", "TEXT DEFAULT '[\"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\", \"Sat\", \"Sun\"]'"),
+            ("exam_date", "TEXT"),
+            ("daily_target_minutes", "INTEGER DEFAULT 60"),
+            ("preferred_days_json", 'TEXT DEFAULT \'["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]\''),
             ("start_date", "TEXT"),
+            ("status", "TEXT DEFAULT 'active'"),
             ("feasibility_status", "TEXT DEFAULT 'feasible'"),
             ("shortfall_minutes", "INTEGER DEFAULT 0"),
             ("feasibility_warning", "TEXT"),
@@ -214,10 +512,10 @@ def init_db():
             ("completed_minutes", "INTEGER DEFAULT 0"),
             ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
         ]:
-            if col_name not in existing_plan_cols:
-                cursor.execute(f"ALTER TABLE study_plans ADD COLUMN {col_name} {col_type}")
+            if col_name not in plan_cols:
+                cursor.execute(f"ALTER TABLE study_plans ADD COLUMN {col_name} {col_def}")
 
-        # 4b. Study tasks table
+        # 7. Study tasks table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS study_tasks (
                 id TEXT PRIMARY KEY,
@@ -243,18 +541,16 @@ def init_db():
                 FOREIGN KEY (topic_id) REFERENCES topics (id) ON DELETE CASCADE
             )
         """)
-
-        # Add missing columns to study_tasks if migrating
         cursor.execute("PRAGMA table_info(study_tasks)")
-        existing_task_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
-            ("course_id", "TEXT"),
-            ("assessment_id", "TEXT"),
-        ]:
-            if col_name not in existing_task_cols:
-                cursor.execute(f"ALTER TABLE study_tasks ADD COLUMN {col_name} {col_type}")
+        task_cols = {col[1] for col in cursor.fetchall()}
+        if "course_id" not in task_cols:
+            cursor.execute("ALTER TABLE study_tasks ADD COLUMN course_id TEXT")
+        if "assessment_id" not in task_cols:
+            cursor.execute("ALTER TABLE study_tasks ADD COLUMN assessment_id TEXT")
+        if "order_index" not in task_cols:
+            cursor.execute("ALTER TABLE study_tasks ADD COLUMN order_index INTEGER DEFAULT 0")
 
-        # 4c. User settings table
+        # 8. User Settings table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
                 id TEXT PRIMARY KEY DEFAULT 'default_user',
@@ -272,16 +568,26 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
         cursor.execute("PRAGMA table_info(user_settings)")
-        existing_setting_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
+        setting_cols = {col[1] for col in cursor.fetchall()}
+        for col_name, col_def in [
             ("owner_user_id", "TEXT"),
+            ("preferred_language", "TEXT DEFAULT 'English'"),
+            ("lesson_style", "TEXT DEFAULT 'In-depth'"),
+            ("daily_study_availability", "TEXT DEFAULT '2-4 hours'"),
+            ("daily_target_minutes", "INTEGER DEFAULT 120"),
+            ("exam_date", "TEXT DEFAULT '2026-05-15'"),
+            ("study_days_json", 'TEXT DEFAULT \'["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]\''),
+            ("theme", "TEXT DEFAULT 'dark'"),
+            ("study_reminders", "INTEGER DEFAULT 1"),
+            ("deadline_alerts", "INTEGER DEFAULT 1"),
+            ("auto_save_progress", "INTEGER DEFAULT 1"),
+            ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
         ]:
-            if col_name not in existing_setting_cols:
-                cursor.execute(f"ALTER TABLE user_settings ADD COLUMN {col_name} {col_type}")
+            if col_name not in setting_cols:
+                cursor.execute(f"ALTER TABLE user_settings ADD COLUMN {col_name} {col_def}")
 
-        # 5. Video resources table
+        # 9. Phase 3 Video Resources
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS video_resources (
                 id TEXT PRIMARY KEY,
@@ -303,7 +609,6 @@ def init_db():
             )
         """)
 
-        # 6. Topic resources association table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS topic_resources (
                 id TEXT PRIMARY KEY,
@@ -322,7 +627,6 @@ def init_db():
             )
         """)
 
-        # 7. Rejected channels table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS rejected_channels (
                 id TEXT PRIMARY KEY,
@@ -335,7 +639,6 @@ def init_db():
             )
         """)
 
-        # 8. YouTube search cache table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS youtube_search_cache (
                 query_hash TEXT PRIMARY KEY,
@@ -346,7 +649,6 @@ def init_db():
             )
         """)
 
-        # 9. Syllabus coverage summary table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS syllabus_coverage_summary (
                 syllabus_id TEXT PRIMARY KEY,
@@ -366,47 +668,61 @@ def init_db():
             )
         """)
 
+        # Migrate coverage summary schema
         cursor.execute("PRAGMA table_info(syllabus_coverage_summary)")
         cov_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
-            ("is_confirmed", "INTEGER DEFAULT 1"),
+        for col_name, col_def in [
+            ("is_confirmed", "INTEGER DEFAULT 0"),
             ("channel_strategy", "TEXT DEFAULT 'two_channels'"),
-            ("languages_json", "TEXT"),
+            ("languages_json", 'TEXT DEFAULT \'["English"]\''),
             ("topics_with_verified", "INTEGER DEFAULT 0"),
             ("topics_with_probable", "INTEGER DEFAULT 0"),
             ("verified_coverage_percentage", "REAL DEFAULT 0.0"),
             ("probable_coverage_percentage", "REAL DEFAULT 0.0"),
         ]:
             if col_name not in cov_cols:
-                cursor.execute(f"ALTER TABLE syllabus_coverage_summary ADD COLUMN {col_name} {col_type}")
+                cursor.execute(f"ALTER TABLE syllabus_coverage_summary ADD COLUMN {col_name} {col_def}")
 
+        # Migrate topic_resources schema
         cursor.execute("PRAGMA table_info(topic_resources)")
-        top_res_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
+        tr_cols = {col[1] for col in cursor.fetchall()}
+        for col_name, col_def in [
             ("assigned_channel", "TEXT"),
             ("is_shared_video", "INTEGER DEFAULT 0"),
-            ("shared_with_topics_json", "TEXT"),
+            ("shared_with_topics_json", 'TEXT DEFAULT \'[]\''),
             ("availability_status", "TEXT DEFAULT 'available'"),
         ]:
-            if col_name not in top_res_cols:
-                cursor.execute(f"ALTER TABLE topic_resources ADD COLUMN {col_name} {col_type}")
+            if col_name not in tr_cols:
+                cursor.execute(f"ALTER TABLE topic_resources ADD COLUMN {col_name} {col_def}")
 
+        # Migrate video_resources schema
         cursor.execute("PRAGMA table_info(video_resources)")
-        vid_cols = {col[1] for col in cursor.fetchall()}
-        for col_name, col_type in [
+        vr_cols = {col[1] for col in cursor.fetchall()}
+        for col_name, col_def in [
             ("availability_status", "TEXT DEFAULT 'available'"),
-            ("description", "TEXT DEFAULT ''"),
+            ("description", "TEXT"),
         ]:
-            if col_name not in vid_cols:
-                cursor.execute(f"ALTER TABLE video_resources ADD COLUMN {col_name} {col_type}")
+            if col_name not in vr_cols:
+                cursor.execute(f"ALTER TABLE video_resources ADD COLUMN {col_name} {col_def}")
 
-        # 10. Backfill existing syllabi into courses table if unlinked
-        cursor.execute("SELECT id, course_name, course_code, filename FROM syllabi WHERE course_id IS NULL OR course_id = ''")
-        unlinked_syllabi = cursor.fetchall()
-        for s_id, c_name, c_code, fname in unlinked_syllabi:
+        cursor.execute("PRAGMA table_info(courses)")
+        c_cols = {col[1] for col in cursor.fetchall()}
+        for col_name, col_def in [
+            ("channel_strategy", "TEXT DEFAULT 'two_channels'"),
+            ("languages_json", 'TEXT DEFAULT \'["English"]\''),
+            ("is_library_confirmed", "INTEGER DEFAULT 0"),
+        ]:
+            if col_name not in c_cols:
+                cursor.execute(f"ALTER TABLE courses ADD COLUMN {col_name} {col_def}")
+
+        # 10. Automatically link orphan syllabi into default course if none exists
+        cursor.execute("SELECT id, course_name, course_code FROM syllabi WHERE course_id IS NULL OR course_id = ''")
+        orphan_syllabi = cursor.fetchall()
+        for s_row in orphan_syllabi:
+            s_id = s_row[0]
+            title = s_row[1] or "Course"
+            code = s_row[2] or ""
             c_id = f"course_{s_id}"
-            title = c_name or (fname.rsplit(".", 1)[0].replace("_", " ").title() if fname else "Course Syllabus")
-            code = c_code or ""
             cursor.execute("""
                 INSERT OR IGNORE INTO courses (id, syllabus_id, course_name, course_code, language, lesson_style)
                 VALUES (?, ?, ?, ?, 'English', 'In-depth')
@@ -424,22 +740,56 @@ def init_db():
         conn.commit()
 
 
-# Run schema initialization on module load
-try:
-    init_db()
-except Exception:
-    pass
+def init_db() -> None:
+    """Initializes database schema safely.
+    For SQLite: executes local table creation and column migrations.
+    For PostgreSQL: verifies connectivity and validates that all 13 expected tables exist (zero DDL/PRAGMA).
+    """
+    if is_postgres():
+        _validate_postgres_schema()
+    else:
+        _init_sqlite_schema()
 
 
 @contextmanager
 def get_db_connection():
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
+    if is_postgres():
+        if psycopg is None:
+            raise RuntimeError(
+                "psycopg is not installed. Please install psycopg[binary]>=3.2.0 to use PostgreSQL."
+            )
+        pg_url = _normalize_pg_url(settings.database_url)
+        connect_kwargs = {
+            "row_factory": dict_row,
+            "prepare_threshold": None,  # Mandatory for Supabase transaction pooler (port 6543)
+            "autocommit": False,
+        }
+        if "sslmode=" not in pg_url:
+            connect_kwargs["sslmode"] = "require"
+
+        conn = psycopg.connect(pg_url, **connect_kwargs)
+        wrapper = PgConnectionWrapper(conn)
+        try:
+            yield wrapper
+        except Exception:
+            try:
+                wrapper.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                wrapper.close()
+            except Exception:
+                pass
+    else:
+        db_path = get_db_path()
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def save_raw_syllabus(
@@ -452,15 +802,34 @@ def save_raw_syllabus(
     raw_text: str,
     owner_user_id: Optional[str] = None,
 ) -> None:
+    db_owner = _normalize_uuid_or_none(owner_user_id) if is_postgres() else owner_user_id
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO syllabi 
-            (id, filename, file_type, file_size_bytes, char_count, word_count, raw_text, owner_user_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (syllabus_id, filename, file_type, file_size_bytes, char_count, word_count, raw_text, owner_user_id)
-        )
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO syllabi
+                (id, filename, file_type, file_size_bytes, char_count, word_count, raw_text, owner_user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    filename = EXCLUDED.filename,
+                    file_type = EXCLUDED.file_type,
+                    file_size_bytes = EXCLUDED.file_size_bytes,
+                    char_count = EXCLUDED.char_count,
+                    word_count = EXCLUDED.word_count,
+                    raw_text = EXCLUDED.raw_text,
+                    owner_user_id = EXCLUDED.owner_user_id
+                """,
+                (syllabus_id, filename, file_type, file_size_bytes, char_count, word_count, raw_text, db_owner)
+            )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO syllabi
+                (id, filename, file_type, file_size_bytes, char_count, word_count, raw_text, owner_user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (syllabus_id, filename, file_type, file_size_bytes, char_count, word_count, raw_text, db_owner)
+            )
         conn.commit()
 
 
@@ -470,7 +839,7 @@ def save_syllabus_hierarchy(
     is_fallback: bool,
     analysis_engine: str,
 ) -> None:
-    """Atomically saves the module and topic hierarchy into SQLite."""
+    """Atomically saves the module and topic hierarchy into SQLite or PostgreSQL."""
     course_name = hierarchy_dict.get("course_name")
     course_code = hierarchy_dict.get("course_code")
     modules = hierarchy_dict.get("modules", [])
@@ -479,14 +848,14 @@ def save_syllabus_hierarchy(
         # 1. Update syllabus record
         conn.execute(
             """
-            UPDATE syllabi 
+            UPDATE syllabi
             SET course_name = ?, course_code = ?, analysis_json = ?, is_fallback = ?, analysis_engine = ?
             WHERE id = ?
             """,
             (
                 course_name,
                 course_code,
-                json.dumps(hierarchy_dict),
+                _safe_json_dumps(hierarchy_dict),
                 1 if is_fallback else 0,
                 analysis_engine,
                 syllabus_id,
@@ -504,58 +873,120 @@ def save_syllabus_hierarchy(
             mod_title = mod.get("title", f"Module {mod_idx+1}")
             official_hours = mod.get("official_hours")
             official_minutes = mod.get("official_minutes")
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO modules (id, syllabus_id, module_title, module_order, official_hours, official_minutes)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (mod_id, syllabus_id, mod_title, mod_idx, official_hours, official_minutes)
-            )
+
+            if is_postgres():
+                conn.execute(
+                    """
+                    INSERT INTO modules (id, syllabus_id, module_title, module_order, official_hours, official_minutes)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        syllabus_id = EXCLUDED.syllabus_id,
+                        module_title = EXCLUDED.module_title,
+                        module_order = EXCLUDED.module_order,
+                        official_hours = EXCLUDED.official_hours,
+                        official_minutes = EXCLUDED.official_minutes
+                    """,
+                    (mod_id, syllabus_id, mod_title, mod_idx, official_hours, official_minutes)
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO modules (id, syllabus_id, module_title, module_order, official_hours, official_minutes)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (mod_id, syllabus_id, mod_title, mod_idx, official_hours, official_minutes)
+                )
 
             for top_idx, topic in enumerate(mod.get("topics", [])):
                 raw_top_id = topic.get("id") or f"top_{mod_idx+1}_{top_idx+1}"
                 top_id = f"{syllabus_id}_{raw_top_id}" if not raw_top_id.startswith(syllabus_id) else raw_top_id
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO topics 
-                    (id, syllabus_id, module_id, topic_title, topic_order, explanation,
-                     estimated_minutes, difficulty_level, prerequisites_json, subtopics_json,
-                     source_evidence, confidence_notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        top_id,
-                        syllabus_id,
-                        mod_id,
-                        topic.get("title", ""),
-                        top_idx,
-                        topic.get("explanation", ""),
-                        topic.get("estimated_minutes", 60),
-                        topic.get("difficulty", "medium"),
-                        json.dumps(topic.get("prerequisites", [])),
-                        json.dumps(topic.get("subtopics", [])),
-                        topic.get("source_evidence"),
-                        topic.get("confidence_notes"),
-                    )
+
+                params = (
+                    top_id,
+                    syllabus_id,
+                    mod_id,
+                    topic.get("title", ""),
+                    top_idx,
+                    topic.get("explanation", ""),
+                    topic.get("estimated_minutes", 60),
+                    topic.get("difficulty", "medium"),
+                    _safe_json_dumps(topic.get("prerequisites", [])),
+                    _safe_json_dumps(topic.get("subtopics", [])),
+                    topic.get("source_evidence"),
+                    topic.get("confidence_notes"),
                 )
+
+                if is_postgres():
+                    conn.execute(
+                        """
+                        INSERT INTO topics
+                        (id, syllabus_id, module_id, topic_title, topic_order, explanation,
+                         estimated_minutes, difficulty_level, prerequisites_json, subtopics_json,
+                         source_evidence, confidence_notes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            syllabus_id = EXCLUDED.syllabus_id,
+                            module_id = EXCLUDED.module_id,
+                            topic_title = EXCLUDED.topic_title,
+                            topic_order = EXCLUDED.topic_order,
+                            explanation = EXCLUDED.explanation,
+                            estimated_minutes = EXCLUDED.estimated_minutes,
+                            difficulty_level = EXCLUDED.difficulty_level,
+                            prerequisites_json = EXCLUDED.prerequisites_json,
+                            subtopics_json = EXCLUDED.subtopics_json,
+                            source_evidence = EXCLUDED.source_evidence,
+                            confidence_notes = EXCLUDED.confidence_notes
+                        """,
+                        params
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO topics
+                        (id, syllabus_id, module_id, topic_title, topic_order, explanation,
+                         estimated_minutes, difficulty_level, prerequisites_json, subtopics_json,
+                         source_evidence, confidence_notes)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        params
+                    )
 
         conn.commit()
 
 
-def get_syllabus_record(syllabus_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves a full syllabus record including stored analysis."""
+def get_syllabus_record(syllabus_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieves a full syllabus record including stored analysis, optionally verifying owner_user_id."""
     with get_db_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM syllabi WHERE id = ? OR course_id = ? ORDER BY created_at DESC LIMIT 1",
-            (syllabus_id, syllabus_id)
-        ).fetchone()
+        if owner_user_id:
+            row = conn.execute(
+                """
+                SELECT * FROM syllabi
+                WHERE (id = ? OR course_id = ?)
+                  AND (owner_user_id = ? OR owner_user_id IS NULL OR owner_user_id = '')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (syllabus_id, syllabus_id, owner_user_id)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM syllabi WHERE id = ? OR course_id = ? ORDER BY created_at DESC LIMIT 1",
+                (syllabus_id, syllabus_id)
+            ).fetchone()
         if not row:
             return None
-        return dict(row)
+        res = dict(row)
+        if res.get("owner_user_id") is not None:
+            res["owner_user_id"] = str(res["owner_user_id"])
+        return res
 
 
-def get_syllabus_hierarchy(syllabus_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves normalized hierarchy or stored JSON."""
+def get_syllabus_hierarchy(syllabus_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieves normalized hierarchy or stored JSON, verifying tenant ownership if requested."""
+    if owner_user_id:
+        s_owner = get_syllabus_owner_id(syllabus_id)
+        if s_owner and s_owner != owner_user_id:
+            return None
+
     with get_db_connection() as conn:
         syllabus = conn.execute(
             "SELECT * FROM syllabi WHERE id = ? OR course_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -566,11 +997,9 @@ def get_syllabus_hierarchy(syllabus_id: str) -> Optional[Dict[str, Any]]:
 
         # Check if stored in analysis_json
         if syllabus["analysis_json"]:
-            try:
-                data = json.loads(syllabus["analysis_json"])
+            data = _safe_json_loads(syllabus["analysis_json"])
+            if data:
                 return data
-            except Exception:
-                pass
 
         # Fallback to reconstructing from tables
         modules_rows = conn.execute(
@@ -593,8 +1022,8 @@ def get_syllabus_hierarchy(syllabus_id: str) -> Optional[Dict[str, Any]]:
                     "explanation": t["explanation"] or "",
                     "estimated_minutes": t["estimated_minutes"],
                     "difficulty": t["difficulty_level"],
-                    "prerequisites": json.loads(t["prerequisites_json"] or "[]"),
-                    "subtopics": json.loads(t["subtopics_json"] or "[]"),
+                    "prerequisites": _safe_json_loads(t["prerequisites_json"], default=[]),
+                    "subtopics": _safe_json_loads(t["subtopics_json"], default=[]),
                     "source_evidence": t["source_evidence"],
                     "confidence_notes": t["confidence_notes"],
                     "order_index": t["topic_order"],
@@ -631,22 +1060,32 @@ def get_cached_search(query_hash: str) -> Optional[Dict[str, Any]]:
         ).fetchone()
         if not row:
             return None
-        try:
-            return json.loads(row["response_json"])
-        except Exception:
-            return None
+        return _safe_json_loads(row["response_json"], default=None)
 
 
 def save_cached_search(query_hash: str, query: str, language: Optional[str], response_dict: Dict[str, Any]) -> None:
     """Caches YouTube search results to avoid quota exhaustion."""
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO youtube_search_cache (query_hash, query, language, response_json)
-            VALUES (?, ?, ?, ?)
-            """,
-            (query_hash, query, language or "en", json.dumps(response_dict))
-        )
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO youtube_search_cache (query_hash, query, language, response_json)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (query_hash) DO UPDATE SET
+                    query = EXCLUDED.query,
+                    language = EXCLUDED.language,
+                    response_json = EXCLUDED.response_json
+                """,
+                (query_hash, query, language or "en", _safe_json_dumps(response_dict))
+            )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO youtube_search_cache (query_hash, query, language, response_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (query_hash, query, language or "en", _safe_json_dumps(response_dict))
+            )
         conn.commit()
 
 
@@ -666,43 +1105,83 @@ def save_discovered_resources(
 ) -> None:
     """Atomically saves discovered video resources, topic associations, and coverage summary."""
     with get_db_connection() as conn:
-        lang_json = json.dumps(languages if languages else ["English"])
+        lang_json = _safe_json_dumps(languages if languages else ["English"])
+
         # 1. Save or replace coverage summary
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO syllabus_coverage_summary
-            (syllabus_id, total_topics, topics_with_candidates, topics_with_relevant,
-             topics_with_no_resource, topics_needing_review, selected_channels_json,
-             requires_third_channel_approval, third_channel_candidates_json,
-             strategy_explanation, is_fallback, discovery_engine,
-             is_confirmed, channel_strategy, languages_json,
-             topics_with_verified, topics_with_probable,
-             verified_coverage_percentage, probable_coverage_percentage,
-             updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-            (
-                syllabus_id,
-                coverage.get("total_topics", 0),
-                coverage.get("topics_with_candidates", 0),
-                coverage.get("topics_with_relevant", coverage.get("topics_with_verified", 0)),
-                coverage.get("topics_with_no_resource", 0),
-                coverage.get("topics_needing_review", coverage.get("topics_with_probable", 0)),
-                json.dumps(selected_channels),
-                1 if requires_third_approval else 0,
-                json.dumps(third_channel_candidates),
-                strategy_explanation,
-                1 if is_fallback else 0,
-                discovery_engine,
-                1 if is_confirmed else 0,
-                channel_strategy,
-                lang_json,
-                coverage.get("topics_with_verified", coverage.get("topics_with_relevant", 0)),
-                coverage.get("topics_with_probable", coverage.get("topics_needing_review", 0)),
-                coverage.get("verified_coverage_percentage", coverage.get("coverage_percentage", 0.0)),
-                coverage.get("probable_coverage_percentage", 0.0),
-            )
+        cov_params = (
+            syllabus_id,
+            coverage.get("total_topics", 0),
+            coverage.get("topics_with_candidates", 0),
+            coverage.get("topics_with_relevant", coverage.get("topics_with_verified", 0)),
+            coverage.get("topics_with_no_resource", 0),
+            coverage.get("topics_needing_review", coverage.get("topics_with_probable", 0)),
+            _safe_json_dumps(selected_channels),
+            1 if requires_third_approval else 0,
+            _safe_json_dumps(third_channel_candidates),
+            strategy_explanation,
+            1 if is_fallback else 0,
+            discovery_engine,
+            1 if is_confirmed else 0,
+            channel_strategy,
+            lang_json,
+            coverage.get("topics_with_verified", coverage.get("topics_with_relevant", 0)),
+            coverage.get("topics_with_probable", coverage.get("topics_needing_review", 0)),
+            coverage.get("verified_coverage_percentage", coverage.get("coverage_percentage", 0.0)),
+            coverage.get("probable_coverage_percentage", 0.0),
         )
+
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO syllabus_coverage_summary
+                (syllabus_id, total_topics, topics_with_candidates, topics_with_relevant,
+                 topics_with_no_resource, topics_needing_review, selected_channels_json,
+                 requires_third_channel_approval, third_channel_candidates_json,
+                 strategy_explanation, is_fallback, discovery_engine,
+                 is_confirmed, channel_strategy, languages_json,
+                 topics_with_verified, topics_with_probable,
+                 verified_coverage_percentage, probable_coverage_percentage,
+                 updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (syllabus_id) DO UPDATE SET
+                    total_topics = EXCLUDED.total_topics,
+                    topics_with_candidates = EXCLUDED.topics_with_candidates,
+                    topics_with_relevant = EXCLUDED.topics_with_relevant,
+                    topics_with_no_resource = EXCLUDED.topics_with_no_resource,
+                    topics_needing_review = EXCLUDED.topics_needing_review,
+                    selected_channels_json = EXCLUDED.selected_channels_json,
+                    requires_third_channel_approval = EXCLUDED.requires_third_channel_approval,
+                    third_channel_candidates_json = EXCLUDED.third_channel_candidates_json,
+                    strategy_explanation = EXCLUDED.strategy_explanation,
+                    is_fallback = EXCLUDED.is_fallback,
+                    discovery_engine = EXCLUDED.discovery_engine,
+                    is_confirmed = EXCLUDED.is_confirmed,
+                    channel_strategy = EXCLUDED.channel_strategy,
+                    languages_json = EXCLUDED.languages_json,
+                    topics_with_verified = EXCLUDED.topics_with_verified,
+                    topics_with_probable = EXCLUDED.topics_with_probable,
+                    verified_coverage_percentage = EXCLUDED.verified_coverage_percentage,
+                    probable_coverage_percentage = EXCLUDED.probable_coverage_percentage,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                cov_params
+            )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO syllabus_coverage_summary
+                (syllabus_id, total_topics, topics_with_candidates, topics_with_relevant,
+                 topics_with_no_resource, topics_needing_review, selected_channels_json,
+                 requires_third_channel_approval, third_channel_candidates_json,
+                 strategy_explanation, is_fallback, discovery_engine,
+                 is_confirmed, channel_strategy, languages_json,
+                 topics_with_verified, topics_with_probable,
+                 verified_coverage_percentage, probable_coverage_percentage,
+                 updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                cov_params
+            )
 
         # 2. Upsert videos and topic resources
         for mapping in topic_mappings:
@@ -710,7 +1189,6 @@ def save_discovered_resources(
             module_id = mapping["module_id"]
             res = mapping.get("resource")
             raw_status = mapping.get("match_status", "no_resource")
-            # Normalize status to standard format while allowing backward compat
             if raw_status in ("relevant", "verified"):
                 match_status = "verified"
             elif raw_status in ("candidate_only", "needs_review", "probable"):
@@ -724,87 +1202,170 @@ def save_discovered_resources(
             notes = mapping.get("relevance_notes")
             assigned_channel = mapping.get("assigned_channel")
             is_shared = 1 if mapping.get("is_shared_video") else 0
-            shared_topics_json = json.dumps(mapping.get("shared_with_topics", []))
+            shared_topics_json = _safe_json_dumps(mapping.get("shared_with_topics", []))
             avail_status = mapping.get("availability_status", "available" if res else "missing")
 
             if res:
                 # Upsert into video_resources
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO video_resources
-                    (id, video_id, title, channel_title, channel_id, thumbnail_url,
-                     duration_seconds, duration_formatted, language, published_at,
-                     view_count, relevance_score, relevance_explanation, is_uncertain, video_url,
-                     availability_status, description)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        res["id"],
-                        res["video_id"],
-                        res["title"],
-                        res["channel_title"],
-                        res.get("channel_id"),
-                        res["thumbnail_url"],
-                        res.get("duration_seconds", 0),
-                        res.get("duration_formatted", "0:00"),
-                        res.get("language", "English"),
-                        res.get("published_at"),
-                        res.get("view_count", 0),
-                        res.get("relevance_score", 0.0),
-                        res.get("relevance_explanation", ""),
-                        1 if res.get("is_uncertain") else 0,
-                        res["video_url"],
-                        res.get("availability_status", "available"),
-                        res.get("description", ""),
-                    )
+                vr_params = (
+                    res["id"],
+                    res["video_id"],
+                    res["title"],
+                    res["channel_title"],
+                    res.get("channel_id"),
+                    res["thumbnail_url"],
+                    res.get("duration_seconds", 0),
+                    res.get("duration_formatted", "0:00"),
+                    res.get("language", "English"),
+                    res.get("published_at"),
+                    res.get("view_count", 0),
+                    res.get("relevance_score", 0.0),
+                    res.get("relevance_explanation", ""),
+                    1 if res.get("is_uncertain") else 0,
+                    res["video_url"],
+                    res.get("availability_status", "available"),
+                    res.get("description", ""),
                 )
+                if is_postgres():
+                    conn.execute(
+                        """
+                        INSERT INTO video_resources
+                        (id, video_id, title, channel_title, channel_id, thumbnail_url,
+                         duration_seconds, duration_formatted, language, published_at,
+                         view_count, relevance_score, relevance_explanation, is_uncertain, video_url,
+                         availability_status, description)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            video_id = EXCLUDED.video_id,
+                            title = EXCLUDED.title,
+                            channel_title = EXCLUDED.channel_title,
+                            channel_id = EXCLUDED.channel_id,
+                            thumbnail_url = EXCLUDED.thumbnail_url,
+                            duration_seconds = EXCLUDED.duration_seconds,
+                            duration_formatted = EXCLUDED.duration_formatted,
+                            language = EXCLUDED.language,
+                            published_at = EXCLUDED.published_at,
+                            view_count = EXCLUDED.view_count,
+                            relevance_score = EXCLUDED.relevance_score,
+                            relevance_explanation = EXCLUDED.relevance_explanation,
+                            is_uncertain = EXCLUDED.is_uncertain,
+                            video_url = EXCLUDED.video_url,
+                            availability_status = EXCLUDED.availability_status,
+                            description = EXCLUDED.description
+                        """,
+                        vr_params
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO video_resources
+                        (id, video_id, title, channel_title, channel_id, thumbnail_url,
+                         duration_seconds, duration_formatted, language, published_at,
+                         view_count, relevance_score, relevance_explanation, is_uncertain, video_url,
+                         availability_status, description)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        vr_params
+                    )
 
                 # Upsert into topic_resources
                 tr_id = f"tr_{topic_id}"
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO topic_resources
-                    (id, syllabus_id, module_id, topic_id, video_resource_id,
-                     is_primary, match_status, match_confidence, relevance_notes,
-                     assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
-                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        tr_id,
-                        syllabus_id,
-                        module_id,
-                        topic_id,
-                        res["id"],
-                        match_status,
-                        match_confidence,
-                        notes,
-                        assigned_channel or res.get("channel_title"),
-                        is_shared,
-                        shared_topics_json,
-                        avail_status,
-                    )
+                tr_params = (
+                    tr_id,
+                    syllabus_id,
+                    module_id,
+                    topic_id,
+                    res["id"],
+                    match_status,
+                    match_confidence,
+                    notes,
+                    assigned_channel or res.get("channel_title"),
+                    is_shared,
+                    shared_topics_json,
+                    avail_status,
                 )
+                if is_postgres():
+                    conn.execute(
+                        """
+                        INSERT INTO topic_resources
+                        (id, syllabus_id, module_id, topic_id, video_resource_id,
+                         is_primary, match_status, match_confidence, relevance_notes,
+                         assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
+                        VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            syllabus_id = EXCLUDED.syllabus_id,
+                            module_id = EXCLUDED.module_id,
+                            topic_id = EXCLUDED.topic_id,
+                            video_resource_id = EXCLUDED.video_resource_id,
+                            is_primary = EXCLUDED.is_primary,
+                            match_status = EXCLUDED.match_status,
+                            match_confidence = EXCLUDED.match_confidence,
+                            relevance_notes = EXCLUDED.relevance_notes,
+                            assigned_channel = EXCLUDED.assigned_channel,
+                            is_shared_video = EXCLUDED.is_shared_video,
+                            shared_with_topics_json = EXCLUDED.shared_with_topics_json,
+                            availability_status = EXCLUDED.availability_status
+                        """,
+                        tr_params
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO topic_resources
+                        (id, syllabus_id, module_id, topic_id, video_resource_id,
+                         is_primary, match_status, match_confidence, relevance_notes,
+                         assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
+                        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        tr_params
+                    )
             else:
                 tr_id = f"tr_{topic_id}"
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO topic_resources
-                    (id, syllabus_id, module_id, topic_id, video_resource_id,
-                     is_primary, match_status, match_confidence, relevance_notes,
-                     assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
-                    VALUES (?, ?, ?, ?, '', 1, ?, ?, ?, ?, 0, '[]', 'missing')
-                    """,
-                    (
-                        tr_id,
-                        syllabus_id,
-                        module_id,
-                        topic_id,
-                        "no_resource",
-                        "uncertain",
-                        notes or "No suitable educational video found matching this topic.",
-                        assigned_channel,
-                    )
+                tr_params = (
+                    tr_id,
+                    syllabus_id,
+                    module_id,
+                    topic_id,
+                    "no_resource",
+                    "uncertain",
+                    notes or "No suitable educational video found matching this topic.",
+                    assigned_channel,
                 )
+                if is_postgres():
+                    conn.execute(
+                        """
+                        INSERT INTO topic_resources
+                        (id, syllabus_id, module_id, topic_id, video_resource_id,
+                         is_primary, match_status, match_confidence, relevance_notes,
+                         assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
+                        VALUES (%s, %s, %s, %s, '', 1, %s, %s, %s, %s, 0, '[]', 'missing')
+                        ON CONFLICT (id) DO UPDATE SET
+                            syllabus_id = EXCLUDED.syllabus_id,
+                            module_id = EXCLUDED.module_id,
+                            topic_id = EXCLUDED.topic_id,
+                            video_resource_id = '',
+                            is_primary = 1,
+                            match_status = EXCLUDED.match_status,
+                            match_confidence = EXCLUDED.match_confidence,
+                            relevance_notes = EXCLUDED.relevance_notes,
+                            assigned_channel = EXCLUDED.assigned_channel,
+                            is_shared_video = 0,
+                            shared_with_topics_json = '[]',
+                            availability_status = 'missing'
+                        """,
+                        tr_params
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO topic_resources
+                        (id, syllabus_id, module_id, topic_id, video_resource_id,
+                         is_primary, match_status, match_confidence, relevance_notes,
+                         assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
+                        VALUES (?, ?, ?, ?, '', 1, ?, ?, ?, ?, 0, '[]', 'missing')
+                        """,
+                        tr_params
+                    )
 
         if is_confirmed:
             conn.execute(
@@ -819,8 +1380,13 @@ def save_discovered_resources(
         conn.commit()
 
 
-def get_syllabus_resources(syllabus_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves saved resources, topic mappings, and coverage summary for a syllabus."""
+def get_syllabus_resources(syllabus_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieves saved resources, topic mappings, and coverage summary for a syllabus, verifying ownership if given."""
+    if owner_user_id:
+        s_owner = get_syllabus_owner_id(syllabus_id)
+        if s_owner and s_owner != owner_user_id:
+            return None
+
     with get_db_connection() as conn:
         cov_row = conn.execute(
             "SELECT * FROM syllabus_coverage_summary WHERE syllabus_id = ?",
@@ -836,7 +1402,7 @@ def get_syllabus_resources(syllabus_id: str) -> Optional[Dict[str, Any]]:
 
         # Fetch topics and joined resources
         query = """
-            SELECT 
+            SELECT
                 t.id as topic_id,
                 t.topic_title,
                 t.module_id,
@@ -897,11 +1463,11 @@ def get_syllabus_resources(syllabus_id: str) -> Optional[Dict[str, Any]]:
                     "duration_seconds": r["duration_seconds"] or 0,
                     "duration_formatted": r["duration_formatted"] or "0:00",
                     "language": r["language"] or "English",
-                    "published_at": r["published_at"],
+                    "published_at": _to_iso_str(r["published_at"]),
                     "view_count": r["view_count"] or 0,
                     "relevance_score": r["relevance_score"] or 0.0,
                     "relevance_explanation": r["relevance_explanation"] or "",
-                    "is_uncertain": bool(r["is_uncertain"]),
+                    "is_uncertain": _safe_bool(r["is_uncertain"]),
                     "video_url": r["video_url"],
                     "availability_status": r["video_avail_status"] or "available",
                 }
@@ -917,13 +1483,13 @@ def get_syllabus_resources(syllabus_id: str) -> Optional[Dict[str, Any]]:
                 "relevance_notes": r["relevance_notes"],
                 "rejected_channels": rejections_map.get(r["topic_id"], []),
                 "assigned_channel": r["assigned_channel"] or (resource["channel_title"] if resource else None),
-                "is_shared_video": bool(r["is_shared_video"]) if r["is_shared_video"] is not None else False,
-                "shared_with_topics": json.loads(r["shared_with_topics_json"] or "[]") if r["shared_with_topics_json"] else [],
+                "is_shared_video": _safe_bool(r["is_shared_video"]),
+                "shared_with_topics": _safe_json_loads(r["shared_with_topics_json"], default=[]),
                 "availability_status": r["topic_avail_status"] or ("available" if resource else "missing"),
             })
 
-        selected_channels = json.loads(cov_row["selected_channels_json"] or "[]")
-        third_candidates = json.loads(cov_row["third_channel_candidates_json"] or "[]")
+        selected_channels = _safe_json_loads(cov_row["selected_channels_json"], default=[])
+        third_candidates = _safe_json_loads(cov_row["third_channel_candidates_json"], default=[])
 
         total = cov_row["total_topics"]
         keys = cov_row.keys()
@@ -932,7 +1498,7 @@ def get_syllabus_resources(syllabus_id: str) -> Optional[Dict[str, Any]]:
         ver_cov_pct = round((verified_count / total * 100), 1) if total > 0 else 0.0
         prob_cov_pct = round((probable_count / total * 100), 1) if total > 0 else 0.0
 
-        is_confirmed = bool(cov_row["is_confirmed"]) if "is_confirmed" in keys and cov_row["is_confirmed"] is not None else True
+        is_confirmed = _safe_bool(cov_row["is_confirmed"]) if "is_confirmed" in keys and cov_row["is_confirmed"] is not None else True
         channel_strategy = cov_row["channel_strategy"] if "channel_strategy" in keys and cov_row["channel_strategy"] else "two_channels"
 
         return {
@@ -954,11 +1520,11 @@ def get_syllabus_resources(syllabus_id: str) -> Optional[Dict[str, Any]]:
                 "probable_coverage_percentage": prob_cov_pct,
             },
             "selected_channels": selected_channels,
-            "requires_third_channel_approval": bool(cov_row["requires_third_channel_approval"]),
+            "requires_third_channel_approval": _safe_bool(cov_row["requires_third_channel_approval"]),
             "third_channel_candidates": third_candidates,
             "strategy_explanation": cov_row["strategy_explanation"] or "",
             "topic_resources": topic_resources,
-            "is_fallback": bool(cov_row["is_fallback"]),
+            "is_fallback": _safe_bool(cov_row["is_fallback"]),
             "discovery_engine": cov_row["discovery_engine"] or "YouTube Data API v3",
             "message": f"Retrieved {len(topic_resources)} topic resources for syllabus.",
         }
@@ -985,22 +1551,53 @@ def add_rejected_channel(syllabus_id: str, topic_id: str, channel_title: str, re
         canonical_topic_id = t_row["id"] if t_row else topic_id
 
         rejection_id = f"rej_{canonical_topic_id}_{abs(hash(channel_title)) % 1000000}"
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO rejected_channels (id, syllabus_id, topic_id, channel_title, reason)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (rejection_id, syllabus_id, canonical_topic_id, channel_title, reason)
-        )
-        if canonical_topic_id != topic_id:
-            raw_rej_id = f"rej_{topic_id}_{abs(hash(channel_title)) % 1000000}"
+        rej_params = (rejection_id, syllabus_id, canonical_topic_id, channel_title, reason)
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO rejected_channels (id, syllabus_id, topic_id, channel_title, reason)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    syllabus_id = EXCLUDED.syllabus_id,
+                    topic_id = EXCLUDED.topic_id,
+                    channel_title = EXCLUDED.channel_title,
+                    reason = EXCLUDED.reason
+                """,
+                rej_params
+            )
+        else:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO rejected_channels (id, syllabus_id, topic_id, channel_title, reason)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (raw_rej_id, syllabus_id, topic_id, channel_title, reason)
+                rej_params
             )
+
+        if canonical_topic_id != topic_id:
+            raw_rej_id = f"rej_{topic_id}_{abs(hash(channel_title)) % 1000000}"
+            raw_params = (raw_rej_id, syllabus_id, topic_id, channel_title, reason)
+            if is_postgres():
+                conn.execute(
+                    """
+                    INSERT INTO rejected_channels (id, syllabus_id, topic_id, channel_title, reason)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        syllabus_id = EXCLUDED.syllabus_id,
+                        topic_id = EXCLUDED.topic_id,
+                        channel_title = EXCLUDED.channel_title,
+                        reason = EXCLUDED.reason
+                    """,
+                    raw_params
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO rejected_channels (id, syllabus_id, topic_id, channel_title, reason)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    raw_params
+                )
         conn.commit()
 
 
@@ -1015,32 +1612,60 @@ def update_topic_resource(
     """Updates only a single topic resource without modifying other topics or resetting study plan."""
     with get_db_connection() as conn:
         # 1. Upsert video_resource
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO video_resources
-            (id, video_id, title, channel_title, channel_id, thumbnail_url,
-             duration_seconds, duration_formatted, language, published_at,
-             view_count, relevance_score, relevance_explanation, is_uncertain, video_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                video_dict["id"],
-                video_dict["video_id"],
-                video_dict["title"],
-                video_dict["channel_title"],
-                video_dict.get("channel_id"),
-                video_dict["thumbnail_url"],
-                video_dict.get("duration_seconds", 0),
-                video_dict.get("duration_formatted", "0:00"),
-                video_dict.get("language", "English"),
-                video_dict.get("published_at"),
-                video_dict.get("view_count", 0),
-                video_dict.get("relevance_score", 0.0),
-                video_dict.get("relevance_explanation", ""),
-                1 if video_dict.get("is_uncertain") else 0,
-                video_dict["video_url"],
-            )
+        vr_params = (
+            video_dict["id"],
+            video_dict["video_id"],
+            video_dict["title"],
+            video_dict["channel_title"],
+            video_dict.get("channel_id"),
+            video_dict["thumbnail_url"],
+            video_dict.get("duration_seconds", 0),
+            video_dict.get("duration_formatted", "0:00"),
+            video_dict.get("language", "English"),
+            _to_iso_str(video_dict.get("published_at")),
+            video_dict.get("view_count", 0),
+            video_dict.get("relevance_score", 0.0),
+            video_dict.get("relevance_explanation", ""),
+            1 if video_dict.get("is_uncertain") else 0,
+            video_dict["video_url"],
         )
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO video_resources
+                (id, video_id, title, channel_title, channel_id, thumbnail_url,
+                 duration_seconds, duration_formatted, language, published_at,
+                 view_count, relevance_score, relevance_explanation, is_uncertain, video_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    video_id = EXCLUDED.video_id,
+                    title = EXCLUDED.title,
+                    channel_title = EXCLUDED.channel_title,
+                    channel_id = EXCLUDED.channel_id,
+                    thumbnail_url = EXCLUDED.thumbnail_url,
+                    duration_seconds = EXCLUDED.duration_seconds,
+                    duration_formatted = EXCLUDED.duration_formatted,
+                    language = EXCLUDED.language,
+                    published_at = EXCLUDED.published_at,
+                    view_count = EXCLUDED.view_count,
+                    relevance_score = EXCLUDED.relevance_score,
+                    relevance_explanation = EXCLUDED.relevance_explanation,
+                    is_uncertain = EXCLUDED.is_uncertain,
+                    video_url = EXCLUDED.video_url
+                """,
+                vr_params
+            )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO video_resources
+                (id, video_id, title, channel_title, channel_id, thumbnail_url,
+                 duration_seconds, duration_formatted, language, published_at,
+                 view_count, relevance_score, relevance_explanation, is_uncertain, video_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                vr_params
+            )
 
         # 2. Get canonical topic_id and module_id for topic
         t_row = conn.execute(
@@ -1058,24 +1683,45 @@ def update_topic_resource(
 
         # 4. Insert updated topic_resource
         tr_id = f"tr_{canonical_topic_id}"
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO topic_resources
-            (id, syllabus_id, module_id, topic_id, video_resource_id,
-             is_primary, match_status, match_confidence, relevance_notes)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
-            """,
-            (
-                tr_id,
-                syllabus_id,
-                module_id,
-                canonical_topic_id,
-                video_dict["id"],
-                match_status,
-                match_confidence,
-                relevance_notes,
-            )
+        tr_params = (
+            tr_id,
+            syllabus_id,
+            module_id,
+            canonical_topic_id,
+            video_dict["id"],
+            match_status,
+            match_confidence,
+            relevance_notes,
         )
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO topic_resources
+                (id, syllabus_id, module_id, topic_id, video_resource_id,
+                 is_primary, match_status, match_confidence, relevance_notes)
+                VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    syllabus_id = EXCLUDED.syllabus_id,
+                    module_id = EXCLUDED.module_id,
+                    topic_id = EXCLUDED.topic_id,
+                    video_resource_id = EXCLUDED.video_resource_id,
+                    is_primary = EXCLUDED.is_primary,
+                    match_status = EXCLUDED.match_status,
+                    match_confidence = EXCLUDED.match_confidence,
+                    relevance_notes = EXCLUDED.relevance_notes
+                """,
+                tr_params
+            )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO topic_resources
+                (id, syllabus_id, module_id, topic_id, video_resource_id,
+                 is_primary, match_status, match_confidence, relevance_notes)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                tr_params
+            )
 
         # Recalculate channel coverage summary dynamically
         cov_rows = conn.execute(
@@ -1084,7 +1730,7 @@ def update_topic_resource(
             FROM topic_resources tr
             JOIN video_resources vr ON tr.video_resource_id = vr.id
             WHERE tr.syllabus_id = ? AND tr.is_primary = 1
-            GROUP BY vr.channel_title
+            GROUP BY vr.channel_title, vr.channel_id
             ORDER BY cnt DESC
             """,
             (syllabus_id,)
@@ -1096,32 +1742,37 @@ def update_topic_resource(
             cnt = cr["cnt"]
             t_ids = cr["t_ids"].split(",") if cr["t_ids"] else []
             pct = round((cnt / tot_topics) * 100, 1)
-            ch_url = f"https://www.youtube.com/channel/{cr['channel_id']}" if cr["channel_id"] else f"https://www.youtube.com/results?search_query={cr['channel_title']}"
+            ch_url = f"https://www.youtube.com/channel/{cr['channel_id']}" if cr['channel_id'] else f"https://www.youtube.com/results?search_query={cr['channel_title']}"
             new_channels.append({
                 "channel_title": cr["channel_title"],
                 "channel_id": cr["channel_id"],
                 "channel_url": ch_url,
-                "topics_covered": cnt,
-                "topic_ids": t_ids,
-                "is_primary": (idx == 0),
-                "percentage_of_course": pct,
+                "coverage_count": cnt,
+                "coverage_percentage": pct,
+                "covered_topic_ids": t_ids,
+                "is_primary": idx < 2,
             })
-        if new_channels:
-            conn.execute(
-                "UPDATE syllabus_coverage_summary SET selected_channels_json = ? WHERE syllabus_id = ?",
-                (json.dumps(new_channels), syllabus_id)
-            )
 
+        verified_cnt = sum(1 for cr in cov_rows)
+        # Update summary row
+        conn.execute(
+            """
+            UPDATE syllabus_coverage_summary
+            SET selected_channels_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE syllabus_id = ?
+            """,
+            (_safe_json_dumps(new_channels), syllabus_id)
+        )
         conn.commit()
 
 
-def set_third_channel_approved(syllabus_id: str, approved: bool) -> None:
-    """Updates approval status for third channel."""
+def set_third_channel_approved(syllabus_id: str, approved: bool = True) -> None:
+    """Records student consent to allow a 3rd channel."""
     with get_db_connection() as conn:
         conn.execute(
             """
             UPDATE syllabus_coverage_summary
-            SET requires_third_channel_approval = ?
+            SET requires_third_channel_approval = ?, updated_at = CURRENT_TIMESTAMP
             WHERE syllabus_id = ?
             """,
             (0 if approved else 1, syllabus_id)
@@ -1130,41 +1781,86 @@ def set_third_channel_approved(syllabus_id: str, approved: bool) -> None:
 
 
 # ==============================================================================
-# Phase 4: Study Plan, Daily Tasks, Rescheduling & Settings Persistence
+# Phase 4 & Phase 5: Study Planner Database Helpers
 # ==============================================================================
 
 def save_study_plan(plan: Dict[str, Any], owner_user_id: Optional[str] = None) -> None:
-    """Saves or updates a study plan record in SQLite."""
-    resolved_owner = plan.get("owner_user_id") or owner_user_id
+    """Saves or replaces a study plan in SQLite or PostgreSQL."""
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO study_plans
-            (id, syllabus_id, course_id, owner_user_id, title, exam_date, daily_target_minutes, preferred_days_json,
-             start_date, status, feasibility_status, shortfall_minutes, feasibility_warning,
-             total_planned_minutes, completed_minutes, created_at, updated_at)
-            VALUES (?, ?, ?, COALESCE(?, (SELECT owner_user_id FROM study_plans WHERE id = ?)), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM study_plans WHERE id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
-            """,
-            (
-                plan["id"],
-                plan["syllabus_id"],
-                plan.get("course_id"),
-                resolved_owner,
-                plan["id"],
-                plan["title"],
-                plan["exam_date"],
-                plan.get("daily_target_minutes", 120),
-                json.dumps(plan.get("preferred_days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])),
-                plan.get("start_date"),
-                plan.get("status", "active"),
-                plan.get("feasibility_status", "feasible"),
-                plan.get("shortfall_minutes", 0),
-                plan.get("feasibility_warning", ""),
-                plan.get("total_planned_minutes", 0),
-                plan.get("completed_minutes", 0),
-                plan["id"],
+        raw_owner = plan.get("owner_user_id") or owner_user_id
+        resolved_owner = _normalize_uuid_or_none(raw_owner) if is_postgres() else raw_owner
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO study_plans
+                (id, syllabus_id, course_id, owner_user_id, title, exam_date, daily_target_minutes, preferred_days_json,
+                 start_date, status, feasibility_status, shortfall_minutes, feasibility_warning,
+                 total_planned_minutes, completed_minutes, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET
+                    syllabus_id = EXCLUDED.syllabus_id,
+                    course_id = EXCLUDED.course_id,
+                    owner_user_id = COALESCE(EXCLUDED.owner_user_id, study_plans.owner_user_id),
+                    title = EXCLUDED.title,
+                    exam_date = EXCLUDED.exam_date,
+                    daily_target_minutes = EXCLUDED.daily_target_minutes,
+                    preferred_days_json = EXCLUDED.preferred_days_json,
+                    start_date = EXCLUDED.start_date,
+                    status = EXCLUDED.status,
+                    feasibility_status = EXCLUDED.feasibility_status,
+                    shortfall_minutes = EXCLUDED.shortfall_minutes,
+                    feasibility_warning = EXCLUDED.feasibility_warning,
+                    total_planned_minutes = EXCLUDED.total_planned_minutes,
+                    completed_minutes = EXCLUDED.completed_minutes,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    plan["id"],
+                    plan["syllabus_id"],
+                    plan.get("course_id"),
+                    resolved_owner,
+                    plan["title"],
+                    plan["exam_date"],
+                    plan.get("daily_target_minutes", 120),
+                    _safe_json_dumps(plan.get("preferred_days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])),
+                    plan.get("start_date"),
+                    plan.get("status", "active"),
+                    plan.get("feasibility_status", "feasible"),
+                    plan.get("shortfall_minutes", 0),
+                    plan.get("feasibility_warning", ""),
+                    plan.get("total_planned_minutes", 0),
+                    plan.get("completed_minutes", 0),
+                )
             )
-        )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO study_plans
+                (id, syllabus_id, course_id, owner_user_id, title, exam_date, daily_target_minutes, preferred_days_json,
+                 start_date, status, feasibility_status, shortfall_minutes, feasibility_warning,
+                 total_planned_minutes, completed_minutes, created_at, updated_at)
+                VALUES (?, ?, ?, COALESCE(?, (SELECT owner_user_id FROM study_plans WHERE id = ?)), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM study_plans WHERE id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
+                """,
+                (
+                    plan["id"],
+                    plan["syllabus_id"],
+                    plan.get("course_id"),
+                    resolved_owner,
+                    plan["id"],
+                    plan["title"],
+                    plan["exam_date"],
+                    plan.get("daily_target_minutes", 120),
+                    _safe_json_dumps(plan.get("preferred_days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])),
+                    plan.get("start_date"),
+                    plan.get("status", "active"),
+                    plan.get("feasibility_status", "feasible"),
+                    plan.get("shortfall_minutes", 0),
+                    plan.get("feasibility_warning", ""),
+                    plan.get("total_planned_minutes", 0),
+                    plan.get("completed_minutes", 0),
+                    plan["id"],
+                )
+            )
         conn.commit()
 
 
@@ -1195,45 +1891,71 @@ def save_study_tasks(plan_id: str, tasks: List[Dict[str, Any]], preserve_complet
 
             if existing and existing["status"] == "completed" and preserve_completed:
                 status_to_save = "completed"
-                completed_at_to_save = existing["completed_at"] or datetime.datetime.now().isoformat()
+                completed_at_to_save = _to_iso_str(existing["completed_at"]) or datetime.datetime.now().isoformat()
                 notes_to_save = t.get("notes") or existing["notes"]
             else:
                 status_to_save = t.get("status", "pending")
-                completed_at_to_save = t.get("completed_at")
+                completed_at_to_save = _to_iso_str(t.get("completed_at"))
                 notes_to_save = t.get("notes") or (existing["notes"] if existing else None)
 
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO study_tasks
-                (id, plan_id, syllabus_id, module_id, topic_id, scheduled_date, title,
-                 task_type, duration_minutes, video_id, video_url, status, completed_at, notes, order_index)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    t["id"],
-                    plan_id,
-                    t["syllabus_id"],
-                    t["module_id"],
-                    t["topic_id"],
-                    t["scheduled_date"],
-                    t["title"],
-                    t["task_type"],
-                    t["duration_minutes"],
-                    t.get("video_id"),
-                    t.get("video_url"),
-                    status_to_save,
-                    completed_at_to_save,
-                    notes_to_save,
-                    t.get("order_index", 0),
-                )
+            task_params = (
+                t["id"],
+                plan_id,
+                t["syllabus_id"],
+                t["module_id"],
+                t["topic_id"],
+                t["scheduled_date"],
+                t["title"],
+                t["task_type"],
+                t["duration_minutes"],
+                t.get("video_id"),
+                t.get("video_url"),
+                status_to_save,
+                completed_at_to_save,
+                notes_to_save,
+                t.get("order_index", 0),
             )
 
-        # Recalculate completed & total minutes for the plan
+            if is_postgres():
+                conn.execute(
+                    """
+                    INSERT INTO study_tasks
+                    (id, plan_id, syllabus_id, module_id, topic_id, scheduled_date, title,
+                     task_type, duration_minutes, video_id, video_url, status, completed_at, notes, order_index)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        plan_id = EXCLUDED.plan_id,
+                        syllabus_id = EXCLUDED.syllabus_id,
+                        module_id = EXCLUDED.module_id,
+                        topic_id = EXCLUDED.topic_id,
+                        scheduled_date = EXCLUDED.scheduled_date,
+                        title = EXCLUDED.title,
+                        task_type = EXCLUDED.task_type,
+                        duration_minutes = EXCLUDED.duration_minutes,
+                        video_id = EXCLUDED.video_id,
+                        video_url = EXCLUDED.video_url,
+                        status = EXCLUDED.status,
+                        completed_at = EXCLUDED.completed_at,
+                        notes = EXCLUDED.notes,
+                        order_index = EXCLUDED.order_index
+                    """,
+                    task_params
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO study_tasks
+                    (id, plan_id, syllabus_id, module_id, topic_id, scheduled_date, title,
+                     task_type, duration_minutes, video_id, video_url, status, completed_at, notes, order_index)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    task_params
+                )
+
+        # Recalculate plan totals after tasks update
         stats = conn.execute(
             """
-            SELECT 
-                COUNT(*) as total_tasks,
-                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+            SELECT
                 SUM(duration_minutes) as total_min,
                 SUM(CASE WHEN status = 'completed' THEN duration_minutes ELSE 0 END) as completed_min
             FROM study_tasks WHERE plan_id = ?
@@ -1244,7 +1966,7 @@ def save_study_tasks(plan_id: str, tasks: List[Dict[str, Any]], preserve_complet
         if stats:
             conn.execute(
                 """
-                UPDATE study_plans 
+                UPDATE study_plans
                 SET total_planned_minutes = ?, completed_minutes = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
@@ -1254,8 +1976,13 @@ def save_study_tasks(plan_id: str, tasks: List[Dict[str, Any]], preserve_complet
         conn.commit()
 
 
-def get_active_study_plan(syllabus_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves the active study plan for a syllabus or course."""
+def get_active_study_plan(syllabus_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieves the active study plan for a syllabus, verifying ownership if given."""
+    if owner_user_id:
+        s_owner = get_syllabus_owner_id(syllabus_id)
+        if s_owner and s_owner != owner_user_id:
+            return None
+
     with get_db_connection() as conn:
         row = conn.execute(
             "SELECT * FROM study_plans WHERE (syllabus_id = ? OR course_id = ?) AND status = 'active' ORDER BY updated_at DESC LIMIT 1",
@@ -1263,23 +1990,53 @@ def get_active_study_plan(syllabus_id: str) -> Optional[Dict[str, Any]]:
         ).fetchone()
         if not row:
             return None
-        return dict(row)
+        res = dict(row)
+        if res.get("owner_user_id") is not None:
+            res["owner_user_id"] = str(res["owner_user_id"])
+        return res
 
 
-def get_study_plan_by_id(plan_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves a study plan by its ID."""
+def get_study_plan_by_id(plan_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieves a study plan by its ID, verifying ownership if given."""
     with get_db_connection() as conn:
-        row = conn.execute("SELECT * FROM study_plans WHERE id = ?", (plan_id,)).fetchone()
+        if owner_user_id:
+            db_owner = _normalize_uuid_or_none(owner_user_id) if is_postgres() else owner_user_id
+            if is_postgres():
+                if db_owner:
+                    row = conn.execute(
+                        "SELECT * FROM study_plans WHERE id = ? AND (owner_user_id = ? OR owner_user_id IS NULL)",
+                        (plan_id, db_owner)
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM study_plans WHERE id = ? AND owner_user_id IS NULL",
+                        (plan_id,)
+                    ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM study_plans WHERE id = ? AND (owner_user_id = ? OR owner_user_id IS NULL OR owner_user_id = '')",
+                    (plan_id, owner_user_id)
+                ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM study_plans WHERE id = ?", (plan_id,)).fetchone()
         if not row:
             return None
-        return dict(row)
+        res = dict(row)
+        if res.get("owner_user_id") is not None:
+            res["owner_user_id"] = str(res["owner_user_id"])
+        return res
 
 
-def get_plan_tasks(plan_id: str) -> List[Dict[str, Any]]:
-    """Retrieves all tasks for a study plan with module and topic titles."""
+def get_plan_tasks(plan_id: str, owner_user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retrieves all tasks for a study plan with module and topic titles, optionally verifying owner_user_id."""
+    if owner_user_id:
+        p_owner = get_study_plan_owner_id(plan_id)
+        if p_owner and p_owner != owner_user_id:
+            return []
+
     with get_db_connection() as conn:
         query = """
-            SELECT 
+            SELECT
                 st.*,
                 m.module_title,
                 t.topic_title
@@ -1290,11 +2047,21 @@ def get_plan_tasks(plan_id: str) -> List[Dict[str, Any]]:
             ORDER BY st.scheduled_date ASC, st.order_index ASC
         """
         rows = conn.execute(query, (plan_id,)).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["completed_at"] = _to_iso_str(d.get("completed_at"))
+            result.append(d)
+        return result
 
 
-def update_task_completion(task_id: str, completed: bool) -> Optional[Dict[str, Any]]:
-    """Toggles task completion and updates parent plan progress metrics."""
+def update_task_completion(task_id: str, completed: bool, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Toggles task completion and updates parent plan progress metrics. Verifies ownership if owner_user_id provided."""
+    if owner_user_id:
+        t_owner = get_task_owner_id(task_id)
+        if t_owner and t_owner != owner_user_id:
+            return None
+
     with get_db_connection() as conn:
         task = conn.execute("SELECT * FROM study_tasks WHERE id = ?", (task_id,)).fetchone()
         if not task:
@@ -1314,7 +2081,7 @@ def update_task_completion(task_id: str, completed: bool) -> Optional[Dict[str, 
         # Update parent plan
         stats = conn.execute(
             """
-            SELECT 
+            SELECT
                 SUM(duration_minutes) as total_min,
                 SUM(CASE WHEN status = 'completed' THEN duration_minutes ELSE 0 END) as completed_min
             FROM study_tasks WHERE plan_id = ?
@@ -1345,11 +2112,20 @@ def update_task_completion(task_id: str, completed: bool) -> Optional[Dict[str, 
             """,
             (task_id,)
         ).fetchone()
-        return dict(updated) if updated else None
+        if not updated:
+            return None
+        res = dict(updated)
+        res["completed_at"] = _to_iso_str(res.get("completed_at"))
+        return res
 
 
-def update_task_note(task_id: str, notes: str) -> Optional[Dict[str, Any]]:
-    """Saves student notes for a study task."""
+def update_task_note(task_id: str, notes: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Saves student notes for a study task. Verifies ownership if owner_user_id provided."""
+    if owner_user_id:
+        t_owner = get_task_owner_id(task_id)
+        if t_owner and t_owner != owner_user_id:
+            return None
+
     with get_db_connection() as conn:
         conn.execute("UPDATE study_tasks SET notes = ? WHERE id = ?", (notes, task_id))
         conn.commit()
@@ -1363,22 +2139,32 @@ def update_task_note(task_id: str, notes: str) -> Optional[Dict[str, Any]]:
             """,
             (task_id,)
         ).fetchone()
-        return dict(updated) if updated else None
+        if not updated:
+            return None
+        res = dict(updated)
+        res["completed_at"] = _to_iso_str(res.get("completed_at"))
+        return res
 
 
 def reschedule_plan_tasks(
     plan_id: str,
     rescheduled_tasks: List[Dict[str, Any]],
     new_feasibility: Dict[str, Any],
+    owner_user_id: Optional[str] = None,
 ) -> None:
     """Updates dates of rescheduled pending tasks and updates plan feasibility warning."""
+    if owner_user_id:
+        p_owner = get_study_plan_owner_id(plan_id)
+        if p_owner and p_owner != owner_user_id:
+            return
+
     with get_db_connection() as conn:
         for t in rescheduled_tasks:
             conn.execute(
                 """
                 UPDATE study_tasks
                 SET scheduled_date = ?, order_index = ?
-                WHERE id = ? AND status != 'completed'
+                WHERE id = ?
                 """,
                 (t["scheduled_date"], t.get("order_index", 0), t["id"])
             )
@@ -1390,22 +2176,27 @@ def reschedule_plan_tasks(
             WHERE id = ?
             """,
             (
-                new_feasibility.get("feasibility_status", "feasible"),
+                new_feasibility.get("status", "feasible"),
                 new_feasibility.get("shortfall_minutes", 0),
-                new_feasibility.get("feasibility_warning", ""),
+                new_feasibility.get("warning"),
                 plan_id,
             )
         )
         conn.commit()
 
 
+# ==============================================================================
+# Phase 6: Student User Settings and Personalization Database Helpers
+# ==============================================================================
+
 def get_user_settings(user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Retrieves persisted student settings or default preferences for a user."""
+    """Retrieves persisted student learning settings, falling back to defaults if not yet configured."""
+    setting_id = user_id or "default_user"
     with get_db_connection() as conn:
-        if user_id:
-            row = conn.execute("SELECT * FROM user_settings WHERE id = ? OR owner_user_id = ?", (user_id, user_id)).fetchone()
-        else:
-            row = conn.execute("SELECT * FROM user_settings WHERE id = 'default_user'").fetchone()
+        row = conn.execute(
+            "SELECT * FROM user_settings WHERE id = ? OR owner_user_id = ? LIMIT 1",
+            (setting_id, user_id or setting_id)
+        ).fetchone()
 
         if not row:
             return {
@@ -1420,47 +2211,74 @@ def get_user_settings(user_id: Optional[str] = None) -> Dict[str, Any]:
                 "deadline_alerts": True,
                 "auto_save_progress": True,
             }
+
         return {
             "preferred_language": row["preferred_language"],
             "lesson_style": row["lesson_style"],
             "daily_study_availability": row["daily_study_availability"],
             "daily_target_minutes": row["daily_target_minutes"],
-            "exam_date": row["exam_date"],
-            "study_days": json.loads(row["study_days_json"] or '["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]'),
+            "exam_date": _to_date_str(row["exam_date"]),
+            "study_days": _safe_json_loads(row["study_days_json"], default=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]),
             "theme": row["theme"],
-            "study_reminders": bool(row["study_reminders"]),
-            "deadline_alerts": bool(row["deadline_alerts"]),
-            "auto_save_progress": bool(row["auto_save_progress"]),
+            "study_reminders": _safe_bool(row["study_reminders"]),
+            "deadline_alerts": _safe_bool(row["deadline_alerts"]),
+            "auto_save_progress": _safe_bool(row["auto_save_progress"]),
         }
 
 
 def save_user_settings(data: Dict[str, Any], user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Persists student settings into SQLite for a user or default tenant."""
+    """Saves student preferences in SQLite or PostgreSQL."""
     setting_id = user_id or "default_user"
-    owner_id = user_id
+    owner_id = _normalize_uuid_or_none(user_id) if is_postgres() else user_id
+    params = (
+        setting_id,
+        owner_id,
+        data.get("preferred_language", "English"),
+        data.get("lesson_style", "In-depth"),
+        data.get("daily_study_availability", "2-4 hours"),
+        data.get("daily_target_minutes", 120),
+        data.get("exam_date", "2026-05-15"),
+        _safe_json_dumps(data.get("study_days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])),
+        data.get("theme", "dark"),
+        1 if data.get("study_reminders", True) else 0,
+        1 if data.get("deadline_alerts", True) else 0,
+        1 if data.get("auto_save_progress", True) else 0,
+    )
+
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO user_settings
-            (id, owner_user_id, preferred_language, lesson_style, daily_study_availability, daily_target_minutes,
-             exam_date, study_days_json, theme, study_reminders, deadline_alerts, auto_save_progress, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-            (
-                setting_id,
-                owner_id,
-                data.get("preferred_language", "English"),
-                data.get("lesson_style", "In-depth"),
-                data.get("daily_study_availability", "2-4 hours"),
-                data.get("daily_target_minutes", 120),
-                data.get("exam_date", "2026-05-15"),
-                json.dumps(data.get("study_days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])),
-                data.get("theme", "dark"),
-                1 if data.get("study_reminders", True) else 0,
-                1 if data.get("deadline_alerts", True) else 0,
-                1 if data.get("auto_save_progress", True) else 0,
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO user_settings
+                (id, owner_user_id, preferred_language, lesson_style, daily_study_availability, daily_target_minutes,
+                 exam_date, study_days_json, theme, study_reminders, deadline_alerts, auto_save_progress, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET
+                    owner_user_id = EXCLUDED.owner_user_id,
+                    preferred_language = EXCLUDED.preferred_language,
+                    lesson_style = EXCLUDED.lesson_style,
+                    daily_study_availability = EXCLUDED.daily_study_availability,
+                    daily_target_minutes = EXCLUDED.daily_target_minutes,
+                    exam_date = EXCLUDED.exam_date,
+                    study_days_json = EXCLUDED.study_days_json,
+                    theme = EXCLUDED.theme,
+                    study_reminders = EXCLUDED.study_reminders,
+                    deadline_alerts = EXCLUDED.deadline_alerts,
+                    auto_save_progress = EXCLUDED.auto_save_progress,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                params
             )
-        )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO user_settings
+                (id, owner_user_id, preferred_language, lesson_style, daily_study_availability, daily_target_minutes,
+                 exam_date, study_days_json, theme, study_reminders, deadline_alerts, auto_save_progress, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                params
+            )
         conn.commit()
     return get_user_settings(user_id)
 
@@ -1473,7 +2291,8 @@ def create_course(course_dict: Dict[str, Any], owner_user_id: Optional[str] = No
     """Creates a new independent course record with preferences and assessments."""
     course_id = course_dict.get("id") or f"course_{uuid.uuid4().hex[:12]}"
     syllabus_id = course_dict.get("syllabus_id")
-    resolved_owner = course_dict.get("owner_user_id") or owner_user_id
+    raw_owner = owner_user_id or course_dict.get("owner_user_id")
+    resolved_owner = _normalize_uuid_or_none(raw_owner) if is_postgres() else raw_owner
     course_name = course_dict.get("course_name") or "New Course"
     course_code = course_dict.get("course_code") or ""
     language = course_dict.get("language") or "English"
@@ -1484,39 +2303,73 @@ def create_course(course_dict: Dict[str, Any], owner_user_id: Optional[str] = No
     assessment_scope = course_dict.get("assessment_scope") or "both"
     color_theme = course_dict.get("color_theme") or "blue"
 
+    params = (
+        course_id,
+        resolved_owner,
+        syllabus_id,
+        course_name,
+        course_code,
+        language,
+        lesson_style,
+        daily_availability,
+        daily_target_minutes,
+        assessment_system_type,
+        assessment_scope,
+        color_theme,
+    )
+
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO courses
-            (id, owner_user_id, syllabus_id, course_name, course_code, language, lesson_style,
-             daily_study_availability, daily_target_minutes, assessment_system_type,
-             assessment_scope, color_theme, is_archived, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """,
-            (
-                course_id,
-                resolved_owner,
-                syllabus_id,
-                course_name,
-                course_code,
-                language,
-                lesson_style,
-                daily_availability,
-                daily_target_minutes,
-                assessment_system_type,
-                assessment_scope,
-                color_theme,
+        if is_postgres():
+            conn.execute(
+                """
+                INSERT INTO courses
+                (id, owner_user_id, syllabus_id, course_name, course_code, language, lesson_style,
+                 daily_study_availability, daily_target_minutes, assessment_system_type,
+                 assessment_scope, color_theme, is_archived, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET
+                    owner_user_id = COALESCE(EXCLUDED.owner_user_id, courses.owner_user_id),
+                    syllabus_id = EXCLUDED.syllabus_id,
+                    course_name = EXCLUDED.course_name,
+                    course_code = EXCLUDED.course_code,
+                    language = EXCLUDED.language,
+                    lesson_style = EXCLUDED.lesson_style,
+                    daily_study_availability = EXCLUDED.daily_study_availability,
+                    daily_target_minutes = EXCLUDED.daily_target_minutes,
+                    assessment_system_type = EXCLUDED.assessment_system_type,
+                    assessment_scope = EXCLUDED.assessment_scope,
+                    color_theme = EXCLUDED.color_theme,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                params
             )
-        )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO courses
+                (id, owner_user_id, syllabus_id, course_name, course_code, language, lesson_style,
+                 daily_study_availability, daily_target_minutes, assessment_system_type,
+                 assessment_scope, color_theme, is_archived, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                params
+            )
+
         if syllabus_id:
             conn.execute("UPDATE syllabi SET course_id = ? WHERE id = ?", (course_id, syllabus_id))
             if resolved_owner:
                 conn.execute(
-                    "UPDATE syllabi SET owner_user_id = ? WHERE id = ? AND (owner_user_id IS NULL OR owner_user_id = '')",
+                    """
+                    UPDATE syllabi SET owner_user_id = ?
+                    WHERE id = ? AND (owner_user_id IS NULL OR owner_user_id = '')
+                    """,
                     (resolved_owner, syllabus_id)
                 )
                 conn.execute(
-                    "UPDATE study_plans SET owner_user_id = ? WHERE syllabus_id = ? AND (owner_user_id IS NULL OR owner_user_id = '')",
+                    """
+                    UPDATE study_plans SET owner_user_id = ?
+                    WHERE syllabus_id = ? AND (owner_user_id IS NULL OR owner_user_id = '')
+                    """,
                     (resolved_owner, syllabus_id)
                 )
             conn.execute("UPDATE study_plans SET course_id = ? WHERE syllabus_id = ?", (course_id, syllabus_id))
@@ -1527,7 +2380,7 @@ def create_course(course_dict: Dict[str, Any], owner_user_id: Optional[str] = No
     if assessments:
         save_course_assessments(course_id, assessments)
 
-    return get_course(course_id)  # type: ignore
+    return get_course(course_id, owner_user_id=resolved_owner or owner_user_id)  # type: ignore
 
 
 def save_course_assessments(course_id: str, assessments: List[Dict[str, Any]]) -> None:
@@ -1536,28 +2389,52 @@ def save_course_assessments(course_id: str, assessments: List[Dict[str, Any]]) -
         conn.execute("DELETE FROM course_assessments WHERE course_id = ?", (course_id,))
         for idx, a in enumerate(assessments):
             a_id = a.get("id") or f"asm_{course_id}_{idx+1}_{uuid.uuid4().hex[:6]}"
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO course_assessments
-                (id, course_id, name, exam_date, assessment_type, scope, weightage, order_index, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """,
-                (
-                    a_id,
-                    course_id,
-                    a.get("name", f"Assessment {idx+1}"),
-                    a.get("exam_date", datetime.date.today().isoformat()),
-                    a.get("assessment_type", "internal"),
-                    a.get("scope", "both"),
-                    a.get("weightage", 0.0),
-                    a.get("order_index", idx),
-                )
+            params = (
+                a_id,
+                course_id,
+                a.get("name", f"Assessment {idx+1}"),
+                _to_date_str(a.get("exam_date", datetime.date.today().isoformat())),
+                a.get("assessment_type", "internal"),
+                a.get("scope", "both"),
+                a.get("weightage", 0.0),
+                a.get("order_index", idx),
             )
+            if is_postgres():
+                conn.execute(
+                    """
+                    INSERT INTO course_assessments
+                    (id, course_id, name, exam_date, assessment_type, scope, weightage, order_index, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (id) DO UPDATE SET
+                        course_id = EXCLUDED.course_id,
+                        name = EXCLUDED.name,
+                        exam_date = EXCLUDED.exam_date,
+                        assessment_type = EXCLUDED.assessment_type,
+                        scope = EXCLUDED.scope,
+                        weightage = EXCLUDED.weightage,
+                        order_index = EXCLUDED.order_index
+                    """,
+                    params
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO course_assessments
+                    (id, course_id, name, exam_date, assessment_type, scope, weightage, order_index, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    params
+                )
         conn.commit()
 
 
-def get_course_assessments(course_id: str) -> List[Dict[str, Any]]:
+def get_course_assessments(course_id: str, owner_user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Retrieves all assessment milestones for a course, tagged with days remaining."""
+    if owner_user_id:
+        c_owner = get_course_owner_id(course_id)
+        if c_owner and c_owner != owner_user_id:
+            return []
+
     with get_db_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM course_assessments WHERE course_id = ? ORDER BY exam_date ASC, order_index ASC",
@@ -1567,6 +2444,8 @@ def get_course_assessments(course_id: str) -> List[Dict[str, Any]]:
         result = []
         for r in rows:
             d = dict(r)
+            d["exam_date"] = _to_date_str(d.get("exam_date"))
+            d["created_at"] = _to_iso_str(d.get("created_at"))
             try:
                 dt = datetime.date.fromisoformat(d["exam_date"])
                 d["days_remaining"] = (dt - today).days
@@ -1579,276 +2458,324 @@ def get_course_assessments(course_id: str) -> List[Dict[str, Any]]:
 
 
 def get_course(course_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Retrieves full course record with its assessments, progress metrics, and syllabus file info."""
+    """Retrieves full course information, joined with linked syllabus and assessment milestones."""
     with get_db_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM courses WHERE id = ? OR syllabus_id = ? ORDER BY updated_at DESC LIMIT 1",
-            (course_id, course_id)
-        ).fetchone()
+        if owner_user_id:
+            if settings.is_production:
+                owner_cond = "owner_user_id = ?"
+            elif is_postgres():
+                owner_cond = "owner_user_id = ?"
+            else:
+                owner_cond = "(owner_user_id = ? OR owner_user_id IS NULL OR owner_user_id = '')"
+            row = conn.execute(
+                f"""
+                SELECT * FROM courses
+                WHERE (id = ? OR syllabus_id = ?)
+                  AND {owner_cond}
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (course_id, course_id, owner_user_id)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM courses WHERE id = ? OR syllabus_id = ? ORDER BY updated_at DESC LIMIT 1",
+                (course_id, course_id)
+            ).fetchone()
         if not row:
             return None
+
         c = dict(row)
-        c["is_archived"] = bool(c["is_archived"])
-        c["owner_user_id"] = row["owner_user_id"]
+        c["is_archived"] = _safe_bool(c.get("is_archived"))
+        c["is_library_confirmed"] = _safe_bool(c.get("is_library_confirmed"))
+        c["languages"] = _safe_json_loads(c.get("languages_json"), default=["English"])
+        c["created_at"] = _to_iso_str(c.get("created_at"))
+        c["updated_at"] = _to_iso_str(c.get("updated_at"))
+        c["assessments"] = get_course_assessments(c["id"])
 
-        # Enforce tenancy filter if an owner identity is provided
-        from app.core.config import settings
+        # Fetch syllabus details if available
+        if c.get("syllabus_id"):
+            s_row = conn.execute("SELECT * FROM syllabi WHERE id = ?", (c["syllabus_id"],)).fetchone()
+            if s_row:
+                s = dict(s_row)
+                s["created_at"] = _to_iso_str(s.get("created_at"))
+                s["is_fallback"] = _safe_bool(s.get("is_fallback"))
+                c["syllabus"] = s
 
-        if owner_user_id is not None:
-            if settings.is_production:
-                # In production: must match owner_user_id and cannot be unowned
-                if c["owner_user_id"] != owner_user_id:
-                    return None
-            else:
-                # In development: if record has an explicit owner, must match
-                if c["owner_user_id"] is not None and c["owner_user_id"] != owner_user_id:
-                    return None
+                # Compute overall topic progress
+                stats = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) as total_tasks,
+                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+                        SUM(duration_minutes) as total_minutes,
+                        SUM(CASE WHEN status = 'completed' THEN duration_minutes ELSE 0 END) as completed_minutes
+                    FROM study_tasks
+                    WHERE course_id = ? OR syllabus_id = ?
+                    """,
+                    (c["id"], c["syllabus_id"])
+                ).fetchone()
 
-        cid = c["id"]
-        sid = c["syllabus_id"] or ""
+                total_t = stats["total_tasks"] or 0
+                comp_t = stats["completed_tasks"] or 0
+                c["progress"] = {
+                    "total_tasks": total_t,
+                    "completed_tasks": comp_t,
+                    "total_minutes": stats["total_minutes"] or 0,
+                    "completed_minutes": stats["completed_minutes"] or 0,
+                    "progress_percentage": round((comp_t / total_t * 100), 1) if total_t > 0 else 0.0,
+                }
 
-        # Fetch assessments
-        c["assessments"] = get_course_assessments(cid)
-
-        # Topics count
-        t_row = conn.execute(
-            "SELECT COUNT(*) as total_topics FROM topics WHERE syllabus_id = ?",
-            (sid,)
-        ).fetchone()
-        c["total_topics"] = t_row["total_topics"] if t_row else 0
-
-        # Tasks stats
-        task_stats = conn.execute(
+        # Nearest upcoming assessment (available for all courses)
+        today_str = datetime.date.today().isoformat()
+        next_asm = conn.execute(
             """
-            SELECT 
-                COUNT(*) as total_tasks,
-                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
-                SUM(duration_minutes) as total_min,
-                SUM(CASE WHEN status = 'completed' THEN duration_minutes ELSE 0 END) as completed_min
-            FROM study_tasks WHERE course_id = ? OR syllabus_id = ?
+            SELECT * FROM course_assessments
+            WHERE course_id = ? AND exam_date >= ?
+            ORDER BY exam_date ASC, order_index ASC LIMIT 1
             """,
-            (cid, sid)
+            (c["id"], today_str)
         ).fetchone()
-
-        c["total_tasks"] = (task_stats["total_tasks"] or 0) if task_stats else 0
-        c["completed_tasks"] = (task_stats["completed_tasks"] or 0) if task_stats else 0
-        c["total_minutes"] = (task_stats["total_min"] or 0) if task_stats else 0
-        c["completed_minutes"] = (task_stats["completed_min"] or 0) if task_stats else 0
-        c["progress_percentage"] = (
-            round((c["completed_tasks"] / c["total_tasks"] * 100), 1)
-            if c["total_tasks"] > 0
-            else 0.0
-        )
+        if next_asm:
+            asm_dict = dict(next_asm)
+            asm_dict["exam_date"] = _to_date_str(asm_dict.get("exam_date"))
+            asm_dt = datetime.date.fromisoformat(asm_dict["exam_date"])
+            asm_dict["days_remaining"] = (asm_dt - datetime.date.today()).days
+            c["next_assessment"] = asm_dict
+        else:
+            c["next_assessment"] = None
 
         # Overdue tasks count
-        today_str = datetime.date.today().isoformat()
-        overdue_row = conn.execute(
+        overdue = conn.execute(
             """
-            SELECT COUNT(*) as overdue_cnt FROM study_tasks 
+            SELECT COUNT(*) as c FROM study_tasks
             WHERE (course_id = ? OR syllabus_id = ?) AND status != 'completed' AND scheduled_date < ?
             """,
-            (cid, sid, today_str)
+            (c["id"], c.get("syllabus_id"), today_str)
         ).fetchone()
-        c["overdue_tasks_count"] = overdue_row["overdue_cnt"] if overdue_row else 0
-
-        # Next upcoming assessment
-        upcoming = [a for a in c["assessments"] if not a.get("is_past")]
-        c["next_assessment"] = upcoming[0] if upcoming else None
-
-        # Syllabus metadata
-        if sid:
-            s_row = conn.execute("SELECT filename, file_type, file_size_bytes FROM syllabi WHERE id = ?", (sid,)).fetchone()
-            if s_row:
-                c["filename"] = s_row["filename"]
-                c["file_type"] = s_row["file_type"]
-                c["file_size_bytes"] = s_row["file_size_bytes"]
+        c["overdue_tasks_count"] = overdue["c"] if overdue else 0
 
         return c
 
 
 def get_course_by_syllabus(syllabus_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieves the course linked with a syllabus ID."""
     return get_course(syllabus_id, owner_user_id=owner_user_id)
 
 
-def get_courses(include_archived: bool = False, owner_user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Retrieves all active (or optionally archived) courses scoped to tenant if provided."""
-    from app.core.config import settings
-
+def get_courses(owner_user_id: Optional[str] = None, include_archived: bool = False) -> List[Dict[str, Any]]:
+    """Retrieves all courses matching owner_user_id (or all unassigned if None in dev mode)."""
     if settings.is_production and not owner_user_id:
-        # Never interpret a missing user ID as permission to access all records in production
         return []
 
     with get_db_connection() as conn:
         conditions = []
-        params: List[Any] = []
+        params = []
+        if owner_user_id:
+            db_owner = _normalize_uuid_or_none(owner_user_id) if is_postgres() else owner_user_id
+            if is_postgres():
+                if db_owner:
+                    conditions.append("owner_user_id = ?")
+                    params.append(db_owner)
+                else:
+                    conditions.append("owner_user_id IS NULL")
+            else:
+                conditions.append("owner_user_id = ?")
+                params.append(owner_user_id)
         if not include_archived:
-            conditions.append("is_archived = 0")
-        if owner_user_id is not None:
-            conditions.append("owner_user_id = ?")
-            params.append(owner_user_id)
+            if is_postgres():
+                conditions.append("is_archived IS NOT TRUE")
+            else:
+                conditions.append("is_archived = 0")
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"SELECT id FROM courses {where_clause} ORDER BY updated_at DESC"
-        rows = conn.execute(query, params).fetchall()
-        courses = []
+        rows = conn.execute(query, tuple(params)).fetchall()
+        result = []
         for r in rows:
             course = get_course(r["id"], owner_user_id=owner_user_id)
             if course:
-                courses.append(course)
-        return courses
+                result.append(course)
+        return result
 
 
 def update_course(course_id: str, updates: Dict[str, Any], owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Updates course details, preferences, or assessment schedules."""
-    from app.core.config import settings
-
-    with get_db_connection() as conn:
-        c = conn.execute("SELECT * FROM courses WHERE id = ? OR syllabus_id = ?", (course_id, course_id)).fetchone()
-        if not c:
-            return None
-        if settings.is_production:
-            if not owner_user_id or c["owner_user_id"] is None or c["owner_user_id"] != owner_user_id:
-                return None
-        else:
-            if owner_user_id is not None and c["owner_user_id"] is not None and c["owner_user_id"] != owner_user_id:
-                return None
-        actual_id = c["id"]
-
-        allowed_fields = [
-            "course_name",
-            "course_code",
-            "owner_user_id",
-            "language",
-            "lesson_style",
-            "daily_study_availability",
-            "daily_target_minutes",
-            "assessment_system_type",
-            "assessment_scope",
-            "color_theme",
-            "is_archived",
-            "syllabus_id",
-        ]
-        set_clauses = []
-        params = []
-        for f in allowed_fields:
-            if f in updates:
-                set_clauses.append(f"{f} = ?")
+    """Updates editable attributes on a course and saves new assessment milestones if provided."""
+    allowed_fields = [
+        "course_name",
+        "course_code",
+        "language",
+        "lesson_style",
+        "daily_study_availability",
+        "daily_target_minutes",
+        "assessment_system_type",
+        "assessment_scope",
+        "color_theme",
+        "is_archived",
+    ]
+    set_clauses = []
+    params = []
+    for f in allowed_fields:
+        if f in updates:
+            set_clauses.append(f"{f} = ?")
+            if f == "is_archived":
+                params.append(1 if updates[f] else 0)
+            else:
                 params.append(updates[f])
 
-        if set_clauses:
-            set_clauses.append("updated_at = CURRENT_TIMESTAMP")
-            params.append(actual_id)
-            query = f"UPDATE courses SET {', '.join(set_clauses)} WHERE id = ?"
-            conn.execute(query, params)
+    if set_clauses:
+        set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+        where_parts = ["id = ?"]
+        params.append(course_id)
+        if owner_user_id:
+            where_parts.append("(owner_user_id = ? OR owner_user_id IS NULL OR owner_user_id = '')")
+            params.append(owner_user_id)
+
+        query = f"UPDATE courses SET {', '.join(set_clauses)} WHERE {' AND '.join(where_parts)}"
+        with get_db_connection() as conn:
+            conn.execute(query, tuple(params))
             conn.commit()
 
-        if "assessments" in updates:
-            save_course_assessments(actual_id, updates["assessments"])
+    if "assessments" in updates and updates["assessments"] is not None:
+        save_course_assessments(course_id, updates["assessments"])
 
-    return get_course(actual_id, owner_user_id=owner_user_id)
+    return get_course(course_id, owner_user_id=owner_user_id)
 
 
 def archive_course(course_id: str, is_archived: bool = True, owner_user_id: Optional[str] = None) -> bool:
-    """Toggles archive status for a course."""
-    from app.core.config import settings
-
+    """Archives or restores a course record."""
     with get_db_connection() as conn:
-        c = conn.execute("SELECT owner_user_id FROM courses WHERE id = ? OR syllabus_id = ?", (course_id, course_id)).fetchone()
-        if not c:
-            return False
-        if settings.is_production:
-            if not owner_user_id or c["owner_user_id"] is None or c["owner_user_id"] != owner_user_id:
-                return False
-        else:
-            if owner_user_id is not None and c["owner_user_id"] is not None and c["owner_user_id"] != owner_user_id:
+        if owner_user_id:
+            c = conn.execute(
+                """
+                SELECT id FROM courses
+                WHERE (id = ? OR syllabus_id = ?)
+                  AND (owner_user_id = ? OR owner_user_id IS NULL OR owner_user_id = '')
+                """,
+                (course_id, course_id, owner_user_id)
+            ).fetchone()
+            if not c:
                 return False
 
-        cursor = conn.execute(
-            "UPDATE courses SET is_archived = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? OR syllabus_id = ?",
+        conn.execute(
+            """
+            UPDATE courses
+            SET is_archived = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? OR syllabus_id = ?
+            """,
             (1 if is_archived else 0, course_id, course_id)
         )
         conn.commit()
-        return cursor.rowcount > 0
+        return True
 
 
 def delete_course(course_id: str, owner_user_id: Optional[str] = None) -> bool:
-    """Deletes a course and all associated assessments, tasks, plans, and resources."""
-    from app.core.config import settings
-
+    """Deletes a course and all associated child entities, ensuring ownership match."""
     with get_db_connection() as conn:
-        c = conn.execute("SELECT id, syllabus_id, owner_user_id FROM courses WHERE id = ? OR syllabus_id = ?", (course_id, course_id)).fetchone()
-        if not c:
-            return False
-        if settings.is_production:
-            if not owner_user_id or c["owner_user_id"] is None or c["owner_user_id"] != owner_user_id:
+        if owner_user_id:
+            c = conn.execute(
+                """
+                SELECT id, syllabus_id FROM courses
+                WHERE (id = ? OR syllabus_id = ?)
+                  AND (owner_user_id = ? OR owner_user_id IS NULL OR owner_user_id = '')
+                """,
+                (course_id, course_id, owner_user_id)
+            ).fetchone()
+            if not c:
                 return False
+            actual_id = c["id"]
+            s_id = c["syllabus_id"]
         else:
-            if owner_user_id is not None and c["owner_user_id"] is not None and c["owner_user_id"] != owner_user_id:
+            c = conn.execute("SELECT id, syllabus_id FROM courses WHERE id = ? OR syllabus_id = ?", (course_id, course_id)).fetchone()
+            if not c:
                 return False
+            actual_id = c["id"]
+            s_id = c["syllabus_id"]
 
-        cid = c["id"]
-        sid = c["syllabus_id"]
-
-        conn.execute("DELETE FROM course_assessments WHERE course_id = ?", (cid,))
-        conn.execute("DELETE FROM study_tasks WHERE course_id = ? OR syllabus_id = ?", (cid, sid))
-        conn.execute("DELETE FROM study_plans WHERE course_id = ? OR syllabus_id = ?", (cid, sid))
-        if sid:
-            conn.execute("DELETE FROM topic_resources WHERE syllabus_id = ?", (sid,))
-            conn.execute("DELETE FROM rejected_channels WHERE syllabus_id = ?", (sid,))
-            conn.execute("DELETE FROM syllabus_coverage_summary WHERE syllabus_id = ?", (sid,))
-            conn.execute("DELETE FROM topics WHERE syllabus_id = ?", (sid,))
-            conn.execute("DELETE FROM modules WHERE syllabus_id = ?", (sid,))
-            conn.execute("DELETE FROM syllabi WHERE id = ?", (sid,))
-        conn.execute("DELETE FROM courses WHERE id = ?", (cid,))
+        conn.execute("DELETE FROM courses WHERE id = ?", (actual_id,))
+        conn.execute("DELETE FROM course_assessments WHERE course_id = ?", (actual_id,))
+        if s_id:
+            conn.execute("DELETE FROM syllabi WHERE id = ?", (s_id,))
+            conn.execute("DELETE FROM modules WHERE syllabus_id = ?", (s_id,))
+            conn.execute("DELETE FROM topics WHERE syllabus_id = ?", (s_id,))
+            conn.execute("DELETE FROM topic_resources WHERE syllabus_id = ?", (s_id,))
+            conn.execute("DELETE FROM rejected_channels WHERE syllabus_id = ?", (s_id,))
+            conn.execute("DELETE FROM syllabus_coverage_summary WHERE syllabus_id = ?", (s_id,))
+            conn.execute("DELETE FROM study_plans WHERE syllabus_id = ? OR course_id = ?", (s_id, actual_id))
+            conn.execute("DELETE FROM study_tasks WHERE syllabus_id = ? OR course_id = ?", (s_id, actual_id))
         conn.commit()
         return True
 
 
 def get_semester_overview(owner_user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Calculates semester-wide metrics, upcoming assessment timelines, and course breakdowns."""
-    courses = get_courses(include_archived=False, owner_user_id=owner_user_id)
-
+    """Computes aggregate metrics across all active enrolled courses for the student."""
+    courses = get_courses(owner_user_id=owner_user_id, include_archived=False)
     total_courses = len(courses)
-    total_topics = sum(c.get("total_topics", 0) for c in courses)
-    total_tasks = sum(c.get("total_tasks", 0) for c in courses)
-    completed_tasks = sum(c.get("completed_tasks", 0) for c in courses)
-    overall_percentage = (
-        round((completed_tasks / total_tasks * 100), 1)
-        if total_tasks > 0
-        else (round((completed_tasks / total_topics * 100), 1) if total_topics > 0 else 0.0)
-    )
-
-    overdue_tasks_count = sum(c.get("overdue_tasks_count", 0) for c in courses)
-
-    # Gather all upcoming assessments across courses
+    total_planned_minutes = 0
+    total_completed_minutes = 0
+    total_topics = 0
+    total_tasks = 0
+    completed_tasks = 0
+    overdue_tasks_count = 0
     all_upcoming = []
+
     for c in courses:
+        prog = c.get("progress", {})
+        total_planned_minutes += prog.get("total_minutes", 0)
+        total_completed_minutes += prog.get("completed_minutes", 0)
+        total_tasks += prog.get("total_tasks", 0)
+        completed_tasks += prog.get("completed_tasks", 0)
+        overdue_tasks_count += c.get("overdue_tasks_count", 0)
+
+        if c.get("syllabus_id"):
+            with get_db_connection() as conn:
+                t_count = conn.execute("SELECT COUNT(*) as c FROM topics WHERE syllabus_id = ?", (c["syllabus_id"],)).fetchone()
+                total_topics += (t_count["c"] if t_count else 0)
+
         for a in c.get("assessments", []):
             if not a.get("is_past"):
                 all_upcoming.append({
-                    "id": a["id"],
+                    "id": a.get("id") or f"asm_{uuid.uuid4().hex[:8]}",
                     "course_id": c["id"],
                     "course_name": c["course_name"],
-                    "course_code": c["course_code"],
-                    "name": a["name"],
-                    "exam_date": a["exam_date"],
-                    "days_remaining": a["days_remaining"],
+                    "course_code": c.get("course_code"),
+                    "name": a.get("name") or a.get("assessment_name") or "Assessment",
+                    "assessment_name": a.get("name") or a.get("assessment_name") or "Assessment",
+                    "color_theme": c.get("color_theme", "blue"),
+                    "exam_date": _to_date_str(a["exam_date"]),
+                    "days_remaining": a.get("days_remaining", 0),
                     "assessment_type": a.get("assessment_type", "internal"),
                     "scope": a.get("scope", "both"),
+                    "weightage": a.get("weightage", 0.0),
                 })
 
     all_upcoming.sort(key=lambda x: x["exam_date"])
+    overall_pct = round((completed_tasks / total_tasks * 100), 1) if total_tasks > 0 else 0.0
 
     return {
-        "status": "success",
         "total_courses": total_courses,
+        "total_active_courses": total_courses,
+        "total_planned_hours": round(total_planned_minutes / 60, 1),
+        "total_completed_hours": round(total_completed_minutes / 60, 1),
         "total_topics": total_topics,
         "total_tasks": total_tasks,
         "completed_tasks": completed_tasks,
-        "overall_percentage": overall_percentage,
+        "overall_percentage": overall_pct,
+        "overall_progress_percentage": overall_pct,
         "overdue_tasks_count": overdue_tasks_count,
-        "upcoming_assessments": all_upcoming,
+        "upcoming_assessments": all_upcoming[:10],
         "courses": courses,
+        "courses_summary": [
+            {
+                "id": c["id"],
+                "course_name": c["course_name"],
+                "course_code": c.get("course_code"),
+                "color_theme": c.get("color_theme", "blue"),
+                "progress_percentage": c.get("progress", {}).get("progress_percentage", 0.0),
+                "next_assessment": c.get("next_assessment"),
+                "overdue_tasks_count": c.get("overdue_tasks_count", 0),
+            }
+            for c in courses
+        ]
     }
 
 
@@ -1856,73 +2783,83 @@ def replace_course_syllabus(
     course_id: str,
     new_syllabus_id: str,
     preserve_matching_completions: bool = True,
+    owner_user_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Replaces a course's syllabus document with a newly parsed one.
-    When preserve_matching_completions is True, completed status and notes are preserved
-    for any topics whose title matches an existing completed topic.
+    Replaces a course's linked syllabus with a newly uploaded syllabus.
+    When preserve_matching_completions=True, preserves completion status, notes,
+    and completed_at dates for tasks with matching normalized titles.
     """
-    with get_db_connection() as conn:
-        c = conn.execute("SELECT * FROM courses WHERE id = ? OR syllabus_id = ?", (course_id, course_id)).fetchone()
-        if not c:
+    if owner_user_id:
+        c_owner = get_course_owner_id(course_id)
+        if c_owner and c_owner != owner_user_id:
             return None
-        cid = c["id"]
-        old_sid = c["syllabus_id"]
+        s_owner = get_syllabus_owner_id(new_syllabus_id)
+        if s_owner and s_owner != owner_user_id:
+            return None
 
-        saved_completions: Dict[str, Dict[str, Any]] = {}
-        if old_sid and preserve_matching_completions:
-            old_tasks = conn.execute(
-                "SELECT title, status, notes, completed_at FROM study_tasks WHERE syllabus_id = ? OR course_id = ?",
-                (old_sid, cid)
+    with get_db_connection() as conn:
+        course = conn.execute("SELECT * FROM courses WHERE id = ?", (course_id,)).fetchone()
+        if not course:
+            return None
+
+        old_syllabus_id = course["syllabus_id"]
+
+        # Cache existing completed task history
+        completed_history = {}
+        if preserve_matching_completions and old_syllabus_id:
+            rows = conn.execute(
+                """
+                SELECT title, status, notes, completed_at
+                FROM study_tasks
+                WHERE syllabus_id = ? OR course_id = ?
+                """,
+                (old_syllabus_id, course_id)
             ).fetchall()
-            for t in old_tasks:
-                if t["status"] == "completed" or t["notes"]:
-                    norm_title = re.sub(r"[^\w\s]", "", t["title"].lower()).strip()
-                    saved_completions[norm_title] = {
-                        "status": t["status"],
+            for r in rows:
+                t = dict(r)
+                if t["status"] == "completed":
+                    norm_key = t["title"].strip().lower()
+                    completed_history[norm_key] = {
+                        "status": "completed",
                         "notes": t["notes"],
-                        "completed_at": t["completed_at"],
+                        "completed_at": _to_iso_str(t["completed_at"]),
                     }
 
-        # Update course to point to new syllabus
-        conn.execute(
-            "UPDATE courses SET syllabus_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (new_syllabus_id, cid)
-        )
-        conn.execute("UPDATE syllabi SET course_id = ? WHERE id = ?", (cid, new_syllabus_id))
+        # Update course with new syllabus_id
+        conn.execute("UPDATE courses SET syllabus_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (new_syllabus_id, course_id))
+        conn.execute("UPDATE syllabi SET course_id = ? WHERE id = ?", (course_id, new_syllabus_id))
+        conn.execute("UPDATE study_plans SET course_id = ? WHERE syllabus_id = ?", (course_id, new_syllabus_id))
+        conn.execute("UPDATE study_tasks SET course_id = ? WHERE syllabus_id = ?", (course_id, new_syllabus_id))
 
-        # Re-apply matching completions to tasks if tasks already generated
-        if saved_completions:
-            new_tasks = conn.execute(
-                "SELECT id, title FROM study_tasks WHERE syllabus_id = ? OR course_id = ?",
-                (new_syllabus_id, cid)
-            ).fetchall()
+        # Re-apply matching completion history to new tasks
+        if completed_history:
+            new_tasks = conn.execute("SELECT id, title FROM study_tasks WHERE syllabus_id = ?", (new_syllabus_id,)).fetchall()
             for nt in new_tasks:
-                norm_new = re.sub(r"[^\w\s]", "", nt["title"].lower()).strip()
-                if norm_new in saved_completions:
-                    m = saved_completions[norm_new]
+                norm_title = nt["title"].strip().lower()
+                if norm_title in completed_history:
+                    m = completed_history[norm_title]
                     conn.execute(
-                        "UPDATE study_tasks SET status = ?, notes = ?, completed_at = ? WHERE id = ?",
+                        """
+                        UPDATE study_tasks
+                        SET status = ?, notes = ?, completed_at = ?
+                        WHERE id = ?
+                        """,
                         (m["status"], m["notes"], m["completed_at"], nt["id"])
                     )
 
         conn.commit()
+    return get_course(course_id, owner_user_id=owner_user_id)
 
-    return get_course(cid)
-
-
-# ==============================================================================
-# Security & Ownership Tracing Helpers
-# ==============================================================================
 
 def get_course_owner_id(course_id: str) -> Optional[str]:
-    """Retrieves the owner_user_id for a course or linked syllabus."""
+    """Retrieves the owner_user_id for a course or syllabus."""
     with get_db_connection() as conn:
         row = conn.execute(
             "SELECT owner_user_id FROM courses WHERE id = ? OR syllabus_id = ?",
             (course_id, course_id)
         ).fetchone()
-        return row["owner_user_id"] if row else None
+        return str(row["owner_user_id"]) if (row and row["owner_user_id"] is not None) else None
 
 
 def get_syllabus_owner_id(syllabus_id: str) -> Optional[str]:
@@ -1935,11 +2872,11 @@ def get_syllabus_owner_id(syllabus_id: str) -> Optional[str]:
         if not row:
             return None
         if row["owner_user_id"]:
-            return row["owner_user_id"]
+            return str(row["owner_user_id"])
         if row["course_id"]:
             c_row = conn.execute("SELECT owner_user_id FROM courses WHERE id = ?", (row["course_id"],)).fetchone()
             if c_row and c_row["owner_user_id"]:
-                return c_row["owner_user_id"]
+                return str(c_row["owner_user_id"])
         return None
 
 
@@ -1953,7 +2890,7 @@ def get_study_plan_owner_id(plan_id: str) -> Optional[str]:
         if not row:
             return None
         if row["owner_user_id"]:
-            return row["owner_user_id"]
+            return str(row["owner_user_id"])
         if row["course_id"]:
             c_owner = get_course_owner_id(row["course_id"])
             if c_owner:
@@ -1965,5 +2902,26 @@ def get_study_plan_owner_id(plan_id: str) -> Optional[str]:
         return None
 
 
-
-
+def get_task_owner_id(task_id: str) -> Optional[str]:
+    """Retrieves the owner_user_id for a study task via its study plan, course, or syllabus links."""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT plan_id, course_id, syllabus_id FROM study_tasks WHERE id = ?",
+            (task_id,)
+        ).fetchone()
+        if not row:
+            return None
+        r = dict(row)
+        if r.get("plan_id"):
+            p_owner = get_study_plan_owner_id(r["plan_id"])
+            if p_owner:
+                return str(p_owner)
+        if r.get("course_id"):
+            c_owner = get_course_owner_id(r["course_id"])
+            if c_owner:
+                return str(c_owner)
+        if r.get("syllabus_id"):
+            s_owner = get_syllabus_owner_id(r["syllabus_id"])
+            if s_owner:
+                return str(s_owner)
+        return None
