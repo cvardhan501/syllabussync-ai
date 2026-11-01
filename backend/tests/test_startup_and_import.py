@@ -69,13 +69,13 @@ class TestImportAndStartup:
                     _validate_postgres_schema()
                 assert "Could not connect to pooler" in str(exc_info.value)
 
-    def test_api_index_serverless_entry_point(self):
-        """Verifies that api/index.py mounts FastAPI app cleanly."""
+    def test_backend_main_serverless_entry_point(self):
+        """Verifies that backend/main.py mounts FastAPI app cleanly for Vercel Services."""
         import importlib.util
-        api_index_path = Path(__file__).resolve().parent.parent.parent / "api" / "index.py"
-        assert api_index_path.exists()
+        backend_main_path = Path(__file__).resolve().parent.parent / "main.py"
+        assert backend_main_path.exists()
 
-        spec = importlib.util.spec_from_file_location("vercel_api_entry", str(api_index_path))
+        spec = importlib.util.spec_from_file_location("vercel_backend_entry", str(backend_main_path))
         serverless_entry = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(serverless_entry)
         assert hasattr(serverless_entry, "app")

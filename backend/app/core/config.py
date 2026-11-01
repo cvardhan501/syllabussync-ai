@@ -1,6 +1,8 @@
 import os
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
@@ -55,27 +57,56 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://syllabussync-ai.vercel.app",
     ]
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v: Any) -> List[str]:
+        origins: List[str] = []
+        if isinstance(v, str):
+            v_str = v.strip()
+            if v_str:
+                if v_str.startswith("[") and v_str.endswith("]"):
+                    try:
+                        parsed = json.loads(v_str)
+                        if isinstance(parsed, list):
+                            origins = [str(o).strip() for o in parsed if str(o).strip()]
+                    except Exception:
+                        pass
+                if not origins:
+                    origins = [origin.strip() for origin in v_str.split(",") if origin.strip()]
+        elif isinstance(v, (list, tuple, set)):
+            origins = [str(origin).strip() for origin in v if str(origin).strip()]
+        elif v:
+            origins = [str(v).strip()]
+
+        # Guarantee production domain is included alongside configured origins
+        prod_origin = "https://syllabussync-ai.vercel.app"
+        if prod_origin not in origins:
+            origins.append(prod_origin)
+
+        return origins
     
-    # Upload limits
-    max_upload_size_mb: int = 10
+    # Upload limits (aligned with Vercel 4.5 MB request payload limit)
+    max_upload_size_mb: float = 4.5
     
     @property
     def max_upload_size_bytes(self) -> int:
-        return self.max_upload_size_mb * 1024 * 1024
+        return int(self.max_upload_size_mb * 1024 * 1024)
 
     # Database
     database_url: str = "sqlite:///./syllabus_sync.db"
     
     # Strands Agents SDK Configuration
     strands_provider: str = "bedrock"
-    strands_model: str = "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    strands_model: str = "amazon.nova-lite-v1:0"
     strands_streaming: Optional[bool] = None
     
     # AWS Bedrock Credentials
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
-    aws_region: str = "us-east-1"
+    aws_region: str = "ap-southeast-2"
     aws_session_token: Optional[str] = None
     
     # Alternative Provider Credentials

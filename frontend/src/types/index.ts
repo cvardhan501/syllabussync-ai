@@ -13,6 +13,7 @@ export interface HealthResponse {
   version: string;
   timestamp: string;
   environment: string;
+  database_connected?: boolean | null;
 }
 
 export interface SyllabusUploadResponse {

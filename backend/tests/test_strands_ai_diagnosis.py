@@ -57,6 +57,7 @@ async def test_bedrock_model_configuration_and_non_streaming():
 
             assert mock_bedrock.called
             call_kwargs = mock_bedrock.call_args.kwargs
+            assert call_kwargs.get("model_id") == settings.strands_model
             assert call_kwargs.get("region_name") == settings.aws_region
             assert call_kwargs.get("streaming") is False
 

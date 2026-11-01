@@ -26,7 +26,7 @@ interface SyllabusPageProps {
   onCourseCreated?: (course: Course) => void;
 }
 
-const MAX_SIZE_MB = 10;
+const MAX_SIZE_MB = 4.5;
 const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
 const ALLOWED_EXTENSIONS = ['.pdf', '.docx'];
 
@@ -366,7 +366,7 @@ export const SyllabusPage: React.FC<SyllabusPageProps> = ({
           </button>
 
           <p className="text-[11px] text-slate-400 mt-5 m-0">
-            Supported formats: PDF, DOCX • Max size: 10 MB
+            Supported formats: PDF, DOCX • Max size: 4.5 MB
           </p>
         </div>
 
@@ -382,7 +382,7 @@ export const SyllabusPage: React.FC<SyllabusPageProps> = ({
             </li>
             <li className="flex items-center gap-2.5">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>Max size 10 MB</span>
+              <span>Max size 4.5 MB</span>
             </li>
             <li className="flex items-center gap-2.5">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />

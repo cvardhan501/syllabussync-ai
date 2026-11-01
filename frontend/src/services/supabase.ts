@@ -82,7 +82,7 @@ export async function getSupabaseAccessToken(): Promise<string | null> {
  */
 export async function signInWithGoogle(redirectTo?: string) {
   const client = getSupabase();
-  const callbackUrl = redirectTo || (typeof window !== 'undefined' ? `${window.location.origin}/` : undefined);
+  const callbackUrl = redirectTo || (typeof window !== 'undefined' ? window.location.origin : undefined);
   
   return client.auth.signInWithOAuth({
     provider: 'google',

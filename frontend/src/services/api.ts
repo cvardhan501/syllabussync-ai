@@ -57,6 +57,80 @@ async function authenticatedFetch(input: RequestInfo | URL, init?: RequestInit):
   return response;
 }
 
+/**
+ * Safely parses response JSON or plain text/HTML errors from the backend.
+ * Provides clear human-friendly messages for HTTP 400, 401, 403, 404, 413, 422, 429, 500, 502, 504,
+ * and Vercel serverless platform errors (FUNCTION_INVOCATION_FAILED, payload limits).
+ */
+async function handleApiResponse<T = any>(response: Response, defaultErrorPrefix: string = 'Operation failed'): Promise<T> {
+  let responseData: any = null;
+  let rawText = '';
+
+  try {
+    rawText = await response.text();
+    if (rawText.trim()) {
+      responseData = JSON.parse(rawText);
+    }
+  } catch {
+    // Non-JSON responses preserved in rawText
+  }
+
+  if (!response.ok) {
+    let errorMsg = '';
+
+    // 1. Structured FastAPI detail response
+    if (responseData && typeof responseData === 'object' && responseData.detail) {
+      if (typeof responseData.detail === 'string') {
+        errorMsg = responseData.detail;
+      } else if (Array.isArray(responseData.detail)) {
+        errorMsg = responseData.detail.map((d: any) => d.msg || JSON.stringify(d)).join(', ');
+      }
+    }
+    // 2. Vercel serverless error strings
+    else if (rawText) {
+      const cleanText = rawText.trim();
+      if (cleanText.includes('FUNCTION_INVOCATION_FAILED')) {
+        errorMsg = 'Backend service is starting or encountered a serverless invocation error (HTTP 500). Please retry in a few moments.';
+      } else if (cleanText.includes('FUNCTION_PAYLOAD_TOO_LARGE') || response.status === 413) {
+        errorMsg = 'Uploaded file exceeds the maximum allowed request size (4.5 MB).';
+      } else if (response.status === 502 || response.status === 504) {
+        errorMsg = `Backend gateway error or timeout (HTTP ${response.status}).`;
+      } else if (cleanText.length < 200 && !cleanText.startsWith('<')) {
+        errorMsg = cleanText;
+      }
+    }
+
+    // 3. Fallback standard HTTP status descriptions
+    if (!errorMsg) {
+      switch (response.status) {
+        case 400: errorMsg = `${defaultErrorPrefix}: Invalid request parameters.`; break;
+        case 401: errorMsg = 'Authentication required or session expired. Please sign in again.'; break;
+        case 403: errorMsg = 'Access denied: You do not have permission to access or modify this resource.'; break;
+        case 404: errorMsg = `${defaultErrorPrefix}: Requested resource not found.`; break;
+        case 413: errorMsg = 'File or payload too large. Maximum allowed size is 4.5 MB.'; break;
+        case 422: errorMsg = `${defaultErrorPrefix}: Validation error in request data.`; break;
+        case 429: errorMsg = 'Rate limit exceeded. Please wait a moment before trying again.'; break;
+        case 500: errorMsg = `${defaultErrorPrefix}: Internal server error (HTTP 500).`; break;
+        case 502: errorMsg = 'Backend service unavailable (HTTP 502 Bad Gateway).'; break;
+        case 504: errorMsg = 'Backend request timed out (HTTP 504 Gateway Timeout).'; break;
+        default: errorMsg = `${defaultErrorPrefix} (HTTP ${response.status}).`;
+      }
+    }
+
+    throw new ApiErrorResponse(errorMsg, response.status);
+  }
+
+  if (responseData !== null) {
+    return responseData as T;
+  }
+
+  if (!rawText.trim()) {
+    return {} as T;
+  }
+
+  throw new ApiErrorResponse(`Server returned an unreadable response (HTTP ${response.status}).`, response.status);
+}
+
 export const apiService = {
   async getHealth(): Promise<HealthResponse> {
     try {
@@ -67,11 +141,7 @@ export const apiService = {
         },
       });
 
-      if (!response.ok) {
-        throw new ApiErrorResponse(`Health check failed with status ${response.status}`, response.status);
-      }
-
-      return await response.json();
+      return await handleApiResponse<HealthResponse>(response, 'Health check failed');
     } catch (err: any) {
       if (err instanceof ApiErrorResponse) {
         throw err;
@@ -89,19 +159,7 @@ export const apiService = {
       body: formData,
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'An unexpected error occurred while parsing the syllabus.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as SyllabusUploadResponse;
+    return await handleApiResponse<SyllabusUploadResponse>(response, 'An unexpected error occurred while parsing the syllabus.');
   },
 
   async analyzeSyllabus(file?: File, syllabusId?: string): Promise<SyllabusAnalysisResponse> {
@@ -118,19 +176,7 @@ export const apiService = {
       body: formData,
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during syllabus analysis.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'An unexpected error occurred while analyzing syllabus topics with Strands Agents SDK.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as SyllabusAnalysisResponse;
+    return await handleApiResponse<SyllabusAnalysisResponse>(response, 'An unexpected error occurred while analyzing syllabus topics with Strands Agents SDK.');
   },
 
   async getSyllabus(syllabusId: string): Promise<SyllabusAnalysisResponse> {
@@ -141,19 +187,7 @@ export const apiService = {
       },
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || `Failed to retrieve syllabus '${syllabusId}'.`;
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as SyllabusAnalysisResponse;
+    return await handleApiResponse<SyllabusAnalysisResponse>(response, '${syllabusId}');
   },
 
   async updateSyllabusTopics(syllabusId: string, payload: TopicUpdateRequest): Promise<SyllabusAnalysisResponse> {
@@ -166,19 +200,7 @@ export const apiService = {
       body: JSON.stringify(payload),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to update syllabus topics.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as SyllabusAnalysisResponse;
+    return await handleApiResponse<SyllabusAnalysisResponse>(response, 'Failed to update syllabus topics.');
   },
 
   async discoverResources(
@@ -194,19 +216,7 @@ export const apiService = {
       body: JSON.stringify(options || {}),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during resource discovery.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to discover YouTube educational resources.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as ResourceDiscoveryResponse;
+    return await handleApiResponse<ResourceDiscoveryResponse>(response, 'Failed to discover YouTube educational resources.');
   },
 
   async getResources(syllabusId: string): Promise<ResourceDiscoveryResponse> {
@@ -217,19 +227,7 @@ export const apiService = {
       },
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || `Failed to retrieve resources for syllabus '${syllabusId}'.`;
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as ResourceDiscoveryResponse;
+    return await handleApiResponse<ResourceDiscoveryResponse>(response, '${syllabusId}');
   },
 
   async getTopicAlternatives(syllabusId: string, topicId: string, language: string = 'English'): Promise<AlternativeResourcesResponse> {
@@ -241,19 +239,7 @@ export const apiService = {
       },
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to fetch alternative channels for this topic.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as AlternativeResourcesResponse;
+    return await handleApiResponse<AlternativeResourcesResponse>(response, 'Failed to fetch alternative channels for this topic.');
   },
 
   async replaceTopicChannel(
@@ -270,19 +256,7 @@ export const apiService = {
       body: JSON.stringify(payload),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during channel replacement.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to replace channel for this topic.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as TopicResourceMapping;
+    return await handleApiResponse<TopicResourceMapping>(response, 'Failed to replace channel for this topic.');
   },
 
   async approveThirdChannel(syllabusId: string): Promise<ResourceDiscoveryResponse> {
@@ -295,19 +269,7 @@ export const apiService = {
       body: JSON.stringify({ approve: true }),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to approve third channel.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as ResourceDiscoveryResponse;
+    return await handleApiResponse<ResourceDiscoveryResponse>(response, 'Failed to approve third channel.');
   },
 
   async discoverChannels(
@@ -324,19 +286,7 @@ export const apiService = {
       body: JSON.stringify({ languages, force_refresh: forceRefresh }),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during channel discovery.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to discover channels for course.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as ChannelDiscoveryResponse;
+    return await handleApiResponse<ChannelDiscoveryResponse>(response, 'Failed to discover channels for course.');
   },
 
   async previewStrategy(
@@ -360,19 +310,7 @@ export const apiService = {
       }),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during strategy preview.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to generate channel strategy preview.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as PreviewStrategyResponse;
+    return await handleApiResponse<PreviewStrategyResponse>(response, 'Failed to generate channel strategy preview.');
   },
 
   async confirmStrategy(
@@ -396,19 +334,7 @@ export const apiService = {
       }),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during strategy confirmation.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to confirm channel strategy and build video library.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as ResourceDiscoveryResponse;
+    return await handleApiResponse<ResourceDiscoveryResponse>(response, 'Failed to confirm channel strategy and build video library.');
   },
 
   async createStudyPlan(syllabusId: string, payload: StudyPlanCreateRequest): Promise<StudyPlanResponse> {
@@ -421,19 +347,7 @@ export const apiService = {
       body: JSON.stringify(payload),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during study plan generation.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to generate personalized study plan.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as StudyPlanResponse;
+    return await handleApiResponse<StudyPlanResponse>(response, 'Failed to generate personalized study plan.');
   },
 
   async getStudyPlan(syllabusId: string): Promise<StudyPlanResponse> {
@@ -444,19 +358,7 @@ export const apiService = {
       },
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || `Failed to retrieve study plan for syllabus '${syllabusId}'.`;
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as StudyPlanResponse;
+    return await handleApiResponse<StudyPlanResponse>(response, '${syllabusId}');
   },
 
   async updateTaskStatus(planId: string, taskId: string, completed: boolean): Promise<TaskItemSchema> {
@@ -469,19 +371,7 @@ export const apiService = {
       body: JSON.stringify({ completed }),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to update task completion state.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as TaskItemSchema;
+    return await handleApiResponse<TaskItemSchema>(response, 'Failed to update task completion state.');
   },
 
   async saveTaskNote(planId: string, taskId: string, notes: string): Promise<TaskItemSchema> {
@@ -494,19 +384,7 @@ export const apiService = {
       body: JSON.stringify({ notes }),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to save task notes.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as TaskItemSchema;
+    return await handleApiResponse<TaskItemSchema>(response, 'Failed to save task notes.');
   },
 
   async reschedulePlan(planId: string, options?: { missed_date?: string; from_date?: string }): Promise<StudyPlanResponse> {
@@ -519,19 +397,7 @@ export const apiService = {
       body: JSON.stringify(options || {}),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during rescheduling.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to reschedule study plan.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as StudyPlanResponse;
+    return await handleApiResponse<StudyPlanResponse>(response, 'Failed to reschedule study plan.');
   },
 
   async getSettings(): Promise<UserSettingsSchema> {
@@ -542,19 +408,7 @@ export const apiService = {
       },
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to retrieve settings.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as UserSettingsSchema;
+    return await handleApiResponse<UserSettingsSchema>(response, 'Failed to retrieve settings.');
   },
 
   async updateSettings(settingsData: UserSettingsSchema): Promise<UserSettingsSchema> {
@@ -567,19 +421,7 @@ export const apiService = {
       body: JSON.stringify(settingsData),
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to update settings.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as UserSettingsSchema;
+    return await handleApiResponse<UserSettingsSchema>(response, 'Failed to update settings.');
   },
 
   async getDiagnostics(): Promise<SystemDiagnosticsResponse> {
@@ -590,19 +432,7 @@ export const apiService = {
       },
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during diagnostics check.', response.status);
-    }
-
-    if (!response.ok) {
-      const errorMsg = responseData?.detail || 'Failed to retrieve system diagnostics.';
-      throw new ApiErrorResponse(errorMsg, response.status);
-    }
-
-    return responseData as SystemDiagnosticsResponse;
+    return await handleApiResponse<SystemDiagnosticsResponse>(response, 'Failed to retrieve system diagnostics.');
   },
 
   async testYouTubeApi(): Promise<DiagnosticTestResult> {
@@ -613,14 +443,7 @@ export const apiService = {
       },
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during YouTube test.', response.status);
-    }
-
-    return responseData as DiagnosticTestResult;
+    return await handleApiResponse<DiagnosticTestResult>(response, 'Server returned an unreadable response during YouTube test.');
   },
 
   async testStrandsModel(): Promise<DiagnosticTestResult> {
@@ -631,14 +454,7 @@ export const apiService = {
       },
     });
 
-    let responseData: any;
-    try {
-      responseData = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Server returned an unreadable response during Strands test.', response.status);
-    }
-
-    return responseData as DiagnosticTestResult;
+    return await handleApiResponse<DiagnosticTestResult>(response, 'Server returned an unreadable response during Strands test.');
   },
 
   // ============================================================================
@@ -652,18 +468,7 @@ export const apiService = {
       headers: { 'Accept': 'application/json' },
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to parse courses response.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Failed to fetch courses.', response.status);
-    }
-
-    return data;
+    return await handleApiResponse(response, 'Failed to fetch courses.');
   },
 
   async getCourse(courseId: string): Promise<Course> {
@@ -672,18 +477,7 @@ export const apiService = {
       headers: { 'Accept': 'application/json' },
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to parse course response.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Failed to fetch course.', response.status);
-    }
-
-    return data as Course;
+    return await handleApiResponse<Course>(response, 'Failed to fetch course.');
   },
 
   async createCourse(payload: any): Promise<Course> {
@@ -696,18 +490,7 @@ export const apiService = {
       body: JSON.stringify(payload),
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to create course.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Failed to create course.', response.status);
-    }
-
-    return data as Course;
+    return await handleApiResponse<Course>(response, 'Failed to create course.');
   },
 
   async updateCourse(courseId: string, payload: any): Promise<Course> {
@@ -720,18 +503,7 @@ export const apiService = {
       body: JSON.stringify(payload),
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to update course.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Failed to update course.', response.status);
-    }
-
-    return data as Course;
+    return await handleApiResponse<Course>(response, 'Failed to update course.');
   },
 
   async archiveCourse(courseId: string, isArchived: boolean = true): Promise<any> {
@@ -741,18 +513,7 @@ export const apiService = {
       headers: { 'Accept': 'application/json' },
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to archive course.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Failed to archive course.', response.status);
-    }
-
-    return data;
+    return await handleApiResponse(response, 'Failed to archive course.');
   },
 
   async deleteCourse(courseId: string): Promise<any> {
@@ -761,18 +522,7 @@ export const apiService = {
       headers: { 'Accept': 'application/json' },
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to delete course.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Failed to delete course.', response.status);
-    }
-
-    return data;
+    return await handleApiResponse(response, 'Failed to delete course.');
   },
 
   async replaceCourseSyllabus(courseId: string, newSyllabusId: string, preserveCompletions: boolean = true): Promise<Course> {
@@ -788,18 +538,7 @@ export const apiService = {
       }),
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to replace syllabus.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Failed to replace syllabus.', response.status);
-    }
-
-    return data as Course;
+    return await handleApiResponse<Course>(response, 'Failed to replace syllabus.');
   },
 
   async getSemesterOverview(): Promise<SemesterOverview> {
@@ -808,18 +547,7 @@ export const apiService = {
       headers: { 'Accept': 'application/json' },
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to parse semester overview.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Failed to fetch semester overview.', response.status);
-    }
-
-    return data as SemesterOverview;
+    return await handleApiResponse<SemesterOverview>(response, 'Failed to fetch semester overview.');
   },
 
   async setupAndAnalyzeSyllabus(payload: any): Promise<{
@@ -837,17 +565,6 @@ export const apiService = {
       body: JSON.stringify(payload),
     });
 
-    let data: any;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ApiErrorResponse('Failed to analyze syllabus and create course.', response.status);
-    }
-
-    if (!response.ok) {
-      throw new ApiErrorResponse(data?.detail || 'Syllabus setup and analysis failed.', response.status);
-    }
-
-    return data;
+    return await handleApiResponse(response, 'Syllabus setup and analysis failed.');
   },
 };

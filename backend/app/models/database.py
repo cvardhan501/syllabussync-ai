@@ -265,6 +265,10 @@ def get_db_path() -> str:
     url = settings.database_url
     if url.startswith("sqlite:///"):
         raw_path = url.replace("sqlite:///", "")
+        if os.environ.get("VERCEL"):
+            # On Vercel serverless functions, the root filesystem is read-only; use /tmp for SQLite fallback
+            import tempfile
+            return os.path.join(tempfile.gettempdir(), os.path.basename(raw_path) or "syllabus_sync.db")
         from pathlib import Path
         p = Path(raw_path)
         if not p.is_absolute():
@@ -321,6 +325,12 @@ def _validate_postgres_schema() -> None:
 
 def _init_sqlite_schema() -> None:
     """Initializes SQLite schema and handles safe column migrations."""
+    if settings.is_production:
+        logger.error(
+            "CRITICAL: SQLite fallback initialized in PRODUCTION environment. "
+            "Serverless /tmp storage is ephemeral and cannot be used for persistent production data. "
+            "Configure DATABASE_URL with Supabase PostgreSQL connection pooler."
+        )
     db_path = get_db_path()
     dirname = os.path.dirname(db_path)
     if dirname:
@@ -763,6 +773,7 @@ def get_db_connection():
             "row_factory": dict_row,
             "prepare_threshold": None,  # Mandatory for Supabase transaction pooler (port 6543)
             "autocommit": False,
+            "connect_timeout": 10,
         }
         if "sslmode=" not in pg_url:
             connect_kwargs["sslmode"] = "require"
