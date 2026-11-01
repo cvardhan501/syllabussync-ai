@@ -197,8 +197,9 @@ class YouTubeClientService:
         )
 
     @classmethod
-    def _compute_query_hash(cls, query: str, language: str, max_results: int) -> str:
-        raw = f"{query.strip().lower()}|{language.strip().lower()}|{max_results}"
+    def _compute_query_hash(cls, query: str, language: str, max_results: Optional[int] = None) -> str:
+        # Normalize hash by query and language so strategy preview (max_results=5) reuses discovery cache (max_results=4)
+        raw = f"{query.strip().lower()}|{language.strip().lower()}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @classmethod
@@ -216,12 +217,13 @@ class YouTubeClientService:
         """
         max_results = max_results or settings.youtube_max_search_results
         lang_code = LANGUAGE_CODE_MAP.get(language.lower(), "en")
-        query_hash = cls._compute_query_hash(query, lang_code, max_results)
+        query_hash = cls._compute_query_hash(query, lang_code)
+        legacy_hash = hashlib.sha256(f"{query.strip().lower()}|{lang_code}|{max_results}".encode("utf-8")).hexdigest()
         excluded_set = {ch.strip().lower() for ch in (excluded_channels or [])}
 
-        # 1. Check SQLite Cache if not forcing refresh
+        # 1. Check Cache if not forcing refresh (check normalized hash first, then legacy hash)
         if not force_refresh:
-            cached_data = get_cached_search(query_hash)
+            cached_data = get_cached_search(query_hash) or get_cached_search(legacy_hash)
             if cached_data and isinstance(cached_data, list):
                 # Filter out excluded channels from cached results
                 filtered = []
@@ -231,7 +233,7 @@ class YouTubeClientService:
                         v_copy["provenance"] = "cache"
                         filtered.append(v_copy)
                 if filtered:
-                    return filtered, False
+                    return filtered[:max_results], False
 
         # 2. Check credentials
         has_credentials = settings.has_youtube_credentials()

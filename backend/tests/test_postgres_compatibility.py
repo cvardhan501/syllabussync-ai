@@ -156,19 +156,16 @@ class TestQueryAdapter:
             assert "GROUP_CONCAT" not in adapted
             assert "STRING_AGG(tr.topic_id, ',')" in adapted
 
-    def test_converts_is_archived_equality_to_boolean_condition(self):
+    def test_preserves_integer_equality(self):
         with patch.object(settings, "database_url", "postgresql://localhost/db"):
-            sql = "SELECT id FROM courses WHERE is_archived = 0"
+            sql = "SELECT * FROM topic_resources WHERE is_primary = 1 AND is_archived = 0"
             adapted = _adapt_sql(sql)
-            assert "is_archived = 0" not in adapted
-            assert "is_archived IS NOT TRUE" in adapted
-
-    def test_converts_is_primary_equality(self):
-        with patch.object(settings, "database_url", "postgresql://localhost/db"):
-            sql = "SELECT * FROM topic_resources WHERE is_primary = 1"
-            adapted = _adapt_sql(sql)
-            assert "is_primary = 1" not in adapted
-            assert "is_primary IS TRUE" in adapted
+            # In PostgreSQL, is_primary and is_archived are INTEGER columns.
+            # They must NOT be rewritten to boolean IS TRUE / IS NOT TRUE which causes psycopg DatatypeMismatch
+            assert "is_primary = 1" in adapted
+            assert "is_archived = 0" in adapted
+            assert "IS TRUE" not in adapted
+            assert "IS NOT TRUE" not in adapted
 
     def test_no_op_when_running_sqlite(self):
         with patch.object(settings, "database_url", "sqlite:///./syllabus_sync.db"):

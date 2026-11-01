@@ -131,13 +131,7 @@ def _adapt_sql(sql: str) -> str:
         flags=re.IGNORECASE
     )
 
-    # 2. Adapt boolean comparisons
-    adapted = re.sub(r'\bis_archived\s*=\s*0\b', 'is_archived IS NOT TRUE', adapted, flags=re.IGNORECASE)
-    adapted = re.sub(r'\bis_archived\s*=\s*1\b', 'is_archived IS TRUE', adapted, flags=re.IGNORECASE)
-    adapted = re.sub(r'\bis_primary\s*=\s*1\b', 'is_primary IS TRUE', adapted, flags=re.IGNORECASE)
-    adapted = re.sub(r'\bis_primary\s*=\s*0\b', 'is_primary IS FALSE', adapted, flags=re.IGNORECASE)
-
-    # 3. Adapt ? placeholders to %s
+    # 2. Adapt ? placeholders to %s
     # Safe because no query in the codebase uses ? inside string literals
     # Remove invalid UUID empty-string checks for PostgreSQL
     adapted = re.sub(r"\s*OR\s+owner_user_id\s*=\s*''", "", adapted, flags=re.IGNORECASE)
@@ -626,7 +620,7 @@ def _init_sqlite_schema() -> None:
                 syllabus_id TEXT NOT NULL,
                 module_id TEXT NOT NULL,
                 topic_id TEXT NOT NULL,
-                video_resource_id TEXT NOT NULL,
+                video_resource_id TEXT,
                 is_primary INTEGER DEFAULT 1,
                 match_status TEXT DEFAULT 'relevant',
                 match_confidence TEXT DEFAULT 'high',
@@ -1369,12 +1363,12 @@ def save_discovered_resources(
                         (id, syllabus_id, module_id, topic_id, video_resource_id,
                          is_primary, match_status, match_confidence, relevance_notes,
                          assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
-                        VALUES (%s, %s, %s, %s, '', 1, %s, %s, %s, %s, 0, '[]', 'missing')
+                        VALUES (%s, %s, %s, %s, NULL, 1, %s, %s, %s, %s, 0, '[]', 'missing')
                         ON CONFLICT (id) DO UPDATE SET
                             syllabus_id = EXCLUDED.syllabus_id,
                             module_id = EXCLUDED.module_id,
                             topic_id = EXCLUDED.topic_id,
-                            video_resource_id = '',
+                            video_resource_id = NULL,
                             is_primary = 1,
                             match_status = EXCLUDED.match_status,
                             match_confidence = EXCLUDED.match_confidence,
@@ -2633,10 +2627,7 @@ def get_courses(owner_user_id: Optional[str] = None, include_archived: bool = Fa
                 conditions.append("owner_user_id = ?")
                 params.append(owner_user_id)
         if not include_archived:
-            if is_postgres():
-                conditions.append("is_archived IS NOT TRUE")
-            else:
-                conditions.append("is_archived = 0")
+            conditions.append("(is_archived = 0 OR is_archived IS NULL)")
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"SELECT id FROM courses {where_clause} ORDER BY updated_at DESC"
