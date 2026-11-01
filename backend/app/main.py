@@ -7,6 +7,12 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.api import api_router
 from app.models.database import init_db
+from app.services.youtube_client import (
+    YouTubeApiException,
+    YouTubeAuthException,
+    YouTubeQuotaExceededException,
+    YouTubeConnectionException,
+)
 
 # Configure structured logging
 logging.basicConfig(
@@ -28,6 +34,11 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     logger.info("Shutting down SyllabusSync AI backend.")
+    try:
+        from app.services.youtube_client import YouTubeClientService
+        await YouTubeClientService.close_http_client()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -45,6 +56,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Specific handler for YouTube API exceptions to return actionable status codes and messages
+@app.exception_handler(YouTubeApiException)
+async def youtube_exception_handler(request: Request, exc: YouTubeApiException):
+    logger.warning(
+        f"YouTube API exception during {request.method} {request.url.path}: {type(exc).__name__}: {str(exc)}"
+    )
+    if isinstance(exc, YouTubeQuotaExceededException):
+        status_code = status.HTTP_429_TOO_MANY_REQUESTS
+        prefix = "YouTube Quota Exceeded"
+    elif isinstance(exc, YouTubeAuthException):
+        status_code = status.HTTP_502_BAD_GATEWAY
+        prefix = "YouTube Authentication Error"
+    elif isinstance(exc, YouTubeConnectionException):
+        status_code = status.HTTP_504_GATEWAY_TIMEOUT
+        prefix = "YouTube Connection Timeout"
+    else:
+        status_code = status.HTTP_502_BAD_GATEWAY
+        prefix = "YouTube API Error"
+
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": f"{prefix}: {str(exc)}"}
+    )
 
 
 # Global unhandled exception handler to protect filesystem paths & sensitive details

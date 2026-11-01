@@ -112,6 +112,19 @@ MODULE_PATTERNS = [
     r"^([IVXLCDM]+)\.\s+([A-Z][A-Za-z0-9\s,\-–—]{3,60})$",
 ]
 
+# Pre-compiled regex patterns for high-throughput line processing
+COMPILED_NON_MODULE_HEADINGS = [re.compile(p, re.IGNORECASE) for p in NON_MODULE_HEADINGS]
+COMPILED_METADATA_FILTERS = [re.compile(p, re.IGNORECASE) for p in METADATA_FILTER_PATTERNS]
+COMPILED_MODULE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in MODULE_PATTERNS]
+COMPILED_HEADING_START = re.compile(
+    r"^(course\s+code|course\s+title|tpc\b|version\b|credits?\b|semester\b|academic\b|department\b|faculty\b|total\s*[:\s\-]|module\s+\d+|unit\s+\d+)",
+    re.IGNORECASE,
+)
+COMPILED_STANDALONE_START = re.compile(
+    r"^(department\b|faculty\b|credits?\b|semester\b|academic\b|total\s*[:\s\-]\s*\d+|tpc\b)",
+    re.IGNORECASE,
+)
+
 
 class ExtractedSyllabusData:
     def __init__(self):
@@ -153,18 +166,18 @@ class SyllabusStructureExtractor:
         for line in raw_lines:
             # Check if line starts an explicit boundary that should never be merged into buffer
             line_is_heading = bool(
-                re.match(r"^(course\s+code|course\s+title|tpc\b|version\b|credits?\b|semester\b|academic\b|department\b|faculty\b|total\s*[:\s\-]|module\s+\d+|unit\s+\d+)", line, re.IGNORECASE)
-                or any(re.match(p, line, re.IGNORECASE) for p in MODULE_PATTERNS)
-                or any(re.match(p, line, re.IGNORECASE) for p in NON_MODULE_HEADINGS)
-                or any(re.match(p, line, re.IGNORECASE) for p in METADATA_FILTER_PATTERNS)
+                COMPILED_HEADING_START.match(line)
+                or any(p.match(line) for p in COMPILED_MODULE_PATTERNS)
+                or any(p.match(line) for p in COMPILED_NON_MODULE_HEADINGS)
+                or any(p.match(line) for p in COMPILED_METADATA_FILTERS)
             )
 
             buffer_is_standalone = False
             if buffer:
                 buffer_is_standalone = (
-                    any(re.match(p, buffer, re.IGNORECASE) for p in MODULE_PATTERNS)
-                    or any(re.match(p, buffer, re.IGNORECASE) for p in NON_MODULE_HEADINGS)
-                    or re.match(r"^(department\b|faculty\b|credits?\b|semester\b|academic\b|total\s*[:\s\-]\s*\d+|tpc\b)", buffer, re.IGNORECASE)
+                    any(p.match(buffer) for p in COMPILED_MODULE_PATTERNS)
+                    or any(p.match(buffer) for p in COMPILED_NON_MODULE_HEADINGS)
+                    or COMPILED_STANDALONE_START.match(buffer)
                 )
 
             if line_is_heading or buffer_is_standalone:
@@ -845,8 +858,8 @@ class SyllabusStructureExtractor:
 
             # Check if this line starts an administrative non-module section
             matched_non_mod = False
-            for pat in NON_MODULE_HEADINGS:
-                if re.match(pat, lower):
+            for pat in COMPILED_NON_MODULE_HEADINGS:
+                if pat.match(lower):
                     matched_non_mod = True
                     if "objective" in lower:
                         current_section = "objectives"
@@ -867,8 +880,8 @@ class SyllabusStructureExtractor:
 
             # Check if this line is a genuine Module/Unit boundary
             matched_module = False
-            for pat in MODULE_PATTERNS:
-                m = re.match(pat, line, re.IGNORECASE)
+            for pat in COMPILED_MODULE_PATTERNS:
+                m = pat.match(line)
                 if m:
                     if current_mod_title or current_mod_lines:
                         module_blocks.append((current_mod_title, current_mod_lines))
@@ -1026,8 +1039,8 @@ class SyllabusStructureExtractor:
         lower = trimmed.lower()
 
         # Check filter patterns
-        for pat in METADATA_FILTER_PATTERNS:
-            if re.match(pat, trimmed, re.IGNORECASE):
+        for pat in COMPILED_METADATA_FILTERS:
+            if pat.match(trimmed):
                 return True
 
         # Check common administrative words

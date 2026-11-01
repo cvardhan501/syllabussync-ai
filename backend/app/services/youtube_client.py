@@ -85,9 +85,116 @@ def parse_iso8601_duration(iso_duration: str) -> tuple[int, str]:
 
 class YouTubeClientService:
     """
-    Client for YouTube Data API v3 with quota protection, SQLite query caching,
-    timeout resilience, deduplication, and local development fallback.
+    Client for YouTube Data API v3 with quota protection, SQLite/PostgreSQL query caching,
+    timeout resilience, deduplication, connection pooling, and local development fallback.
     """
+
+    _client: Optional[httpx.AsyncClient] = None
+
+    @classmethod
+    async def get_http_client(cls) -> httpx.AsyncClient:
+        """Returns or initializes shared httpx.AsyncClient with connection pooling and keep-alive."""
+        if cls._client is None or cls._client.is_closed:
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0)
+            cls._client = httpx.AsyncClient(timeout=10.0, limits=limits)
+        return cls._client
+
+    @classmethod
+    async def close_http_client(cls) -> None:
+        """Closes shared httpx.AsyncClient during application shutdown."""
+        if cls._client is not None and not cls._client.is_closed:
+            await cls._client.aclose()
+            cls._client = None
+
+    @classmethod
+    def _sanitize_log_text(cls, text: Any) -> str:
+        """Redacts API keys, credentials, and query secrets from log text."""
+        if not text:
+            return ""
+        return re.sub(r"([?&]key=)[^&\s]+", r"\1[REDACTED]", str(text))
+
+    @classmethod
+    def _handle_api_error_response(
+        cls,
+        resp: httpx.Response,
+        endpoint_name: str,
+        query: str,
+        language: str,
+        excluded_set: set,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        """
+        Parses Google API error responses safely without leaking credentials.
+        Returns fallback videos if in development mode; otherwise raises
+        descriptive YouTubeApiException subclasses.
+        """
+        status_code = resp.status_code
+        err_msg = ""
+        reasons: List[str] = []
+        try:
+            err_json = resp.json().get("error", {})
+            err_msg = err_json.get("message", "")
+            for e in err_json.get("errors", []):
+                if e.get("reason"):
+                    reasons.append(e.get("reason"))
+            for d in err_json.get("details", []):
+                if isinstance(d, dict) and d.get("reason"):
+                    reasons.append(d.get("reason"))
+        except Exception:
+            err_msg = resp.text[:200]
+
+        safe_query = cls._sanitize_log_text(query)
+        logger.warning(
+            f"YouTube API {endpoint_name} returned HTTP {status_code} for '{safe_query}': "
+            f"message='{err_msg}', reasons={reasons}"
+        )
+
+        # Quota exceeded or 429
+        if "quotaExceeded" in reasons or "dailyLimitExceeded" in reasons or status_code == 429:
+            if settings.allow_dev_fallback_youtube:
+                logger.warning("YouTube API quota/rate limit exceeded; using local educational fallback.")
+                fb = cls._generate_fallback_videos(query, language, excluded_set)
+                for v in fb:
+                    v["relevance_explanation"] = f"Quota fallback: {v.get('relevance_explanation', '')}"
+                return fb, True
+            raise YouTubeQuotaExceededException(
+                "YouTube Data API daily quota limit exceeded. Please check your Google Cloud Console quota."
+            )
+
+        # Auth / Key invalid or expired
+        is_key_error = (
+            "keyInvalid" in reasons
+            or "API_KEY_INVALID" in reasons
+            or "api key expired" in err_msg.lower()
+            or "invalid api key" in err_msg.lower()
+            or "renew the api key" in err_msg.lower()
+        )
+        if is_key_error:
+            if settings.allow_dev_fallback_youtube:
+                logger.warning("YouTube API key is invalid or expired; using local educational fallback.")
+                fb = cls._generate_fallback_videos(query, language, excluded_set)
+                for v in fb:
+                    v["relevance_explanation"] = f"Auth fallback: {v.get('relevance_explanation', '')}"
+                return fb, True
+            raise YouTubeAuthException(
+                "YouTube Data API key is expired or invalid. Please renew or verify YOUTUBE_API_KEY in Google Cloud Console."
+            )
+
+        # 403 Forbidden other
+        if status_code == 403:
+            raise YouTubeApiException(
+                f"YouTube API permission error: {err_msg or 'Access forbidden'}"
+            )
+
+        # 400 Bad Request
+        if status_code == 400:
+            raise YouTubeApiException(
+                f"YouTube API invalid request argument: {err_msg or 'Bad Request'}"
+            )
+
+        # Other HTTP errors (e.g. 500, 502)
+        raise YouTubeApiException(
+            f"YouTube Data API error (HTTP {status_code}): {err_msg or 'Request failed'}"
+        )
 
     @classmethod
     def _compute_query_hash(cls, query: str, language: str, max_results: int) -> str:
@@ -148,163 +255,186 @@ class YouTubeClientService:
         max_retries = 2
         search_resp = None
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            try:
-                search_params = {
-                    "part": "snippet",
-                    "type": "video",
-                    "q": f"{query} tutorial lecture educational",
-                    "maxResults": min(max_results * 2, 15),
-                    "relevanceLanguage": lang_code,
-                    "videoEmbeddable": "true",
-                    "safeSearch": "strict",
-                    "key": api_key,
-                }
+        client = await cls.get_http_client()
+        try:
+            search_params = {
+                "part": "snippet",
+                "type": "video",
+                "q": f"{query} tutorial lecture educational",
+                "maxResults": min(max_results * 2, 15),
+                "relevanceLanguage": lang_code,
+                "videoEmbeddable": "true",
+                "safeSearch": "strict",
+                "key": api_key,
+            }
 
-                for attempt in range(max_retries + 1):
-                    search_resp = await client.get(f"{YOUTUBE_BASE_URL}/search", params=search_params)
+            for attempt in range(max_retries + 1):
+                search_resp = await client.get(f"{YOUTUBE_BASE_URL}/search", params=search_params)
 
-                    if search_resp.status_code == 429 or search_resp.status_code == 503:
-                        if attempt < max_retries:
-                            backoff_sec = (1.5 ** attempt) + random.uniform(0.1, 0.4)
-                            logger.warning(
-                                f"YouTube API rate limited (HTTP {search_resp.status_code}) for '{query}'. "
-                                f"Backing off for {backoff_sec:.2f}s (retry {attempt + 1}/{max_retries})..."
-                            )
-                            await asyncio.sleep(backoff_sec)
-                            continue
-                        else:
-                            logger.warning(f"YouTube API rate limit (429) persisted after {max_retries} retries.")
-                            if settings.allow_dev_fallback_youtube:
-                                fb = cls._generate_fallback_videos(query, language, excluded_set)
-                                for v in fb:
-                                    v["relevance_explanation"] = f"Rate limit fallback: {v.get('relevance_explanation', '')}"
-                                return fb, True
-                            raise YouTubeQuotaExceededException("YouTube Data API rate limit exceeded (HTTP 429). Please retry later.")
+                if search_resp.status_code in (429, 503):
+                    if attempt < max_retries:
+                        backoff_sec = (1.5 ** attempt) + random.uniform(0.1, 0.4)
+                        logger.warning(
+                            f"YouTube API rate limited (HTTP {search_resp.status_code}) for '{cls._sanitize_log_text(query)}'. "
+                            f"Backing off for {backoff_sec:.2f}s (retry {attempt + 1}/{max_retries})..."
+                        )
+                        await asyncio.sleep(backoff_sec)
+                        continue
+                    else:
+                        logger.warning(f"YouTube API rate limit (429) persisted after {max_retries} retries.")
+                        return cls._handle_api_error_response(search_resp, "/search", query, language, excluded_set)
 
-                    # Not retryable (either 200, 400, 403, or other status)
+                # If non-retryable error, parse and handle immediately
+                if search_resp.status_code < 200 or search_resp.status_code >= 300:
+                    return cls._handle_api_error_response(search_resp, "/search", query, language, excluded_set)
+
+                break
+
+            if search_resp is None:
+                raise YouTubeConnectionException("No response received from YouTube Data API v3.")
+
+            search_data = search_resp.json()
+            items = search_data.get("items", [])
+
+            if not items:
+                return [], False
+
+            video_ids = [
+                item["id"]["videoId"]
+                for item in items
+                if item.get("id", {}).get("videoId")
+            ]
+
+            # Step B: Fetch detailed video metadata (durations, statistics)
+            details_params = {
+                "part": "snippet,contentDetails,statistics",
+                "id": ",".join(video_ids),
+                "key": api_key,
+            }
+
+            details_resp = None
+            for attempt in range(max_retries + 1):
+                details_resp = await client.get(f"{YOUTUBE_BASE_URL}/videos", params=details_params)
+
+                if details_resp.status_code in (429, 503):
+                    if attempt < max_retries:
+                        backoff_sec = (1.5 ** attempt) + random.uniform(0.1, 0.4)
+                        logger.warning(
+                            f"YouTube API /videos rate limited (HTTP {details_resp.status_code}) for '{cls._sanitize_log_text(query)}'. "
+                            f"Backing off for {backoff_sec:.2f}s (retry {attempt + 1}/{max_retries})..."
+                        )
+                        await asyncio.sleep(backoff_sec)
+                        continue
+                    else:
+                        logger.warning(f"YouTube API /videos rate limit (429) persisted after {max_retries} retries.")
+                        return cls._handle_api_error_response(details_resp, "/videos", query, language, excluded_set)
+
+                if details_resp.status_code < 200 or details_resp.status_code >= 300:
+                    return cls._handle_api_error_response(details_resp, "/videos", query, language, excluded_set)
+
+                break
+
+            if details_resp is None:
+                raise YouTubeConnectionException("No response received from YouTube Data API v3 /videos.")
+
+            details_data = details_resp.json()
+            video_items = details_data.get("items", [])
+
+            results = []
+            seen_video_ids = set()
+
+            for v in video_items:
+                v_id = v["id"]
+                if v_id in seen_video_ids:
+                    continue
+                seen_video_ids.add(v_id)
+
+                snippet = v.get("snippet", {})
+                content_details = v.get("contentDetails", {})
+                stats = v.get("statistics", {})
+
+                channel_title = snippet.get("channelTitle", "YouTube Educator")
+                if channel_title.strip().lower() in excluded_set:
+                    continue
+
+                # Parse duration
+                raw_duration = content_details.get("duration", "PT0S")
+                duration_sec, duration_fmt = parse_iso8601_duration(raw_duration)
+
+                # Thumbnails
+                thumbs = snippet.get("thumbnails", {})
+                thumb_url = (
+                    thumbs.get("high", {}).get("url")
+                    or thumbs.get("medium", {}).get("url")
+                    or thumbs.get("default", {}).get("url")
+                    or f"https://i.ytimg.com/vi/{v_id}/hqdefault.jpg"
+                )
+
+                view_count = int(stats.get("viewCount", 0))
+
+                results.append({
+                    "id": v_id,
+                    "video_id": v_id,
+                    "title": snippet.get("title", "Educational Video"),
+                    "description": snippet.get("description", ""),
+                    "channel_title": channel_title,
+                    "channel_id": snippet.get("channelId"),
+                    "thumbnail_url": thumb_url,
+                    "duration_seconds": duration_sec,
+                    "duration_formatted": duration_fmt,
+                    "language": language,
+                    "published_at": snippet.get("publishedAt"),
+                    "view_count": view_count,
+                    "relevance_score": 0.85,
+                    "relevance_explanation": f"Official educational video from {channel_title}.",
+                    "is_uncertain": False,
+                    "provenance": "live",
+                    "video_url": f"https://www.youtube.com/watch?v={v_id}",
+                    "availability_status": "available",
+                })
+
+                if len(results) >= max_results:
                     break
 
-                if search_resp is None:
-                    raise YouTubeConnectionException("No response received from YouTube Data API v3.")
+            # Save to cache
+            save_cached_search(query_hash, query, lang_code, results)
+            return results, False
 
-                if search_resp.status_code == 403:
-                    error_json = search_resp.json().get("error", {})
-                    errors = error_json.get("errors", [])
-                    reasons = [e.get("reason") for e in errors]
-                    if "quotaExceeded" in reasons or "dailyLimitExceeded" in reasons:
-                        logger.warning("YouTube API daily quota exceeded. Falling back if permitted.")
-                        if settings.allow_dev_fallback_youtube:
-                            fb = cls._generate_fallback_videos(query, language, excluded_set)
-                            for v in fb:
-                                v["relevance_explanation"] = f"Quota exceeded fallback: {v.get('relevance_explanation', '')}"
-                            return fb, True
-                        raise YouTubeQuotaExceededException(
-                            "YouTube Data API daily quota limit exceeded. Please check your Google Cloud Console quota."
-                        )
-                    elif "keyInvalid" in reasons or "API_KEY_INVALID" in reasons:
-                        raise YouTubeAuthException("Configured YOUTUBE_API_KEY is invalid or unauthorized.")
-                    else:
-                        raise YouTubeApiException(f"YouTube API permission error: {error_json.get('message', 'Forbidden')}")
+        except httpx.TimeoutException:
+            logger.error(f"Timeout connecting to YouTube Data API v3 for '{cls._sanitize_log_text(query)}'.")
+            if settings.allow_dev_fallback_youtube:
+                return cls._generate_fallback_videos(query, language, excluded_set), True
+            raise YouTubeConnectionException("YouTube Data API request timed out. Please check your internet connection.")
+        except httpx.RequestError as exc:
+            logger.error(f"Network error during YouTube Data API request: {cls._sanitize_log_text(str(exc))}")
+            if settings.allow_dev_fallback_youtube:
+                return cls._generate_fallback_videos(query, language, excluded_set), True
+            raise YouTubeConnectionException(f"Network error contacting YouTube: {cls._sanitize_log_text(str(exc))}")
 
-                elif search_resp.status_code == 400:
-                    raise YouTubeAuthException("YouTube API request was rejected (invalid API key or parameter).")
+    @classmethod
+    async def search_videos_batch(
+        cls,
+        requests: List[Dict[str, Any]],
+        concurrency_limit: int = 5,
+    ) -> List[tuple[List[Dict[str, Any]], bool]]:
+        """
+        Searches videos for multiple queries concurrently with bounded asynchronous concurrency.
+        Requests format: [{"query": str, "language": str, "max_results": int, "force_refresh": bool, "excluded_channels": ...}]
+        """
+        import asyncio
+        sem = asyncio.Semaphore(concurrency_limit)
 
-                search_resp.raise_for_status()
-                search_data = search_resp.json()
-                items = search_data.get("items", [])
+        async def _bounded_search(req: Dict[str, Any]) -> tuple[List[Dict[str, Any]], bool]:
+            async with sem:
+                return await cls.search_videos(
+                    query=req["query"],
+                    language=req.get("language", "English"),
+                    max_results=req.get("max_results"),
+                    force_refresh=req.get("force_refresh", False),
+                    excluded_channels=req.get("excluded_channels"),
+                )
 
-                if not items:
-                    return [], False
-
-                video_ids = [
-                    item["id"]["videoId"]
-                    for item in items
-                    if item.get("id", {}).get("videoId")
-                ]
-
-                # Step B: Fetch detailed video metadata (durations, statistics)
-                details_params = {
-                    "part": "snippet,contentDetails,statistics",
-                    "id": ",".join(video_ids),
-                    "key": api_key,
-                }
-
-                details_resp = await client.get(f"{YOUTUBE_BASE_URL}/videos", params=details_params)
-                details_resp.raise_for_status()
-                details_data = details_resp.json()
-                video_items = details_data.get("items", [])
-
-                results = []
-                seen_video_ids = set()
-
-                for v in video_items:
-                    v_id = v["id"]
-                    if v_id in seen_video_ids:
-                        continue
-                    seen_video_ids.add(v_id)
-
-                    snippet = v.get("snippet", {})
-                    content_details = v.get("contentDetails", {})
-                    stats = v.get("statistics", {})
-
-                    channel_title = snippet.get("channelTitle", "YouTube Educator")
-                    if channel_title.strip().lower() in excluded_set:
-                        continue
-
-                    # Parse duration
-                    raw_duration = content_details.get("duration", "PT0S")
-                    duration_sec, duration_fmt = parse_iso8601_duration(raw_duration)
-
-                    # Thumbnails
-                    thumbs = snippet.get("thumbnails", {})
-                    thumb_url = (
-                        thumbs.get("high", {}).get("url")
-                        or thumbs.get("medium", {}).get("url")
-                        or thumbs.get("default", {}).get("url")
-                        or f"https://i.ytimg.com/vi/{v_id}/hqdefault.jpg"
-                    )
-
-                    view_count = int(stats.get("viewCount", 0))
-
-                    results.append({
-                        "id": v_id,
-                        "video_id": v_id,
-                        "title": snippet.get("title", "Educational Video"),
-                        "description": snippet.get("description", ""),
-                        "channel_title": channel_title,
-                        "channel_id": snippet.get("channelId"),
-                        "thumbnail_url": thumb_url,
-                        "duration_seconds": duration_sec,
-                        "duration_formatted": duration_fmt,
-                        "language": language,
-                        "published_at": snippet.get("publishedAt"),
-                        "view_count": view_count,
-                        "relevance_score": 0.85,
-                        "relevance_explanation": f"Official educational video from {channel_title}.",
-                        "is_uncertain": False,
-                        "provenance": "live",
-                        "video_url": f"https://www.youtube.com/watch?v={v_id}",
-                        "availability_status": "available",
-                    })
-
-                    if len(results) >= max_results:
-                        break
-
-                # Save to cache
-                save_cached_search(query_hash, query, lang_code, results)
-                return results, False
-
-            except httpx.TimeoutException:
-                logger.error("Timeout connecting to YouTube Data API v3.")
-                if settings.allow_dev_fallback_youtube:
-                    return cls._generate_fallback_videos(query, language, excluded_set), True
-                raise YouTubeConnectionException("YouTube Data API request timed out. Please check your internet connection.")
-            except httpx.RequestError as exc:
-                logger.error(f"Network error during YouTube Data API request: {str(exc)}")
-                if settings.allow_dev_fallback_youtube:
-                    return cls._generate_fallback_videos(query, language, excluded_set), True
-                raise YouTubeConnectionException(f"Network error contacting YouTube: {str(exc)}")
+        return await asyncio.gather(*[_bounded_search(r) for r in requests])
 
     @classmethod
     def _generate_fallback_videos(

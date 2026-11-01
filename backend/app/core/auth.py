@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 import jwt
 from jwt import PyJWK
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from app.core.config import settings
 
 logger = logging.getLogger("syllabus_sync.auth")
@@ -551,28 +551,19 @@ def verify_ownership(
                 )
 
 
-async def verify_diagnostics_access(
+def check_is_admin(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
-) -> None:
+) -> bool:
     """
-    Secures diagnostics and test probe endpoints in production.
-    - In development/test: unrestricted for local UI diagnostics.
-    - In production: requires either:
-        a) Valid X-Admin-Key header matching settings.admin_api_key, OR
-        b) Valid Supabase JWT with role in ('service_role', 'admin', 'supabase_admin')
-           or app_metadata.is_admin is True.
-      Otherwise raises HTTP 403 Forbidden.
+    Returns True if caller has verified administrative privileges:
+    1. Valid X-Admin-Key header matching settings.admin_api_key, OR
+    2. Valid Supabase JWT with administrative role or claim.
     """
-    if not settings.is_production:
-        return
-
-    # Check X-Admin-Key header
     if settings.admin_api_key and x_admin_key:
         if hmac.compare_digest(x_admin_key.strip(), settings.admin_api_key.strip()):
-            return
+            return True
 
-    # Check Bearer JWT claims
     if authorization and authorization.startswith("Bearer "):
         token = authorization[7:].strip()
         try:
@@ -580,11 +571,75 @@ async def verify_diagnostics_access(
             role = claims.get("role")
             app_meta = claims.get("app_metadata", {})
             if role in ("service_role", "admin", "supabase_admin") or app_meta.get("is_admin") is True:
-                return
+                return True
         except Exception:
             pass
 
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Access denied: Administrative privileges required to access diagnostics in production.",
-    )
+    return False
+
+
+async def require_admin_access(
+    is_admin: bool = Depends(check_is_admin),
+) -> None:
+    """
+    Strictly enforces administrative privileges for restricted operations in production.
+    Raises HTTP 403 Forbidden if not an administrator.
+    """
+    if not settings.is_production:
+        return
+    if not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrative privileges required for this operation.",
+        )
+
+
+async def verify_diagnostics_access(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+) -> Optional[str]:
+    """
+    Secures diagnostics endpoints in production:
+    - In production: permits callers with valid X-Admin-Key OR valid authenticated Supabase JWT.
+    - Otherwise raises HTTP 401 Unauthorized.
+    """
+    if not settings.is_production:
+        return "dev-user"
+
+    # 1. Admin key authentication
+    if settings.admin_api_key and x_admin_key:
+        if hmac.compare_digest(x_admin_key.strip(), settings.admin_api_key.strip()):
+            return "admin-api-key"
+
+    # 2. Supabase Bearer JWT authentication (for standard users and admins)
+    if not authorization or not authorization.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required: Missing Authorization header in production.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication scheme: Bearer token is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token: Token payload is empty.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        return verify_supabase_jwt(token)
+    except Exception as e:
+        logger.warning(f"Diagnostics JWT verification failure: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid or expired authentication token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )

@@ -6,6 +6,7 @@ import {
   Sun, 
   Server, 
   ShieldCheck, 
+  AlertCircle,
   ChevronDown,
   Sparkles, 
   Save, 
@@ -54,18 +55,32 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   // Diagnostics state
   const [diagnostics, setDiagnostics] = useState<SystemDiagnosticsResponse | null>(null);
   const [isLoadingDiagnostics, setIsLoadingDiagnostics] = useState(false);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [youtubeTestResult, setYoutubeTestResult] = useState<DiagnosticTestResult | null>(null);
   const [isTestingYouTube, setIsTestingYouTube] = useState(false);
   const [strandsTestResult, setStrandsTestResult] = useState<DiagnosticTestResult | null>(null);
   const [isTestingStrands, setIsTestingStrands] = useState(false);
 
+  // Clean up any legacy shared admin key from browser localStorage to enforce security policies
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('syllabussync_admin_key');
+    }
+  }, []);
+
   const fetchDiagnostics = async () => {
     setIsLoadingDiagnostics(true);
+    setDiagnosticsError(null);
     try {
       const data = await apiService.getDiagnostics();
       setDiagnostics(data);
-    } catch {
-      // Graceful fallback
+    } catch (err: any) {
+      setDiagnostics(null);
+      if (err.status === 401) {
+        setDiagnosticsError('Authentication required. Please sign in to view live service diagnostics.');
+      } else {
+        setDiagnosticsError(err.message || 'Failed to retrieve live system diagnostics.');
+      }
     } finally {
       setIsLoadingDiagnostics(false);
     }
@@ -81,7 +96,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
     try {
       const res = await apiService.testYouTubeApi();
       setYoutubeTestResult(res);
-      fetchDiagnostics();
+      await fetchDiagnostics();
     } catch (err: any) {
       setYoutubeTestResult({
         service: 'YouTube Data API v3',
@@ -101,6 +116,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
     try {
       const res = await apiService.testStrandsModel();
       setStrandsTestResult(res);
+      await fetchDiagnostics();
     } catch (err: any) {
       setStrandsTestResult({
         service: 'Strands Agents SDK',
@@ -439,11 +455,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   System Diagnostics & Service Health
                 </h3>
                 <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full uppercase tracking-wider ${
-                  diagnostics?.status === 'healthy'
+                  diagnostics?.status === 'healthy' || diagnostics?.status === 'success'
                     ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                    : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                    : diagnosticsError
+                    ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+                    : 'bg-slate-500/15 text-slate-300 border border-slate-500/30'
                 }`}>
-                  {diagnostics?.status || 'Active'}
+                  {diagnostics?.status || (diagnosticsError ? 'Unavailable' : 'Checking')}
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 m-0">
@@ -463,6 +481,21 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
           </button>
         </div>
 
+        {/* Diagnostics Error Banner */}
+        {diagnosticsError && (
+          <div className="rounded-xl bg-amber-950/20 border border-amber-500/30 p-3.5 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <p className="text-xs font-semibold text-amber-200 m-0">
+                Live Diagnostics Unavailable
+              </p>
+              <p className="text-[11px] text-amber-300/80 leading-relaxed m-0">
+                {diagnosticsError}
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* 4 Diagnostics Cards Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
           {/* Card 1: FastAPI Backend */}
@@ -473,58 +506,72 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 <span>FastAPI Service</span>
               </div>
               <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
-                diagnostics?.backend.status === 'ok'
-                  ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
-                  : 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
+                diagnostics
+                  ? (diagnostics.backend.status === 'ok' || diagnostics.backend.status === 'healthy'
+                      ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
+                      : 'bg-amber-950/40 text-amber-300 border border-amber-800/50')
+                  : 'bg-slate-800 text-slate-400'
               }`}>
-                {diagnostics?.backend.status || 'healthy'}
+                {diagnostics?.backend.status || (isLoadingDiagnostics ? 'checking' : 'unavailable')}
               </span>
             </div>
 
             <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
               <div className="flex justify-between">
                 <span className="text-slate-400">Environment:</span>
-                <span className="text-white">{diagnostics?.backend.environment || 'development'}</span>
+                <span className="text-white font-semibold">
+                  {diagnostics ? diagnostics.backend.environment : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">App Version:</span>
-                <span className="text-white">{diagnostics?.backend.version || '0.2.0'}</span>
+                <span className="text-white">
+                  {diagnostics ? diagnostics.backend.version : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Health Status:</span>
-                <span className="text-emerald-400 font-bold">{diagnostics?.backend.status || 'healthy'}</span>
+                <span className={diagnostics ? 'text-emerald-400 font-bold' : 'text-slate-500 font-mono'}>
+                  {diagnostics ? diagnostics.backend.status : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
               </div>
             </div>
           </div>
 
-          {/* Card 2: SQLite Database */}
+          {/* Card 2: Database */}
           <div className="rounded-xl bg-[#070b14] border border-[#1b2b52] p-4 space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-blue-400 font-semibold">
                 <Database className="w-4 h-4" />
-                <span>SQLite Database</span>
+                <span>Database</span>
               </div>
               <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
                 diagnostics?.database.status === 'connected'
                   ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
-                  : 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
+                  : 'bg-slate-800 text-slate-400'
               }`}>
-                {diagnostics?.database.status || 'connected'}
+                {diagnostics?.database.status || (isLoadingDiagnostics ? 'checking' : 'unavailable')}
               </span>
             </div>
 
             <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
               <div className="flex justify-between">
                 <span className="text-slate-400">Engine:</span>
-                <span className="text-white">{diagnostics?.database.engine || 'SQLite'}</span>
+                <span className="text-white font-semibold">
+                  {diagnostics ? diagnostics.database.engine : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Tables Count:</span>
-                <span className="text-white">{diagnostics?.database.tables_count ?? 11} tables</span>
+                <span className="text-white">
+                  {diagnostics ? `${diagnostics.database.tables_count} tables` : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Connection:</span>
-                <span className="text-emerald-400 font-bold">Active & Verified</span>
+                <span className={diagnostics?.database.status === 'connected' ? 'text-emerald-400 font-bold' : 'text-slate-500 font-mono'}>
+                  {diagnostics ? (diagnostics.database.status === 'connected' ? 'Active & Verified' : 'Error') : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
               </div>
             </div>
           </div>
@@ -539,27 +586,57 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
                 diagnostics?.strands.credentials_configured
                   ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
-                  : 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
+                  : 'bg-slate-800 text-slate-400'
               }`}>
-                {diagnostics?.strands.active_mode || 'live'}
+                {diagnostics?.strands.active_mode || (isLoadingDiagnostics ? 'checking' : 'unavailable')}
               </span>
             </div>
 
             <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
               <div className="flex justify-between">
                 <span className="text-slate-400">Provider:</span>
-                <span className="text-white">{diagnostics?.strands.provider || 'bedrock'}</span>
+                <span className="text-white">
+                  {diagnostics ? diagnostics.strands.provider : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Model:</span>
-                <span className="text-white truncate max-w-[200px]" title={diagnostics?.strands.model}>
-                  {diagnostics?.strands.model || 'Claude 3.5 Sonnet'}
+                <span className="text-white font-semibold truncate max-w-[200px]" title={diagnostics?.strands.model}>
+                  {diagnostics ? diagnostics.strands.model : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">AWS Region:</span>
+                <span className="text-white">
+                  {diagnostics ? (diagnostics.strands.region || '—') : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Credentials:</span>
-                <span className={diagnostics?.strands.credentials_configured ? 'text-emerald-400 font-bold' : 'text-amber-400 font-bold'}>
-                  {diagnostics?.strands.credentials_summary || 'Configured'}
+                <span className={diagnostics?.strands.credentials_configured ? 'text-emerald-400 font-bold' : 'text-slate-400'}>
+                  {diagnostics ? diagnostics.strands.credentials_summary : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Connectivity:</span>
+                <span className={`font-bold ${
+                  diagnostics?.strands.connectivity_status === 'verified'
+                    ? 'text-emerald-400'
+                    : diagnostics?.strands.connectivity_status === 'unverified'
+                    ? 'text-sky-400'
+                    : diagnostics?.strands.connectivity_status === 'missing'
+                    ? 'text-amber-400'
+                    : 'text-rose-400'
+                }`}>
+                  {diagnostics
+                    ? (diagnostics.strands.connectivity_status === 'verified'
+                        ? 'Verified (Live)'
+                        : diagnostics.strands.connectivity_status === 'unverified'
+                        ? 'Configured (Unprobed)'
+                        : diagnostics.strands.connectivity_status === 'missing'
+                        ? 'Credentials Missing'
+                        : 'Connection Failed')
+                    : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
                 </span>
               </div>
             </div>
@@ -575,7 +652,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   {isTestingStrands ? (
                     <>
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      <span>Probing Model...</span>
+                      <span>Probing Bedrock...</span>
                     </>
                   ) : (
                     <>
@@ -609,7 +686,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   <p className="m-0 font-bold">{strandsTestResult.message}</p>
                   {strandsTestResult.status === 'model_not_available' && (
                     <p className="mt-1.5 text-[9.5px] text-amber-400/90 font-sans">
-                      Tip: Amazon Nova models (<code className="text-amber-200">amazon.nova-lite-v1:0</code>) are verified active and ready on this account without third-party form approval.
+                      Tip: Confirm Amazon Nova Lite (<code className="text-amber-200">amazon.nova-lite-v1:0</code>) is enabled under Bedrock Model Access in region <code className="text-amber-200">ap-southeast-2</code>.
                     </p>
                   )}
                 </div>
@@ -627,28 +704,56 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
                 diagnostics?.youtube.key_configured
                   ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
-                  : 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
+                  : 'bg-slate-800 text-slate-400'
               }`}>
-                {diagnostics?.youtube.active_mode || 'live'}
+                {diagnostics?.youtube.active_mode || (isLoadingDiagnostics ? 'checking' : 'unavailable')}
               </span>
             </div>
 
             <div className="space-y-1.5 text-slate-300 font-mono text-[11px]">
               <div className="flex justify-between">
                 <span className="text-slate-400">Active Mode:</span>
-                <span className={diagnostics?.youtube.active_mode === 'live' ? 'text-emerald-400 font-bold' : 'text-amber-400 font-bold'}>
-                  {diagnostics?.youtube.active_mode === 'live' ? 'Live YouTube API' : 'Dev Fallback'}
+                <span className={diagnostics?.youtube.active_mode === 'live' ? 'text-emerald-400 font-bold' : 'text-slate-300'}>
+                  {diagnostics
+                    ? (diagnostics.youtube.active_mode === 'live' ? 'Live YouTube API' : 'Dev Fallback')
+                    : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">API Key:</span>
-                <span className={diagnostics?.youtube.key_configured ? 'text-emerald-400 font-bold' : 'text-amber-400 font-bold'}>
-                  {diagnostics?.youtube.key_summary || 'Configured (Isolated)'}
+                <span className={diagnostics?.youtube.key_configured ? 'text-emerald-400 font-bold' : 'text-slate-400'}>
+                  {diagnostics ? diagnostics.youtube.key_summary : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Connectivity:</span>
+                <span className={`font-bold ${
+                  diagnostics?.youtube.connectivity_status === 'verified'
+                    ? 'text-emerald-400'
+                    : diagnostics?.youtube.connectivity_status === 'unverified'
+                    ? 'text-sky-400'
+                    : diagnostics?.youtube.connectivity_status === 'quota_exceeded'
+                    ? 'text-amber-400'
+                    : 'text-rose-400'
+                }`}>
+                  {diagnostics
+                    ? (diagnostics.youtube.connectivity_status === 'verified'
+                        ? 'Verified (Live)'
+                        : diagnostics.youtube.connectivity_status === 'unverified'
+                        ? 'Configured (Unprobed)'
+                        : diagnostics.youtube.connectivity_status === 'quota_exceeded'
+                        ? 'Quota Exceeded'
+                        : diagnostics.youtube.connectivity_status === 'missing'
+                        ? 'Key Missing'
+                        : 'Invalid / Expired')
+                    : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Cached Queries:</span>
-                <span className="text-white">{diagnostics?.youtube.cached_queries_count ?? 0}</span>
+                <span className="text-white">
+                  {diagnostics ? `${diagnostics.youtube.cached_queries_count} queries` : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                </span>
               </div>
             </div>
 
@@ -663,7 +768,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   {isTestingYouTube ? (
                     <>
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      <span>Probing API...</span>
+                      <span>Probing YouTube...</span>
                     </>
                   ) : (
                     <>

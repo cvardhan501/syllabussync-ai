@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import { 
   LayoutDashboard, 
   BookOpen, 
@@ -11,14 +11,25 @@ import {
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { GuideModal } from './components/GuideModal';
-import { DashboardPage } from './pages/DashboardPage';
-import { CoursesPage } from './pages/CoursesPage';
-import { SyllabusPage } from './pages/SyllabusPage';
-import { VideoLibraryPage } from './pages/VideoLibraryPage';
-import { StudyPlanPage } from './pages/StudyPlanPage';
-import { ProgressPage } from './pages/ProgressPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { LoginPage } from './pages/LoginPage';
+
+// Code-split pages for sub-second bundle loading and optimized initial paint
+const DashboardPage = lazy(() => import('./pages/DashboardPage').then(m => ({ default: m.DashboardPage })));
+const CoursesPage = lazy(() => import('./pages/CoursesPage').then(m => ({ default: m.CoursesPage })));
+const SyllabusPage = lazy(() => import('./pages/SyllabusPage').then(m => ({ default: m.SyllabusPage })));
+const VideoLibraryPage = lazy(() => import('./pages/VideoLibraryPage').then(m => ({ default: m.VideoLibraryPage })));
+const StudyPlanPage = lazy(() => import('./pages/StudyPlanPage').then(m => ({ default: m.StudyPlanPage })));
+const ProgressPage = lazy(() => import('./pages/ProgressPage').then(m => ({ default: m.ProgressPage })));
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })));
+const LoginPage = lazy(() => import('./pages/LoginPage').then(m => ({ default: m.LoginPage })));
+
+const PageLoadingFallback: React.FC = () => (
+  <div className="flex items-center justify-center min-h-[350px]">
+    <div className="flex flex-col items-center gap-3">
+      <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+      <span className="text-xs text-slate-400">Loading view...</span>
+    </div>
+  </div>
+);
 import type { 
   NavigationTab, 
   HealthResponse, 
@@ -365,7 +376,11 @@ export const App: React.FC = () => {
 
   // 2. Unauthenticated user gate
   if (!session && !isDevBypass) {
-    return <LoginPage onBypassDevMode={() => setIsDevBypass(true)} />;
+    return (
+      <Suspense fallback={<PageLoadingFallback />}>
+        <LoginPage onBypassDevMode={() => setIsDevBypass(true)} />
+      </Suspense>
+    );
   }
 
   return (
@@ -404,90 +419,92 @@ export const App: React.FC = () => {
         />
 
         <main className="flex-1 p-4 sm:p-7 overflow-y-auto pb-24 md:pb-8">
-          {currentTab === 'dashboard' && (
-            <DashboardPage
-              onNavigate={setCurrentTab}
-              uploadedSyllabus={uploadedSyllabus}
-              analyzedSyllabus={analyzedSyllabus}
-              studyPlan={studyPlan}
-              discoveryData={discoveryData}
-            />
-          )}
+          <Suspense fallback={<PageLoadingFallback />}>
+            {currentTab === 'dashboard' && (
+              <DashboardPage
+                onNavigate={setCurrentTab}
+                uploadedSyllabus={uploadedSyllabus}
+                analyzedSyllabus={analyzedSyllabus}
+                studyPlan={studyPlan}
+                discoveryData={discoveryData}
+              />
+            )}
 
-          {currentTab === 'courses' && (
-            <CoursesPage
-              courses={courses}
-              activeCourseId={activeCourse?.id || null}
-              onSelectCourse={(c) => {
-                setActiveCourse(c);
-                setCurrentTab('syllabus');
-              }}
-              onOpenUploadWizard={() => {
-                setActiveCourse(null);
-                setUploadedSyllabus(null);
-                setAnalyzedSyllabus(null);
-                setCurrentTab('syllabus');
-              }}
-              onRefreshCourses={refreshCourses}
-              onNavigate={setCurrentTab}
-            />
-          )}
+            {currentTab === 'courses' && (
+              <CoursesPage
+                courses={courses}
+                activeCourseId={activeCourse?.id || null}
+                onSelectCourse={(c) => {
+                  setActiveCourse(c);
+                  setCurrentTab('syllabus');
+                }}
+                onOpenUploadWizard={() => {
+                  setActiveCourse(null);
+                  setUploadedSyllabus(null);
+                  setAnalyzedSyllabus(null);
+                  setCurrentTab('syllabus');
+                }}
+                onRefreshCourses={refreshCourses}
+                onNavigate={setCurrentTab}
+              />
+            )}
 
-          {currentTab === 'syllabus' && (
-            <SyllabusPage
-              uploadedSyllabus={uploadedSyllabus}
-              onSyllabusUploaded={setUploadedSyllabus}
-              analyzedSyllabus={analyzedSyllabus}
-              onAnalysisComplete={setAnalyzedSyllabus}
-              onNavigateToStudyPlan={() => setCurrentTab('study-plan')}
-              onCourseCreated={(c) => {
-                refreshCourses();
-                setActiveCourse(c);
-              }}
-            />
-          )}
+            {currentTab === 'syllabus' && (
+              <SyllabusPage
+                uploadedSyllabus={uploadedSyllabus}
+                onSyllabusUploaded={setUploadedSyllabus}
+                analyzedSyllabus={analyzedSyllabus}
+                onAnalysisComplete={setAnalyzedSyllabus}
+                onNavigateToStudyPlan={() => setCurrentTab('study-plan')}
+                onCourseCreated={(c) => {
+                  refreshCourses();
+                  setActiveCourse(c);
+                }}
+              />
+            )}
 
-          {currentTab === 'videos' && (
-            <VideoLibraryPage
-              analyzedSyllabus={analyzedSyllabus}
-              onNavigateToSyllabus={() => setCurrentTab('syllabus')}
-              preferredLanguage={preferences.preferredLanguage}
-              onDiscoveryUpdated={setDiscoveryData}
-              courses={courses}
-              activeCourse={activeCourse}
-              onSelectCourse={setActiveCourse}
-            />
-          )}
+            {currentTab === 'videos' && (
+              <VideoLibraryPage
+                analyzedSyllabus={analyzedSyllabus}
+                onNavigateToSyllabus={() => setCurrentTab('syllabus')}
+                preferredLanguage={preferences.preferredLanguage}
+                onDiscoveryUpdated={setDiscoveryData}
+                courses={courses}
+                activeCourse={activeCourse}
+                onSelectCourse={setActiveCourse}
+              />
+            )}
 
-          {currentTab === 'study-plan' && (
-            <StudyPlanPage
-              analyzedSyllabus={analyzedSyllabus}
-              onNavigate={setCurrentTab}
-              examDate={preferences.examDate}
-              onPlanUpdated={setStudyPlan}
-            />
-          )}
+            {currentTab === 'study-plan' && (
+              <StudyPlanPage
+                analyzedSyllabus={analyzedSyllabus}
+                onNavigate={setCurrentTab}
+                examDate={preferences.examDate}
+                onPlanUpdated={setStudyPlan}
+              />
+            )}
 
-          {currentTab === 'progress' && (
-            <ProgressPage
-              uploadedSyllabus={uploadedSyllabus}
-              analyzedSyllabus={analyzedSyllabus}
-              studyPlan={studyPlan}
-              discoveryData={discoveryData}
-              onNavigate={setCurrentTab}
-              activeCourse={activeCourse}
-              courses={courses}
-              onSelectCourse={setActiveCourse}
-            />
-          )}
+            {currentTab === 'progress' && (
+              <ProgressPage
+                uploadedSyllabus={uploadedSyllabus}
+                analyzedSyllabus={analyzedSyllabus}
+                studyPlan={studyPlan}
+                discoveryData={discoveryData}
+                onNavigate={setCurrentTab}
+                activeCourse={activeCourse}
+                courses={courses}
+                onSelectCourse={setActiveCourse}
+              />
+            )}
 
-          {currentTab === 'settings' && (
-            <SettingsPage
-              health={health}
-              preferences={preferences}
-              onSavePreferences={handleUpdatePreferences}
-            />
-          )}
+            {currentTab === 'settings' && (
+              <SettingsPage
+                health={health}
+                preferences={preferences}
+                onSavePreferences={handleUpdatePreferences}
+              />
+            )}
+          </Suspense>
         </main>
       </div>
 

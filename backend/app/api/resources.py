@@ -19,6 +19,7 @@ from app.schemas.resource import (
 )
 from app.services.resource_matcher import ResourceMatcherService
 from app.services.youtube_client import (
+    YouTubeApiException,
     YouTubeAuthException,
     YouTubeQuotaExceededException,
     YouTubeConnectionException,
@@ -64,10 +65,20 @@ async def discover_channels(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"YouTube Quota Exceeded: {str(e)}",
         )
+    except YouTubeAuthException as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"YouTube Authentication Error: {str(e)}",
+        )
     except YouTubeConnectionException as e:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"YouTube Connection Timeout: {str(e)}",
+        )
+    except YouTubeApiException as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"YouTube API Error: {str(e)}",
         )
 
 
@@ -107,6 +118,21 @@ async def preview_strategy(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"YouTube Quota Exceeded: {str(e)}",
         )
+    except YouTubeAuthException as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"YouTube Authentication Error: {str(e)}",
+        )
+    except YouTubeConnectionException as e:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"YouTube Connection Timeout: {str(e)}",
+        )
+    except YouTubeApiException as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"YouTube API Error: {str(e)}",
+        )
 
 
 @router.post(
@@ -144,6 +170,21 @@ async def confirm_strategy(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"YouTube Quota Exceeded: {str(e)}",
+        )
+    except YouTubeAuthException as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"YouTube Authentication Error: {str(e)}",
+        )
+    except YouTubeConnectionException as e:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"YouTube Connection Timeout: {str(e)}",
+        )
+    except YouTubeApiException as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"YouTube API Error: {str(e)}",
         )
 
 
@@ -192,6 +233,11 @@ async def discover_resources(
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"YouTube Connection Timeout: {str(e)}",
+        )
+    except YouTubeApiException as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"YouTube API Error: {str(e)}",
         )
 
 

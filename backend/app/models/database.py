@@ -2,6 +2,7 @@ import sqlite3
 import os
 import json
 import datetime
+import time
 import uuid
 import re
 import logging
@@ -1062,8 +1063,22 @@ def get_syllabus_hierarchy(syllabus_id: str, owner_user_id: Optional[str] = None
 # Phase 3: YouTube Resources and Topic Matching Database Helpers
 # ==============================================================================
 
+_IN_MEMORY_SEARCH_CACHE: Dict[str, Tuple[float, Any]] = {}
+_SEARCH_CACHE_TTL = 900.0  # 15 minutes
+
+
 def get_cached_search(query_hash: str) -> Optional[Dict[str, Any]]:
-    """Retrieves cached YouTube search results if present."""
+    """Retrieves cached YouTube search results, checking in-memory cache first."""
+    now = time.time()
+    if query_hash in _IN_MEMORY_SEARCH_CACHE:
+        ts, data = _IN_MEMORY_SEARCH_CACHE[query_hash]
+        if now - ts < _SEARCH_CACHE_TTL:
+            if isinstance(data, list):
+                return [dict(v) for v in data]
+            return data
+        else:
+            del _IN_MEMORY_SEARCH_CACHE[query_hash]
+
     with get_db_connection() as conn:
         row = conn.execute(
             "SELECT response_json FROM youtube_search_cache WHERE query_hash = ?",
@@ -1071,11 +1086,16 @@ def get_cached_search(query_hash: str) -> Optional[Dict[str, Any]]:
         ).fetchone()
         if not row:
             return None
-        return _safe_json_loads(row["response_json"], default=None)
+        data = _safe_json_loads(row["response_json"], default=None)
+        if data:
+            _IN_MEMORY_SEARCH_CACHE[query_hash] = (now, data)
+        return data
 
 
 def save_cached_search(query_hash: str, query: str, language: Optional[str], response_dict: Dict[str, Any]) -> None:
-    """Caches YouTube search results to avoid quota exhaustion."""
+    """Caches YouTube search results to avoid quota exhaustion, updating in-memory cache immediately."""
+    now = time.time()
+    _IN_MEMORY_SEARCH_CACHE[query_hash] = (now, response_dict)
     with get_db_connection() as conn:
         if is_postgres():
             conn.execute(
@@ -1550,6 +1570,26 @@ def get_topic_rejected_channels(syllabus_id: str, topic_id: str) -> List[str]:
             (syllabus_id, topic_id, alt_id)
         ).fetchall()
         return [r["channel_title"] for r in rows]
+
+
+def get_all_rejected_channels_for_syllabus(syllabus_id: str) -> Dict[str, List[str]]:
+    """Returns a dictionary mapping topic_id -> list of rejected channel names for all topics in 1 query."""
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT topic_id, channel_title FROM rejected_channels WHERE syllabus_id = ?",
+            (syllabus_id,)
+        ).fetchall()
+        result: Dict[str, List[str]] = {}
+        for r in rows:
+            top_id = r["topic_id"]
+            ch = r["channel_title"]
+            result.setdefault(top_id, []).append(ch)
+            unprefixed = top_id.replace(f"{syllabus_id}_", "")
+            if unprefixed != top_id:
+                result.setdefault(unprefixed, []).append(ch)
+            prefixed = f"{syllabus_id}_{top_id}"
+            result.setdefault(prefixed, []).append(ch)
+        return result
 
 
 def add_rejected_channel(syllabus_id: str, topic_id: str, channel_title: str, reason: Optional[str] = None) -> None:

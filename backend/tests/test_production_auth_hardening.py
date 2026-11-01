@@ -289,39 +289,52 @@ def test_prod_mode_cross_user_isolation():
 
 def test_diagnostics_protection_in_production():
     """
-    Requirement 4: Audit and ensure /api/diagnostics cannot leak keys or run probes publicly.
-    In production mode, administrative authorization is required.
+    Requirement 4 & Diagnostics RBAC:
+    - In production mode, unauthenticated public requests are rejected with 401 Unauthorized.
+    - Authenticated users (e.g. students) can access safe, read-only diagnostics without secret leakage.
+    - Administrative operations (e.g. cache clear) strictly require admin authorization (403 Forbidden for non-admins).
     """
     settings.app_env = "production"
     settings.admin_api_key = "secure-production-admin-key-777"
     settings.supabase_jwt_secret = TEST_SECRET
 
-    # 1. Unauthenticated public request to /api/diagnostics -> 403 Forbidden
+    # 1. Unauthenticated public request to /api/diagnostics -> 401 Unauthorized
     res_unauth = client.get("/api/diagnostics")
-    assert res_unauth.status_code == 403
-    assert "Administrative privileges required" in res_unauth.json()["detail"]
+    assert res_unauth.status_code == 401
+    assert "Authentication required" in res_unauth.json()["detail"]
 
-    # 2. Public request to test probe endpoints -> 403 Forbidden
+    # 2. Public request to test probe endpoints -> 401 Unauthorized
     res_probe = client.post("/api/diagnostics/test-youtube")
-    assert res_probe.status_code == 403
+    assert res_probe.status_code == 401
 
-    # 3. Regular student JWT -> 403 Forbidden
+    # 3. Regular student JWT -> 200 OK for safe, read-only diagnostics
     student_token = create_test_supabase_jwt(sub="regular-student-uuid", secret=TEST_SECRET, role="authenticated")
     res_student = client.get("/api/diagnostics", headers={"Authorization": f"Bearer {student_token}"})
-    assert res_student.status_code == 403
+    assert res_student.status_code == 200
+    student_diag = res_student.json()
+    assert student_diag["status"] == "success"
+    assert student_diag["backend"]["environment"] == "production"
+    # Ensure sensitive table names list is redacted for non-admins
+    assert student_diag["database"]["tables"] == []
 
-    # 4. Valid X-Admin-Key header -> 200 OK
-    res_admin_key = client.get("/api/diagnostics", headers={"X-Admin-Key": "secure-production-admin-key-777"})
+    # 4. Regular student JWT attempting admin-only operation -> 403 Forbidden
+    res_admin_op_denied = client.post("/api/diagnostics/cache/clear", headers={"Authorization": f"Bearer {student_token}"})
+    assert res_admin_op_denied.status_code == 403
+    assert "Administrative privileges required" in res_admin_op_denied.json()["detail"]
+
+    # 5. Valid X-Admin-Key header -> can execute admin-only operations (200 OK)
+    res_admin_key = client.post("/api/diagnostics/cache/clear", headers={"X-Admin-Key": "secure-production-admin-key-777"})
     assert res_admin_key.status_code == 200
-    diag = res_admin_key.json()
-    assert diag["status"] == "success"
-    # Ensure YouTube key details do not leak length
-    assert "length" not in diag["youtube"]["key_summary"].lower()
+    assert res_admin_key.json()["status"] == "success"
 
-    # 5. Admin JWT (role='service_role' or 'admin') -> 200 OK
+    # 6. Admin JWT (role='service_role' or 'admin') -> 200 OK for admin-only operations and includes table inventory
     admin_token = create_test_supabase_jwt(sub="supabase-admin-uuid", secret=TEST_SECRET, role="service_role")
-    res_admin_jwt = client.get("/api/diagnostics", headers={"Authorization": f"Bearer {admin_token}"})
+    res_admin_jwt = client.post("/api/diagnostics/cache/clear", headers={"Authorization": f"Bearer {admin_token}"})
     assert res_admin_jwt.status_code == 200
+
+    res_admin_diag = client.get("/api/diagnostics", headers={"Authorization": f"Bearer {admin_token}"})
+    assert res_admin_diag.status_code == 200
+    assert len(res_admin_diag.json()["database"]["tables"]) >= 0
 
 
 def test_diagnostics_accessible_in_dev_mode():

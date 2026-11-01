@@ -25,11 +25,15 @@ class DatabaseDiagnostic(BaseModel):
 class StrandsDiagnostic(BaseModel):
     provider: str = Field(description="Configured provider (e.g. 'bedrock', 'openai', 'anthropic')")
     model: str = Field(description="Model identifier")
+    region: Optional[str] = Field(default="ap-southeast-2", description="AWS region for Bedrock")
     credentials_configured: bool = Field(description="Whether required credentials exist in environment")
     credentials_summary: str = Field(description="Safe overview without secrets (e.g. 'Configured (Bedrock)')")
     fallback_enabled: bool = Field(description="Whether development fallback is enabled")
     active_mode: str = Field(description="'live' if credentials configured, else 'development_fallback'")
     fallback_reason: Optional[str] = Field(default=None)
+    connectivity_status: str = Field(default="unverified", description="'verified', 'unverified', 'auth_failed', 'model_not_available', or 'missing'")
+    last_tested: Optional[str] = Field(default=None, description="ISO timestamp of last live test probe")
+    last_test_message: Optional[str] = Field(default=None, description="Safe summary from last test probe")
 
 
 class YouTubeDiagnostic(BaseModel):
@@ -39,6 +43,9 @@ class YouTubeDiagnostic(BaseModel):
     active_mode: str = Field(description="'live' if key configured, else 'development_fallback'")
     fallback_reason: Optional[str] = Field(default=None)
     cached_queries_count: int = Field(default=0)
+    connectivity_status: str = Field(default="unverified", description="'verified', 'unverified', 'expired_or_invalid', 'quota_exceeded', or 'missing'")
+    last_tested: Optional[str] = Field(default=None, description="ISO timestamp of last live test probe")
+    last_test_message: Optional[str] = Field(default=None, description="Safe summary from last test probe")
 
 
 class SystemDiagnosticsResponse(BaseModel):

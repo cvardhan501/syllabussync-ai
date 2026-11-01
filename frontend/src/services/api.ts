@@ -45,16 +45,34 @@ async function authenticatedFetch(input: RequestInfo | URL, init?: RequestInit):
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const response = await window.fetch(input, {
-    ...init,
-    headers,
-  });
+  // Enforce a client-side timeout (e.g. 60 seconds) so UI never hangs indefinitely
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000);
 
-  if (response.status === 401 && typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('syllabussync:unauthorized'));
+  if (init?.signal) {
+    init.signal.addEventListener('abort', () => controller.abort());
   }
 
-  return response;
+  try {
+    const response = await window.fetch(input, {
+      ...init,
+      signal: controller.signal,
+      headers,
+    });
+
+    if (response.status === 401 && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('syllabussync:unauthorized'));
+    }
+
+    return response;
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      throw new Error('Request timed out after 60 seconds. Please check your network connection and retry.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 /**

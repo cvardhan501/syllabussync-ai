@@ -503,11 +503,15 @@ export interface DatabaseDiagnostic {
 export interface StrandsDiagnostic {
   provider: string;
   model: string;
+  region?: string | null;
   credentials_configured: boolean;
   credentials_summary: string;
   fallback_enabled: boolean;
   active_mode: string;
   fallback_reason?: string | null;
+  connectivity_status: string;
+  last_tested?: string | null;
+  last_test_message?: string | null;
 }
 
 export interface YouTubeDiagnostic {
@@ -517,6 +521,9 @@ export interface YouTubeDiagnostic {
   active_mode: string;
   fallback_reason?: string | null;
   cached_queries_count: number;
+  connectivity_status: string;
+  last_tested?: string | null;
+  last_test_message?: string | null;
 }
 
 export interface SystemDiagnosticsResponse {

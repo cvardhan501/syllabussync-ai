@@ -2,19 +2,27 @@ import asyncio
 import logging
 import math
 import re
+import time
 from urllib.parse import quote_plus
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 from app.models.database import (
     get_syllabus_hierarchy,
     get_topic_rejected_channels,
+    get_all_rejected_channels_for_syllabus,
     add_rejected_channel,
     save_discovered_resources,
     get_syllabus_resources,
     update_topic_resource,
     set_third_channel_approved,
 )
-from app.services.youtube_client import YouTubeClientService
+from app.services.youtube_client import (
+    YouTubeClientService,
+    YouTubeApiException,
+    YouTubeAuthException,
+    YouTubeQuotaExceededException,
+    YouTubeConnectionException,
+)
 from app.schemas.resource import (
     VideoResource,
     TopicResourceMapping,
@@ -32,6 +40,28 @@ from app.schemas.resource import (
 
 logger = logging.getLogger("syllabus_sync.matcher")
 
+# Precompiled regular expressions for high-frequency search and parsing
+BOILERPLATE_PATTERN = re.compile(
+    r"(?i)\b(case\s+study(?:\s+\d+)?|assignment(?:\s+\d+)?|independent\s+lab|lab\s+exercise|introduction\s+to|overview\s+of|fundamentals\s+of|basics\s+of|detailed\s+|concepts?\s+of|study\s+of|part\s+\d+|unit\s+\d+:?|module\s+\d+:?)\b"
+)
+COURSE_CODE_PATTERN = re.compile(r"\b[A-Z]{2,4}\d{3,4}\b")
+WHITESPACE_PATTERN = re.compile(r"\s+")
+PARENS_PATTERN = re.compile(r"[()]")
+SUBSTANTIVE_WORDS_PATTERN = re.compile(r"[a-zA-Z]{3,}")
+CASE_STUDY_PATTERN = re.compile(r"(?i)^case\s+study\s+\d+")
+COMPREHENSIVE_PHRASES = ("full course", "complete course", "masterclass", "all in one", "marathon")
+
+STOP_WORDS = {
+    "and", "the", "for", "with", "from", "intro", "introduction", "basics", "overview",
+    "detailed", "concepts", "concept", "study", "notes", "lecture", "tutorial", "chapter",
+    "part", "unit", "module"
+}
+
+# In-memory evaluation and strategy preview caches
+_RELEVANCE_CACHE: Dict[Tuple[str, str, str], Tuple[float, str, str]] = {}
+_PREVIEW_CACHE: Dict[str, Tuple[float, Any]] = {}
+_PREVIEW_CACHE_TTL = 300.0  # 5 minutes
+
 
 class ResourceMatcherService:
     """
@@ -43,25 +73,48 @@ class ResourceMatcherService:
     @classmethod
     def generate_topic_search_query(cls, course_name: str, topic_title: str) -> str:
         """
-        Generates targeted topic-specific search queries by stripping generic academic boilerplate
-        and focusing on key conceptual phrases combined with the course domain.
+        Generates targeted topic-specific search queries by stripping generic academic boilerplate,
+        extracting primary conceptual clauses for long multi-clause topics, and combining
+        with the course domain. Query length is bounded to avoid YouTube HTTP 400 Bad Request.
         """
+        # If topic contains multiple clauses (separated by ; or \n or •), focus on primary concepts
+        raw_clauses = [c.strip() for c in re.split(r"[;\n•\r]+", topic_title) if c.strip()]
+        if len(raw_clauses) > 1:
+            # Pick primary clause(s) up to 80 chars
+            selected_clauses = []
+            cur_len = 0
+            for cl in raw_clauses:
+                cl_clean = BOILERPLATE_PATTERN.sub("", cl).strip()
+                if not cl_clean or len(cl_clean) < 3:
+                    continue
+                if cur_len + len(cl_clean) > 80 and selected_clauses:
+                    break
+                selected_clauses.append(cl_clean)
+                cur_len += len(cl_clean) + 2
+            clause_text = "; ".join(selected_clauses) if selected_clauses else raw_clauses[0]
+        else:
+            clause_text = topic_title
+
         # Strip generic academic boilerplate
-        cleaned_topic = re.sub(
-            r"(?i)\b(case\s+study(?:\s+\d+)?|assignment(?:\s+\d+)?|independent\s+lab|lab\s+exercise|introduction\s+to|overview\s+of|fundamentals\s+of|basics\s+of|detailed\s+|concepts?\s+of|study\s+of|part\s+\d+|unit\s+\d+:?|module\s+\d+:?)\b",
-            "",
-            topic_title
-        ).strip()
-        cleaned_topic = re.sub(r"\s+", " ", cleaned_topic).strip(" :-,")
+        cleaned_topic = BOILERPLATE_PATTERN.sub("", clause_text).strip()
+        cleaned_topic = WHITESPACE_PATTERN.sub(" ", cleaned_topic).strip(" :-,")
         if not cleaned_topic or len(cleaned_topic) < 3:
-            cleaned_topic = topic_title
+            cleaned_topic = topic_title.split(";")[0].strip() if ";" in topic_title else topic_title
+
+        # Bound topic length to at most 90 characters
+        if len(cleaned_topic) > 90:
+            cleaned_topic = cleaned_topic[:90].rsplit(" ", 1)[0]
 
         # Clean course name (strip course code pattern like CSE3016 or CS101 and parentheses)
-        clean_course = re.sub(r"\b[A-Z]{2,4}\d{3,4}\b", "", course_name)
-        clean_course = re.sub(r"[()]", "", clean_course)
-        clean_course = re.sub(r"\s+", " ", clean_course).strip(" :-,")
+        clean_course = COURSE_CODE_PATTERN.sub("", course_name)
+        clean_course = PARENS_PATTERN.sub("", clean_course)
+        clean_course = WHITESPACE_PATTERN.sub(" ", clean_course).strip(" :-,")
         if not clean_course:
             clean_course = course_name
+
+        # Bound course name to at most 60 characters
+        if len(clean_course) > 60:
+            clean_course = clean_course[:60].rsplit(" ", 1)[0]
 
         return f"{clean_course} {cleaned_topic}".strip()
 
@@ -76,20 +129,21 @@ class ResourceMatcherService:
         Evaluates video title and description against specific topic keywords.
         Returns: (relevance_score, match_status, explanation)
         match_status is one of: 'verified', 'probable', 'unverified', 'no_resource'.
+        Results are memoized in-memory for identical (topic, video_id, course_name).
         """
+        v_id = str(video.get("video_id") or video.get("id") or "")
+        cache_key = (topic_title.strip().lower(), v_id, course_name.strip().lower())
+        if v_id and cache_key in _RELEVANCE_CACHE:
+            return _RELEVANCE_CACHE[cache_key]
+
         v_title = video.get("title", "").lower()
         v_desc = video.get("description", "").lower()
         v_duration = video.get("duration_seconds", 0)
         ch_name = video.get("channel_title", "Educator")
 
         # Extract substantive topic keywords (> 2 chars, non-stopwords)
-        raw_words = re.findall(r"[a-zA-Z]{3,}", topic_title.lower())
-        stop_words = {
-            "and", "the", "for", "with", "from", "intro", "introduction", "basics", "overview",
-            "detailed", "concepts", "concept", "study", "notes", "lecture", "tutorial", "chapter",
-            "part", "unit", "module"
-        }
-        topic_keywords = [w for w in raw_words if w not in stop_words]
+        raw_words = SUBSTANTIVE_WORDS_PATTERN.findall(topic_title.lower())
+        topic_keywords = [w for w in raw_words if w not in STOP_WORDS]
         if not topic_keywords:
             topic_keywords = raw_words
 
@@ -101,49 +155,50 @@ class ResourceMatcherService:
         desc_ratio = len(desc_matches) / len(topic_keywords) if topic_keywords else 0.0
 
         # Check course domain match
-        course_words = [w for w in re.findall(r"[a-zA-Z]{3,}", course_name.lower()) if w not in stop_words]
+        course_words = [w for w in SUBSTANTIVE_WORDS_PATTERN.findall(course_name.lower()) if w not in STOP_WORDS]
         course_in_title = any(cw in v_title for cw in course_words)
         course_in_desc = any(cw in v_desc for cw in course_words)
 
         # Long-form / comprehensive lecture flag
         is_comprehensive = v_duration >= 2700 or any(
-            phrase in v_title for phrase in ["full course", "complete course", "masterclass", "all in one", "marathon"]
+            phrase in v_title for phrase in COMPREHENSIVE_PHRASES
         )
 
         # Scoring & Classification
+        result: tuple[float, str, str]
         if title_ratio >= 0.50:
             score = round(0.85 + (title_ratio * 0.10), 2)
             matched_str = ", ".join(f"'{m}'" for m in title_matches[:3])
             explanation = f"Verified match: Title explicitly covers {matched_str} from {ch_name}."
-            return score, "verified", explanation
-
-        if title_ratio >= 0.25 and (desc_ratio >= 0.35 or course_in_title):
+            result = (score, "verified", explanation)
+        elif title_ratio >= 0.25 and (desc_ratio >= 0.35 or course_in_title):
             score = 0.78
             matched_str = ", ".join(f"'{m}'" for m in title_matches[:2])
             explanation = f"Verified match: Video directly teaches {matched_str} in accredited curriculum."
-            return score, "verified", explanation
-
-        if desc_ratio >= 0.50:
+            result = (score, "verified", explanation)
+        elif desc_ratio >= 0.50:
             score = 0.68
             matched_str = ", ".join(f"'{m}'" for m in desc_matches[:3])
             explanation = f"Probable match: Lecture breakdown cites {matched_str} in lesson metadata."
-            return score, "probable", explanation
-
-        if is_comprehensive and (course_in_title or course_in_desc):
+            result = (score, "probable", explanation)
+        elif is_comprehensive and (course_in_title or course_in_desc):
             score = 0.60
             duration_fmt = video.get("duration_formatted", "")
             explanation = f"Probable match: Comprehensive {duration_fmt} course from {ch_name} covering overall syllabus topics."
-            return score, "probable", explanation
-
-        if course_in_title:
+            result = (score, "probable", explanation)
+        elif course_in_title:
             score = 0.38
             explanation = f"Unverified match: General subject video from {ch_name}; lacks direct evidence for '{topic_title}'."
-            return score, "unverified", explanation
+            result = (score, "unverified", explanation)
+        else:
+            # Below threshold
+            score = 0.12
+            explanation = f"No verified video found: Candidate from {ch_name} lacks sufficient relevance for '{topic_title}'."
+            result = (score, "no_resource", explanation)
 
-        # Below threshold
-        score = 0.12
-        explanation = f"No verified video found: Candidate from {ch_name} lacks sufficient relevance for '{topic_title}'."
-        return score, "no_resource", explanation
+        if v_id:
+            _RELEVANCE_CACHE[cache_key] = result
+        return result
 
     @classmethod
     def _make_channel_url(cls, ch_title: str, ch_id: Optional[str]) -> str:
@@ -209,22 +264,49 @@ class ResourceMatcherService:
             lang_list = ["English"]
         primary_lang = lang_list[0]
 
-        # Topic candidate search
+        # Topic candidate search with bounded concurrency
         channel_topics_map: Dict[str, Set[str]] = {}
         channel_info_map: Dict[str, Dict[str, Any]] = {}
         channel_examples_map: Dict[str, List[Dict[str, Any]]] = {}
 
-        for t in flattened_topics:
-            t_id = t["topic_id"]
-            query = cls.generate_topic_search_query(course_name, t["topic_title"])
+        sem = asyncio.Semaphore(5)
 
-            videos, _ = await YouTubeClientService.search_videos(
-                query=query,
-                language=primary_lang,
-                max_results=4,
-                force_refresh=force_refresh,
-            )
+        async def _fetch_channel_candidate(t: Dict[str, Any]):
+            async with sem:
+                try:
+                    query = cls.generate_topic_search_query(course_name, t["topic_title"])
+                    videos, _ = await YouTubeClientService.search_videos(
+                        query=query,
+                        language=primary_lang,
+                        max_results=4,
+                        force_refresh=force_refresh,
+                    )
+                    return t, videos, None
+                except Exception as exc:
+                    logger.warning(
+                        f"Channel discovery search error for topic '{t.get('topic_title')}': {type(exc).__name__}: {exc}"
+                    )
+                    return t, [], exc
 
+        topic_search_results = await asyncio.gather(*[_fetch_channel_candidate(t) for t in flattened_topics])
+
+        successful_searches = 0
+        collected_errors = []
+        for t, videos, err in topic_search_results:
+            if err is not None:
+                collected_errors.append(err)
+            else:
+                successful_searches += 1
+
+        # If every topic failed, propagate the underlying failure
+        if total_topics > 0 and successful_searches == 0 and collected_errors:
+            for err_cls in (YouTubeAuthException, YouTubeQuotaExceededException, YouTubeConnectionException, YouTubeApiException):
+                for err in collected_errors:
+                    if isinstance(err, err_cls):
+                        raise err
+            raise collected_errors[0]
+
+        for t, videos, _ in topic_search_results:
             for v in videos:
                 ch = v["channel_title"]
                 if not ch:
@@ -247,13 +329,14 @@ class ResourceMatcherService:
 
                 # Save example videos for channel
                 examples = channel_examples_map.setdefault(ch, [])
-                if len(examples) < 3 and not any(ex["video_id"] == v["video_id"] for ex in examples):
+                v_id = v.get("video_id") or v.get("id") or "vid"
+                if len(examples) < 3 and not any(ex["video_id"] == v_id for ex in examples):
                     examples.append({
-                        "video_id": v["video_id"],
-                        "title": v["title"],
-                        "thumbnail_url": v["thumbnail_url"],
-                        "duration_formatted": v["duration_formatted"],
-                        "video_url": v["video_url"],
+                        "video_id": v_id,
+                        "title": v.get("title", "Educational Video"),
+                        "thumbnail_url": v.get("thumbnail_url"),
+                        "duration_formatted": v.get("duration_formatted", "15:00"),
+                        "video_url": v.get("video_url") or f"https://www.youtube.com/watch?v={v_id}",
                     })
 
         all_topic_titles = [t["topic_title"] for t in flattened_topics]
@@ -326,22 +409,66 @@ class ResourceMatcherService:
         lang_list = [l.strip() for l in (languages or ["English"]) if l.strip()]
         primary_lang = lang_list[0] if lang_list else "English"
 
-        # Search candidates for all topics
+        # Check in-memory preview cache to accelerate repeat preview / confirm requests
+        cache_key = (
+            f"{syllabus_id}_{strategy}_{allow_third_channel}_"
+            f"{','.join(sorted(selected_channel_names or []))}_"
+            f"{','.join(f'{k}:{v}' for k, v in sorted((custom_assignments or {}).items()))}_"
+            f"{','.join(sorted(lang_list))}"
+        )
+        now = time.time()
+        if cache_key in _PREVIEW_CACHE:
+            ts, cached_preview = _PREVIEW_CACHE[cache_key]
+            if now - ts < _PREVIEW_CACHE_TTL:
+                return cached_preview
+
+        # Single query to fetch all rejected channels across syllabus topics
+        all_rejected_map = get_all_rejected_channels_for_syllabus(syllabus_id)
+
+        # Search candidates for all topics using bounded async concurrency
         topic_candidates: Dict[str, List[Dict[str, Any]]] = {}
         channel_to_topics: Dict[str, Set[str]] = {}
         channel_id_map: Dict[str, Optional[str]] = {}
 
-        for t in flattened_topics:
-            t_id = t["topic_id"]
-            query = cls.generate_topic_search_query(course_name, t["topic_title"])
-            rejected = get_topic_rejected_channels(syllabus_id, t_id)
+        sem = asyncio.Semaphore(5)
 
-            videos, _ = await YouTubeClientService.search_videos(
-                query=query,
-                language=primary_lang,
-                max_results=5,
-                excluded_channels=rejected,
-            )
+        async def _fetch_topic_search(t: Dict[str, Any]):
+            async with sem:
+                t_id = t["topic_id"]
+                try:
+                    query = cls.generate_topic_search_query(course_name, t["topic_title"])
+                    rejected = all_rejected_map.get(t_id, [])
+                    videos, _ = await YouTubeClientService.search_videos(
+                        query=query,
+                        language=primary_lang,
+                        max_results=5,
+                        excluded_channels=rejected,
+                    )
+                    return t_id, videos, None
+                except Exception as exc:
+                    logger.warning(
+                        f"Strategy preview search error for topic '{t.get('topic_title')}': {type(exc).__name__}: {exc}"
+                    )
+                    return t_id, [], exc
+
+        search_results = await asyncio.gather(*[_fetch_topic_search(t) for t in flattened_topics])
+
+        successful_searches = 0
+        collected_errors = []
+        for t_id, videos, err in search_results:
+            if err is not None:
+                collected_errors.append(err)
+            else:
+                successful_searches += 1
+
+        if total_topics > 0 and successful_searches == 0 and collected_errors:
+            for err_cls in (YouTubeAuthException, YouTubeQuotaExceededException, YouTubeConnectionException, YouTubeApiException):
+                for err in collected_errors:
+                    if isinstance(err, err_cls):
+                        raise err
+            raise collected_errors[0]
+
+        for t_id, videos, _ in search_results:
             topic_candidates[t_id] = videos
             for v in videos:
                 ch = v["channel_title"]
@@ -701,7 +828,7 @@ class ResourceMatcherService:
             probable_coverage_percentage=prob_pct,
         )
 
-        return PreviewStrategyResponse(
+        resp = PreviewStrategyResponse(
             status="success",
             syllabus_id=syllabus_id,
             strategy=strategy,
@@ -714,6 +841,8 @@ class ResourceMatcherService:
             requires_third_channel_approval=requires_third_approval,
             third_channel_candidates=third_candidates,
         )
+        _PREVIEW_CACHE[cache_key] = (now, resp)
+        return resp
 
     @classmethod
     async def confirm_channel_strategy(

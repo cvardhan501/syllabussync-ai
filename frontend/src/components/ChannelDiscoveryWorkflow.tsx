@@ -208,14 +208,27 @@ export const ChannelDiscoveryWorkflow: React.FC<ChannelDiscoveryWorkflowProps> =
 
       {/* Error Alert */}
       {errorMessage && (
-        <div className="p-4 rounded-2xl bg-rose-950/40 border border-rose-800/60 text-xs text-rose-300 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-            <span>{errorMessage}</span>
+        <div className="p-4 rounded-2xl bg-rose-950/40 border border-rose-800/60 text-xs text-rose-300 flex items-start justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <span className="font-semibold block">{errorMessage}</span>
+              {errorMessage.toLowerCase().includes('quota') && (
+                <p className="text-[11px] text-rose-400/80 m-0">
+                  Google Cloud YouTube Data API quota has been reached. Please check your Google Cloud Console quota or try again later.
+                </p>
+              )}
+              {errorMessage.toLowerCase().includes('api key') && (
+                <p className="text-[11px] text-rose-400/80 m-0">
+                  Please update or renew the YOUTUBE_API_KEY credential in your deployment environment.
+                </p>
+              )}
+            </div>
           </div>
           <button
             onClick={() => setErrorMessage(null)}
-            className="text-rose-400 hover:text-white font-bold px-2 py-0.5"
+            className="text-rose-400 hover:text-white font-bold px-2 py-0.5 cursor-pointer shrink-0"
+            title="Dismiss error"
           >
             ✕
           </button>
