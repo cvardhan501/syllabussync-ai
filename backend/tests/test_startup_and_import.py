@@ -80,3 +80,36 @@ class TestImportAndStartup:
         spec.loader.exec_module(serverless_entry)
         assert hasattr(serverless_entry, "app")
         assert serverless_entry.app is not None
+
+    def test_entrypoint_imports_from_service_root_cwd(self):
+        """Simulates Vercel serverless Lambda container where CWD and sys.path[0] is backend/."""
+        import os
+        backend_dir = str(Path(__file__).resolve().parent.parent)
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(backend_dir)
+            if backend_dir not in sys.path:
+                sys.path.insert(0, backend_dir)
+
+            # vc_init imports the module directly by its declared name 'main'
+            mod = importlib.import_module("main")
+            assert hasattr(mod, "app"), "main.py must expose 'app'"
+            assert mod.app is not None
+        finally:
+            os.chdir(old_cwd)
+
+    def test_pyproject_entrypoint_matches_main_app(self):
+        """Verifies that backend/pyproject.toml specifies tool.vercel.entrypoint = 'main:app'."""
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # fallback if on python < 3.11
+
+        pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        assert pyproject_path.exists(), "backend/pyproject.toml must exist for Vercel Services"
+
+        with open(pyproject_path, "rb") as f:
+            data = tomllib.load(f)
+
+        entrypoint = data.get("tool", {}).get("vercel", {}).get("entrypoint")
+        assert entrypoint == "main:app", f"Expected 'main:app', got {entrypoint}"

@@ -14,4 +14,3 @@ if str(BACKEND_ROOT) not in sys.path:
 from app.main import app
 
 __all__ = ["app"]
-

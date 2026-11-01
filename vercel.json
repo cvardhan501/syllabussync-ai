@@ -8,7 +8,7 @@
     "backend": {
       "root": "backend/",
       "framework": "fastapi",
-      "entrypoint": "main:app"
+      "entrypoint": "pyproject.toml"
     }
   },
   "rewrites": [
