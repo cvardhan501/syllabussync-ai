@@ -345,17 +345,24 @@ async def approve_third_channel(
     current_user_id: Optional[str] = Depends(get_current_user_id),
 ):
     """
-    Records student approval for introducing a 3rd channel and updates the resource plan.
+    Records student approval for introducing a 3rd channel and immediately updates the resource plan
+    using fast cached topic candidates without redundant external network discovery.
     """
     s_owner = get_syllabus_owner_id(syllabus_id)
     verify_ownership(s_owner, current_user_id, resource_type="syllabus")
 
     approve = payload.approve if payload else True
     try:
-        return await ResourceMatcherService.discover_resources_for_syllabus(
+        from app.models.database import get_syllabus_resources
+        existing = get_syllabus_resources(syllabus_id)
+        current_strategy = (existing.get("channel_strategy") if existing else None) or "two_channels"
+        current_langs = (existing.get("languages") if existing else None) or ["English"]
+
+        return await ResourceMatcherService.confirm_channel_strategy(
             syllabus_id=syllabus_id,
+            strategy=current_strategy,
+            languages=current_langs,
             allow_third_channel=approve,
-            force_refresh=True,
         )
     except ValueError as e:
         raise HTTPException(

@@ -159,21 +159,29 @@ export const Header: React.FC<HeaderProps> = ({
         <div
           className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono border transition-all select-none ${
             health?.status === 'healthy' || health?.status === 'ok'
-              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+              ? health?.database_connected === false
+                ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
               : healthError
               ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
               : 'bg-slate-500/10 text-slate-400 border-slate-500/30'
           }`}
           title={
             health?.status === 'healthy' || health?.status === 'ok'
-              ? `FastAPI Backend Online (v${health.version})`
+              ? health?.database_connected === false
+                ? `FastAPI Online (v${health.version}) • Database probe degraded/timed out`
+                : `FastAPI Backend Online (v${health.version}) • Database Connected`
               : healthError
               ? `FastAPI Backend Offline: ${healthError}`
               : 'Connecting to FastAPI Backend...'
           }
         >
           {health?.status === 'healthy' || health?.status === 'ok' ? (
-            <Wifi className="w-3 h-3 text-emerald-400" />
+            health?.database_connected === false ? (
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+            ) : (
+              <Wifi className="w-3 h-3 text-emerald-400" />
+            )
           ) : healthError ? (
             <WifiOff className="w-3 h-3 text-rose-400" />
           ) : (
@@ -181,7 +189,9 @@ export const Header: React.FC<HeaderProps> = ({
           )}
           <span className="font-semibold uppercase tracking-wider text-[10px]">
             {health?.status === 'healthy' || health?.status === 'ok'
-              ? `Online (v${health.version})`
+              ? health?.database_connected === false
+                ? `Online (v${health.version}) • DB Degraded`
+                : `Online (v${health.version})`
               : healthError
               ? 'Offline'
               : 'Connecting...'}

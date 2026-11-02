@@ -60,6 +60,11 @@ async function authenticatedFetch(input: RequestInfo | URL, init?: RequestInit):
   const isGet = method === 'GET';
   const urlKey = typeof input === 'string' ? input : (input instanceof URL ? input.toString() : input.url);
 
+  // Invalidate any cached in-flight GET promises when a mutation is issued
+  if (!isGet) {
+    inFlightGetRequests.clear();
+  }
+
   // Return cloned response for concurrent duplicate in-flight GET requests
   if (isGet && inFlightGetRequests.has(urlKey)) {
     try {
@@ -84,7 +89,9 @@ async function authenticatedFetch(input: RequestInfo | URL, init?: RequestInit):
     urlStr.includes('/setup-and-analyze') ||
     urlStr.includes('/analyze') ||
     urlStr.includes('/study-plan') ||
-    urlStr.includes('/strategy')
+    urlStr.includes('/strategy') ||
+    urlStr.includes('/channel-discovery') ||
+    urlStr.includes('/approve-third-channel')
   );
   const customTimeout = (init as any)?.timeoutMs;
   const timeoutMs = customTimeout || (isHeavyOperation ? 180000 : 60000);
@@ -206,34 +213,80 @@ async function handleApiResponse<T = any>(response: Response, defaultErrorPrefix
   throw new ApiErrorResponse(`Server returned an unreadable response (HTTP ${response.status}).`, response.status);
 }
 
-export const apiService = {
-  async getHealth(): Promise<HealthResponse> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-    try {
-      // Direct, non-blocking health probe bypassing session token overhead and cache
-      const response = await window.fetch(`${API_BASE}/health`, {
-        method: 'GET',
-        headers: {
-          'Accept': 'application/json',
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          'Pragma': 'no-cache',
-        },
-        signal: controller.signal,
-      });
+// In-flight deduplication and sequence guards for health polling
+let inFlightHealthPromise: Promise<HealthResponse> | null = null;
+let lastHealthFetchTime = 0;
+let lastHealthResponse: HealthResponse | null = null;
+let healthSequenceNumber = 0;
+const HEALTH_DEBOUNCE_MS = 1500;
 
-      return await handleApiResponse<HealthResponse>(response, 'Health check failed');
-    } catch (err: any) {
-      if (err.name === 'AbortError') {
-        throw new Error('Health check request timed out after 8 seconds.');
-      }
-      if (err instanceof ApiErrorResponse) {
-        throw err;
-      }
-      throw new Error(err?.message || 'Unable to connect to SyllabusSync AI backend API.');
-    } finally {
-      clearTimeout(timeoutId);
+export const apiService = {
+  async getHealth(forceRefresh: boolean = false): Promise<HealthResponse> {
+    const now = Date.now();
+    // Return recent cached response if available and not forced
+    if (!forceRefresh && lastHealthResponse && (now - lastHealthFetchTime < HEALTH_DEBOUNCE_MS)) {
+      return lastHealthResponse;
     }
+    // Share existing in-flight promise to prevent concurrent overlapping calls
+    if (inFlightHealthPromise) {
+      return inFlightHealthPromise;
+    }
+
+    const currentSeq = ++healthSequenceNumber;
+
+    const executeProbe = async (attempt: number = 0): Promise<HealthResponse> => {
+      const controller = new AbortController();
+      const timeoutMs = 5000;
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await window.fetch(`${API_BASE}/health`, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+          },
+          signal: controller.signal,
+        });
+
+        const data = await handleApiResponse<HealthResponse>(response, 'Health check failed');
+        // Prevent stale responses from overwriting newer sequences
+        if (currentSeq >= healthSequenceNumber) {
+          lastHealthResponse = data;
+          lastHealthFetchTime = Date.now();
+        }
+        return data;
+      } catch (err: any) {
+        // Automatic retry with backoff on momentary network glitch (attempt 0 only)
+        if (attempt === 0 && (err.name === 'AbortError' || err.message?.includes('Failed to fetch') || err.message?.includes('NetworkError'))) {
+          await new Promise((res) => setTimeout(res, 500));
+          return executeProbe(1);
+        }
+
+        // Do not cache failed health results
+        if (currentSeq >= healthSequenceNumber) {
+          lastHealthResponse = null;
+          lastHealthFetchTime = 0;
+        }
+
+        if (err.name === 'AbortError') {
+          throw new Error('Health check request timed out after 5 seconds.');
+        }
+        if (err instanceof ApiErrorResponse) {
+          throw err;
+        }
+        throw new Error(err?.message || 'Unable to connect to SyllabusSync AI backend API.');
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    };
+
+    inFlightHealthPromise = executeProbe().finally(() => {
+      inFlightHealthPromise = null;
+    });
+
+    return inFlightHealthPromise;
   },
 
   async uploadSyllabus(file: File): Promise<SyllabusUploadResponse> {

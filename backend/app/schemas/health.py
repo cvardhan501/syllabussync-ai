@@ -10,3 +10,5 @@ class HealthResponse(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Current UTC timestamp")
     environment: str = Field(description="Current deployment environment")
     database_connected: Optional[bool] = Field(default=None, description="Lightweight database connectivity status")
+    database_status: Optional[str] = Field(default="connected", description="Database probe status: 'connected' | 'degraded' | 'timeout'")
+

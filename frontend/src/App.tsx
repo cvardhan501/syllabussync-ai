@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, Suspense, lazy } from 'react';
+import React, { useState, useEffect, useCallback, useRef, Suspense, lazy } from 'react';
 import { 
   LayoutDashboard, 
   BookOpen, 
@@ -130,6 +130,7 @@ export const App: React.FC = () => {
 
   const setActiveCourse = (course: Course | null) => {
     setActiveCourseState(course);
+    setStudyPlan(null); // Clear active study plan so switching courses never displays stale tasks
     try {
       if (course) {
         localStorage.setItem('syllabussync_active_course', JSON.stringify(course));
@@ -141,17 +142,28 @@ export const App: React.FC = () => {
     }
   };
 
-  const refreshCourses = async () => {
+  const refreshCourses = async (deletedCourseId?: string) => {
     try {
       const res = await apiService.getCourses(true);
-      setCourses(res.courses || []);
-      if (res.courses && res.courses.length > 0) {
-        if (!activeCourse || !res.courses.some((c) => c.id === activeCourse.id)) {
-          const first = res.courses.find((c) => !c.is_archived) || res.courses[0];
-          setActiveCourse(first);
+      const updatedCourses = res.courses || [];
+      setCourses(updatedCourses);
+
+      const currentActiveId = activeCourse?.id;
+      const isCurrentActiveDeleted = Boolean(deletedCourseId && currentActiveId === deletedCourseId);
+      const isCurrentActiveMissing = !currentActiveId || !updatedCourses.some((c) => c.id === currentActiveId);
+
+      if (isCurrentActiveDeleted || isCurrentActiveMissing) {
+        if (updatedCourses.length > 0) {
+          const nextActive = updatedCourses.find((c) => !c.is_archived) || updatedCourses[0];
+          setActiveCourse(nextActive);
+        } else {
+          setActiveCourse(null);
+          setAnalyzedSyllabusState(null);
+          setStudyPlan(null);
+          setDiscoveryData(null);
+          localStorage.removeItem('syllabussync_active_course');
+          localStorage.removeItem('syllabussync_active_syllabus');
         }
-      } else {
-        setActiveCourse(null);
       }
     } catch {
       // Ignore
@@ -301,26 +313,41 @@ export const App: React.FC = () => {
     }
   };
 
-  // Poll or check health on mount
-  const checkHealth = useCallback(async () => {
+  // Monotonic sequence and concurrency guard to prevent overlapping polls and stale state overwrite
+  const isPollingHealthRef = useRef(false);
+  const healthSequenceRef = useRef(0);
+
+  // Poll or check health with sequencing and deduplication
+  const checkHealth = useCallback(async (force = false) => {
+    if (isPollingHealthRef.current && !force) return;
+    isPollingHealthRef.current = true;
+    const reqSeq = ++healthSequenceRef.current;
+
     try {
-      const data = await apiService.getHealth();
-      setHealth(data);
-      setHealthError(null);
+      const data = await apiService.getHealth(force);
+      // Strictly ignore stale responses from earlier requests
+      if (reqSeq >= healthSequenceRef.current) {
+        setHealth(data);
+        setHealthError(null);
+      }
     } catch (err: any) {
-      setHealth(null);
-      setHealthError(err?.message || 'API Offline');
+      if (reqSeq >= healthSequenceRef.current) {
+        setHealth(null);
+        setHealthError(err?.message || 'FastAPI Backend Offline');
+      }
+    } finally {
+      isPollingHealthRef.current = false;
     }
   }, []);
 
   useEffect(() => {
-    checkHealth();
+    checkHealth(true);
     // Poll every 10 seconds for timely recovery after restart
-    const interval = setInterval(checkHealth, 10000);
+    const interval = setInterval(() => checkHealth(false), 10000);
 
-    // Immediate check on browser window focus or network reconnect
+    // Recheck on browser window focus or network reconnect without duplicate stacking
     const handleRecheck = () => {
-      checkHealth();
+      checkHealth(false);
     };
     window.addEventListener('focus', handleRecheck);
     window.addEventListener('online', handleRecheck);
@@ -505,6 +532,9 @@ export const App: React.FC = () => {
                 examDate={activeCourse?.assessments?.find(a => a.assessment_type === 'end_sem' || a.scope === 'end_sem')?.exam_date || activeCourse?.assessments?.[activeCourse.assessments.length - 1]?.exam_date || studyPlan?.exam_date}
                 initialPlan={studyPlan}
                 onPlanUpdated={setStudyPlan}
+                courses={courses}
+                activeCourse={activeCourse}
+                onSelectCourse={setActiveCourse}
               />
             )}
 
@@ -524,7 +554,7 @@ export const App: React.FC = () => {
             {currentTab === 'settings' && (
               <SettingsPage
                 health={health}
-                onRefreshHealth={checkHealth}
+                onRefreshHealth={() => checkHealth(true)}
                 preferences={preferences}
                 onSavePreferences={handleUpdatePreferences}
               />

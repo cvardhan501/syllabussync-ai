@@ -2959,17 +2959,23 @@ def delete_course(course_id: str, owner_user_id: Optional[str] = None) -> bool:
             actual_id = c["id"]
             s_id = c["syllabus_id"]
 
-        conn.execute("DELETE FROM courses WHERE id = ?", (actual_id,))
-        conn.execute("DELETE FROM course_assessments WHERE course_id = ?", (actual_id,))
+        # Delete child entities in reverse dependency order (leaf -> root) to respect foreign keys
         if s_id:
-            conn.execute("DELETE FROM syllabi WHERE id = ?", (s_id,))
-            conn.execute("DELETE FROM modules WHERE syllabus_id = ?", (s_id,))
-            conn.execute("DELETE FROM topics WHERE syllabus_id = ?", (s_id,))
+            conn.execute("DELETE FROM study_tasks WHERE syllabus_id = ? OR course_id = ?", (s_id, actual_id))
+            conn.execute("DELETE FROM study_plans WHERE syllabus_id = ? OR course_id = ?", (s_id, actual_id))
             conn.execute("DELETE FROM topic_resources WHERE syllabus_id = ?", (s_id,))
             conn.execute("DELETE FROM rejected_channels WHERE syllabus_id = ?", (s_id,))
             conn.execute("DELETE FROM syllabus_coverage_summary WHERE syllabus_id = ?", (s_id,))
-            conn.execute("DELETE FROM study_plans WHERE syllabus_id = ? OR course_id = ?", (s_id, actual_id))
-            conn.execute("DELETE FROM study_tasks WHERE syllabus_id = ? OR course_id = ?", (s_id, actual_id))
+            conn.execute("DELETE FROM topics WHERE syllabus_id = ?", (s_id,))
+            conn.execute("DELETE FROM modules WHERE syllabus_id = ?", (s_id,))
+            conn.execute("DELETE FROM syllabi WHERE id = ? OR course_id = ?", (s_id, actual_id))
+        else:
+            conn.execute("DELETE FROM study_tasks WHERE course_id = ?", (actual_id,))
+            conn.execute("DELETE FROM study_plans WHERE course_id = ?", (actual_id,))
+            conn.execute("DELETE FROM syllabi WHERE course_id = ?", (actual_id,))
+
+        conn.execute("DELETE FROM course_assessments WHERE course_id = ?", (actual_id,))
+        conn.execute("DELETE FROM courses WHERE id = ?", (actual_id,))
         conn.commit()
         return True
 
@@ -3154,6 +3160,10 @@ def get_syllabus_owner_id(syllabus_id: str) -> Optional[str]:
             (syllabus_id,)
         ).fetchone()
         if not row:
+            # Check if syllabus_id is actually a course_id
+            c_row = conn.execute("SELECT owner_user_id FROM courses WHERE id = ?", (syllabus_id,)).fetchone()
+            if c_row and c_row["owner_user_id"]:
+                return str(c_row["owner_user_id"])
             return None
         if row["owner_user_id"]:
             return str(row["owner_user_id"])

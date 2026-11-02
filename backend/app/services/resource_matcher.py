@@ -58,10 +58,12 @@ STOP_WORDS = {
     "part", "unit", "module"
 }
 
-# In-memory evaluation and strategy preview caches
+# In-memory evaluation, channel discovery, and strategy preview caches
 _RELEVANCE_CACHE: Dict[Tuple[str, str, str], Tuple[float, str, str]] = {}
 _PREVIEW_CACHE: Dict[str, Tuple[float, Any]] = {}
 _PREVIEW_CACHE_TTL = 300.0  # 5 minutes
+_CHANNEL_DISCOVERY_CACHE: Dict[str, Tuple[float, Any]] = {}
+_CHANNEL_DISCOVERY_CACHE_TTL = 300.0  # 5 minutes
 
 
 class ResourceMatcherService:
@@ -265,12 +267,24 @@ class ResourceMatcherService:
             lang_list = ["English"]
         primary_lang = lang_list[0]
 
+        # Check in-memory channel discovery cache to accelerate repeat wizard steps
+        cache_key = f"{syllabus_id}_{primary_lang}_{','.join(sorted(lang_list))}"
+        now = time.time()
+        if not force_refresh and cache_key in _CHANNEL_DISCOVERY_CACHE:
+            ts, cached_discovery = _CHANNEL_DISCOVERY_CACHE[cache_key]
+            if now - ts < _CHANNEL_DISCOVERY_CACHE_TTL:
+                return cached_discovery
+
+        # Pre-warm search cache in a single query to eliminate N+1 DB roundtrips and YouTube API hits
+        topic_queries = [cls.generate_topic_search_query(course_name, t["topic_title"]) for t in flattened_topics]
+        batch_warm_search_cache(topic_queries, primary_lang)
+
         # Topic candidate search with bounded concurrency
         channel_topics_map: Dict[str, Set[str]] = {}
         channel_info_map: Dict[str, Dict[str, Any]] = {}
         channel_examples_map: Dict[str, List[Dict[str, Any]]] = {}
 
-        sem = asyncio.Semaphore(5)
+        sem = asyncio.Semaphore(15)
 
         async def _fetch_channel_candidate(t: Dict[str, Any]):
             async with sem:
@@ -374,7 +388,7 @@ class ResourceMatcherService:
         # Sort channels by fit score and covered count descending
         discovered_channels.sort(key=lambda c: (c.fit_score, c.relevant_video_count), reverse=True)
 
-        return ChannelDiscoveryResponse(
+        resp = ChannelDiscoveryResponse(
             status="success",
             syllabus_id=syllabus_id,
             course_name=course_name,
@@ -384,6 +398,8 @@ class ResourceMatcherService:
             discovered_channels=discovered_channels,
             message=f"Discovered {len(discovered_channels)} accredited educational channels for '{course_name}'.",
         )
+        _CHANNEL_DISCOVERY_CACHE[cache_key] = (now, resp)
+        return resp
 
     @classmethod
     async def generate_strategy_preview(

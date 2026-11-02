@@ -14,6 +14,7 @@ export interface HealthResponse {
   timestamp: string;
   environment: string;
   database_connected?: boolean | null;
+  database_status?: 'connected' | 'degraded' | 'timeout' | string | null;
 }
 
 export interface SyllabusUploadResponse {

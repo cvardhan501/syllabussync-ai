@@ -305,6 +305,8 @@ export const VideoLibraryPage: React.FC<VideoLibraryPageProps> = ({
     try {
       const updated = await apiService.approveThirdChannel(currentSyllabusId);
       setDiscoveryData(updated);
+      const cacheKey = `video_discovery_${currentSyllabusId}_${selectedLanguage}`;
+      sessionStorage.setItem(cacheKey, JSON.stringify(updated));
       if (onDiscoveryUpdated) onDiscoveryUpdated(updated);
     } catch (err: any) {
       setError(err.message || 'Failed to approve third channel.');

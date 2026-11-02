@@ -81,14 +81,15 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
     setIsLoadingDiagnostics(true);
     setDiagnosticsError(null);
 
-    // Refresh health probe in parallel for instant status updates
-    apiService.getHealth()
+    // Refresh health probe with force refresh
+    apiService.getHealth(true)
       .then((h) => {
         setHealth(h);
         if (onRefreshHealth) onRefreshHealth().catch(() => {});
       })
       .catch(() => {
         setHealth(null);
+        if (onRefreshHealth) onRefreshHealth().catch(() => {});
       });
 
     try {
@@ -547,13 +548,15 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 <span>Database</span>
               </div>
               <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
-                (diagnostics?.database.status === 'connected' || health?.database_connected)
+                (diagnostics?.database.status === 'connected' || health?.database_connected === true)
                   ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
-                  : diagnostics?.database.status === 'timeout'
+                  : (diagnostics?.database.status === 'timeout' || health?.database_connected === false)
                   ? 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
                   : 'bg-slate-800 text-slate-400'
               }`}>
-                {diagnostics?.database.status || (health?.database_connected ? 'connected' : (isLoadingDiagnostics ? 'checking' : 'offline'))}
+                {(diagnostics?.database.status === 'connected' || health?.database_connected === true)
+                  ? 'connected'
+                  : ((diagnostics?.database.status === 'timeout' || health?.database_connected === false) ? 'degraded' : (isLoadingDiagnostics ? 'checking' : 'offline'))}
               </span>
             </div>
 
@@ -567,13 +570,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <div className="flex justify-between">
                 <span className="text-slate-400">Tables Count:</span>
                 <span className="text-white">
-                  {diagnostics ? `${diagnostics.database.tables_count} tables` : (health?.database_connected ? 'Verified active' : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable'))}
+                  {diagnostics ? `${diagnostics.database.tables_count} tables` : (health?.database_connected === true ? 'Verified active' : (health?.database_connected === false ? 'Unreachable' : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')))}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Connection:</span>
-                <span className={(diagnostics?.database.status === 'connected' || health?.database_connected) ? 'text-emerald-400 font-bold' : (diagnostics?.database.status === 'timeout' ? 'text-amber-400 font-bold' : 'text-slate-500 font-mono')}>
-                  {(diagnostics?.database.status === 'connected' || health?.database_connected) ? 'Active & Verified' : (diagnostics?.database.status === 'timeout' ? 'Connection Timed Out' : (isLoadingDiagnostics ? 'Checking...' : 'Offline'))}
+                <span className={(diagnostics?.database.status === 'connected' || health?.database_connected === true) ? 'text-emerald-400 font-bold' : ((diagnostics?.database.status === 'timeout' || health?.database_connected === false) ? 'text-amber-400 font-bold' : 'text-slate-500 font-mono')}>
+                  {(diagnostics?.database.status === 'connected' || health?.database_connected === true) ? 'Active & Verified' : ((diagnostics?.database.status === 'timeout' || health?.database_connected === false) ? 'Connection Degraded / Timed Out' : (isLoadingDiagnostics ? 'Checking...' : 'Offline'))}
                 </span>
               </div>
             </div>

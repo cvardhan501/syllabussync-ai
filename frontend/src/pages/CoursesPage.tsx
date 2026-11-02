@@ -23,7 +23,7 @@ interface CoursesPageProps {
   activeCourseId: string | null;
   onSelectCourse: (course: Course) => void;
   onOpenUploadWizard: () => void;
-  onRefreshCourses: () => Promise<void>;
+  onRefreshCourses: (deletedCourseId?: string) => Promise<void>;
   onNavigate: (tab: NavigationTab) => void;
 }
 
@@ -72,12 +72,13 @@ export const CoursesPage: React.FC<CoursesPageProps> = ({
 
   const handleDeleteCourse = async () => {
     if (!deletingCourse) return;
+    const targetCourse = deletingCourse;
     setIsActionLoading(true);
     setActionError(null);
     try {
-      await apiService.deleteCourse(deletingCourse.id);
-      await onRefreshCourses();
+      await apiService.deleteCourse(targetCourse.id);
       setDeletingCourse(null);
+      await onRefreshCourses(targetCourse.id);
     } catch (err: any) {
       setActionError(err.message || 'Failed to delete course.');
     } finally {
@@ -535,6 +536,15 @@ export const CoursesPage: React.FC<CoursesPageProps> = ({
               Are you sure you want to delete <span className="font-semibold text-white">"{deletingCourse.course_name}"</span>? 
               This will permanently remove all associated syllabus modules, daily tasks, study notes, and video associations. This action cannot be undone.
             </p>
+
+            {actionError && (
+              <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
+                <span>{actionError}</span>
+                <button type="button" onClick={() => setActionError(null)} className="text-slate-400 hover:text-white">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
 
             <div className="flex items-center justify-end gap-2 pt-2">
               <button

@@ -127,7 +127,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
 
         {/* System Health Status Footer */}
-        <div className="px-4 py-2.5 border-t border-[#152342] bg-[#070d1c]">
+        <div className="px-4 py-2.5 border-t border-[#152342] bg-[#070d1c] space-y-1">
           <div className="flex items-center justify-between text-[11px]">
             <span className="text-slate-400 font-medium">FastAPI Backend</span>
             {health?.status === 'healthy' || health?.status === 'ok' ? (
@@ -143,6 +143,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </span>
             ) : (
               <span className="text-slate-500">Connecting...</span>
+            )}
+          </div>
+          {/* Separate Database Connectivity Status */}
+          <div className="flex items-center justify-between text-[10px] font-mono">
+            <span className="text-slate-500">Database</span>
+            {health?.status === 'healthy' || health?.status === 'ok' ? (
+              health.database_connected === false ? (
+                <span className="inline-flex items-center gap-1 text-amber-400 font-medium">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                  <span>Degraded</span>
+                </span>
+              ) : health.database_connected === true ? (
+                <span className="inline-flex items-center gap-1 text-emerald-400">
+                  <span className="w-1 h-1 rounded-full bg-emerald-400" />
+                  <span>Connected</span>
+                </span>
+              ) : (
+                <span className="text-slate-500">Standby</span>
+              )
+            ) : (
+              <span className="text-slate-600">Unavailable</span>
             )}
           </div>
         </div>

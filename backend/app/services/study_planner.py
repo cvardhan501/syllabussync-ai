@@ -15,6 +15,7 @@ from app.models.database import (
     update_task_completion,
     update_task_note,
     reschedule_plan_tasks,
+    get_db_connection,
     _safe_json_loads,
     _to_iso_str,
 )
@@ -148,6 +149,17 @@ class StudyPlannerService:
         existing_plan = get_active_study_plan(syllabus_id)
         plan_id = existing_plan["id"] if existing_plan else f"plan_{syllabus_id}"
 
+        # Resolve linked course_id
+        course_id = hierarchy.get("course_id") or (existing_plan.get("course_id") if existing_plan else None)
+        if not course_id:
+            try:
+                with get_db_connection() as conn:
+                    c_row = conn.execute("SELECT id FROM courses WHERE syllabus_id = ? OR id = ? LIMIT 1", (syllabus_id, syllabus_id)).fetchone()
+                    if c_row:
+                        course_id = c_row["id"]
+            except Exception as e:
+                logger.warning(f"Failed to lookup course_id for syllabus {syllabus_id}: {e}")
+
         # Fetch existing tasks to preserve completions and notes
         existing_tasks = get_plan_tasks(plan_id) if existing_plan else []
         completed_task_map: Dict[str, Dict[str, Any]] = {}
@@ -201,6 +213,7 @@ class StudyPlannerService:
 
             raw_tasks_to_schedule.append({
                 "id": video_task_id,
+                "course_id": course_id,
                 "syllabus_id": syllabus_id,
                 "module_id": mod_id,
                 "module_title": mod_title,
@@ -218,6 +231,7 @@ class StudyPlannerService:
             s_min = 25 if difficulty == "easy" else (35 if difficulty == "medium" else 45)
             raw_tasks_to_schedule.append({
                 "id": study_task_id,
+                "course_id": course_id,
                 "syllabus_id": syllabus_id,
                 "module_id": mod_id,
                 "module_title": mod_title,
@@ -235,6 +249,7 @@ class StudyPlannerService:
             p_min = 20 if difficulty == "easy" else (30 if difficulty == "medium" else 45)
             raw_tasks_to_schedule.append({
                 "id": practice_task_id,
+                "course_id": course_id,
                 "syllabus_id": syllabus_id,
                 "module_id": mod_id,
                 "module_title": mod_title,
@@ -348,6 +363,7 @@ class StudyPlannerService:
         plan_dict = {
             "id": plan_id,
             "syllabus_id": syllabus_id,
+            "course_id": course_id,
             "title": f"Study Roadmap: {course_name}",
             "exam_date": exam_date,
             "owner_user_id": owner_user_id or (existing_plan.get("owner_user_id") if existing_plan else None),

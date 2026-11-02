@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   CalendarDays, 
   Check, 
@@ -18,7 +18,8 @@ import type {
   NavigationTab, 
   SyllabusAnalysisResponse, 
   StudyPlanResponse,
-  TaskItemSchema 
+  TaskItemSchema,
+  Course
 } from '../types';
 import { apiService, ApiErrorResponse } from '../services/api';
 import { SproutingPlantIllustration } from '../components/Illustrations';
@@ -28,7 +29,10 @@ interface StudyPlanPageProps {
   onNavigate: (tab: NavigationTab) => void;
   examDate?: string;
   initialPlan?: StudyPlanResponse | null;
-  onPlanUpdated?: (plan: StudyPlanResponse) => void;
+  onPlanUpdated?: (plan: StudyPlanResponse | null) => void;
+  courses?: Course[];
+  activeCourse?: Course | null;
+  onSelectCourse?: (course: Course) => void;
 }
 
 export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
@@ -37,12 +41,20 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
   examDate,
   initialPlan,
   onPlanUpdated,
+  courses = [],
+  activeCourse,
+  onSelectCourse,
 }) => {
+  const currentSyllabusId = activeCourse?.syllabus_id || analyzedSyllabus?.syllabus_id || activeCourse?.id;
+  const currentCourseName = activeCourse?.course_name || analyzedSyllabus?.course_name || 'Course';
+  const currentCourseCode = activeCourse?.course_code || analyzedSyllabus?.course_code;
+
   const [plan, setPlan] = useState<StudyPlanResponse | null>(() => initialPlan || null);
   const [isLoading, setIsLoading] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isRescheduling, setIsRescheduling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadSeqRef = useRef(0);
 
   // User-selected target exam date: prioritize syllabus plan date, prop, or 60 days in future
   const getInitialExamDate = () => {
@@ -84,23 +96,26 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
   const [noteContent, setNoteContent] = useState('');
   const [isSavingNote, setIsSavingNote] = useState(false);
 
-  // Load existing study plan on mount
+  // Load active course study plan with sequence guard and race condition immunity
   useEffect(() => {
     let isMounted = true;
-    if (!analyzedSyllabus?.syllabus_id) {
+    const reqSeq = ++loadSeqRef.current;
+
+    if (!currentSyllabusId) {
       setPlan(null);
+      setIsLoading(false);
       return;
     }
 
+    // Immediately clear previous course's plan so no stale tasks are visible while switching
+    setPlan(null);
+    setIsLoading(true);
+    setError(null);
+
     const loadPlan = async () => {
-      // Only show full loading spinner if no plan is cached or displayed
-      if (!plan && !initialPlan) {
-        setIsLoading(true);
-      }
-      setError(null);
       try {
-        const data = await apiService.getStudyPlan(analyzedSyllabus.syllabus_id);
-        if (isMounted) {
+        const data = await apiService.getStudyPlan(currentSyllabusId);
+        if (isMounted && reqSeq === loadSeqRef.current) {
           setPlan(data);
           if (onPlanUpdated) onPlanUpdated(data);
           // Set selectedDate to today or first day
@@ -109,9 +124,12 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
           setSelectedDate(hasToday ? today : data.daily_schedules[0]?.date || '');
         }
       } catch (err: any) {
-        if (isMounted) {
+        if (isMounted && reqSeq === loadSeqRef.current) {
           if (err instanceof ApiErrorResponse) {
-            if (err.status !== 404) {
+            if (err.status === 404) {
+              // Clean empty state for course that does not yet have a generated study plan
+              setPlan(null);
+            } else {
               setError(err.message || 'Failed to load study plan.');
             }
           } else {
@@ -119,7 +137,9 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
           }
         }
       } finally {
-        if (isMounted) setIsLoading(false);
+        if (isMounted && reqSeq === loadSeqRef.current) {
+          setIsLoading(false);
+        }
       }
     };
 
@@ -127,11 +147,11 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [analyzedSyllabus?.syllabus_id]);
+  }, [currentSyllabusId]);
 
   // Generate / Regenerate Study Plan
   const handleGeneratePlan = async () => {
-    if (!analyzedSyllabus?.syllabus_id) return;
+    if (!currentSyllabusId) return;
     const today = new Date().toISOString().split('T')[0];
     if (!targetExamDate || targetExamDate <= today) {
       setError(`Exam date (${targetExamDate || 'empty'}) cannot be in the past. Please select a future exam date.`);
@@ -140,7 +160,7 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
     setIsGenerating(true);
     setError(null);
     try {
-      const data = await apiService.createStudyPlan(analyzedSyllabus.syllabus_id, {
+      const data = await apiService.createStudyPlan(currentSyllabusId, {
         exam_date: targetExamDate,
         daily_target_minutes: 120,
         preserve_completed: true,
@@ -278,6 +298,38 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
       {/* Header Row */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
+          {courses.length > 0 && (
+            <div className="flex items-center gap-2 flex-wrap mb-1.5">
+              {courses.length > 1 && onSelectCourse && (
+                <div className="relative inline-block mr-1">
+                  <select
+                    value={activeCourse?.id || ''}
+                    onChange={(e) => {
+                      const c = courses.find((item) => item.id === e.target.value);
+                      if (c) onSelectCourse(c);
+                    }}
+                    className="text-xs bg-[#0b1429] border border-[#1b2b52] text-white px-3 py-1 rounded-xl focus:outline-hidden focus:border-blue-500 cursor-pointer font-medium"
+                    aria-label="Select course for study plan"
+                  >
+                    {courses.map((c) => (
+                      <option key={c.id} value={c.id} className="bg-[#0b1429] text-white">
+                        {c.course_code ? `[${c.course_code}] ${c.course_name}` : c.course_name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {currentCourseCode && (
+                <span className="px-2.5 py-0.5 rounded-lg bg-blue-600/20 text-blue-300 border border-blue-500/40 font-mono text-xs font-bold uppercase tracking-wider">
+                  {currentCourseCode}
+                </span>
+              )}
+              <span className="text-xs text-slate-400 font-semibold truncate max-w-[280px]">
+                {currentCourseName}
+              </span>
+            </div>
+          )}
+
           <h2 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight m-0">
             Your Personalized Study Plan
           </h2>
@@ -308,7 +360,7 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
             />
           </div>
 
-          {analyzedSyllabus && plan && (
+          {currentSyllabusId && plan && (
             <button
               onClick={handleGeneratePlan}
               disabled={isGenerating}
@@ -379,7 +431,7 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
       )}
 
       {/* Empty State: No Syllabus */}
-      {!analyzedSyllabus && (
+      {!currentSyllabusId && !isLoading && (
         <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-8 text-center space-y-4">
           <div className="w-14 h-14 rounded-2xl bg-blue-600/15 border border-blue-500/30 text-blue-400 flex items-center justify-center mx-auto">
             <ListTodo className="w-7 h-7" />
@@ -400,7 +452,7 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
       )}
 
       {/* Empty State: Syllabus Exists but Plan not yet created */}
-      {analyzedSyllabus && !plan && !isLoading && (
+      {currentSyllabusId && !plan && !isLoading && (
         <div className="rounded-2xl bg-[#0b1429] border border-[#18284e] p-8 text-center space-y-4">
           <div className="w-14 h-14 rounded-2xl bg-blue-600/15 border border-blue-500/30 text-blue-400 flex items-center justify-center mx-auto">
             <Sparkles className="w-7 h-7" />
@@ -410,7 +462,7 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
               Ready to Build Your Study Roadmap
             </h3>
             <p className="text-xs text-slate-400 m-0">
-              Generate a timetable based on {analyzedSyllabus.total_topics_count} verified topics, targeting your exam on {targetExamDate}.
+              Generate a timetable for <span className="font-semibold text-white">{currentCourseName}</span> targeting your exam on {targetExamDate}.
             </p>
           </div>
 
