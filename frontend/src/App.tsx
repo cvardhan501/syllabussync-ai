@@ -1,4 +1,4 @@
-import React, { useState, useEffect, Suspense, lazy } from 'react';
+import React, { useState, useEffect, useCallback, Suspense, lazy } from 'react';
 import { 
   LayoutDashboard, 
   BookOpen, 
@@ -47,7 +47,6 @@ const DEFAULT_PREFERENCES: UserPreferences = {
   preferredLanguage: 'English',
   lessonStyle: 'In-depth',
   dailyStudyAvailability: '2-4 hours',
-  examDate: '2026-04-25',
   theme: 'dark',
   studyReminders: true,
   deadlineAlerts: true,
@@ -75,7 +74,21 @@ export const App: React.FC = () => {
   const [session, setSession] = useState<Session | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [isCheckingSession, setIsCheckingSession] = useState(true);
-  const [isDevBypass, setIsDevBypass] = useState(false);
+  const [isDevBypass, setIsDevBypassState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('syllabussync_dev_bypass') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const setIsDevBypass = (val: boolean) => {
+    setIsDevBypassState(val);
+    try {
+      if (val) localStorage.setItem('syllabussync_dev_bypass', 'true');
+      else localStorage.removeItem('syllabussync_dev_bypass');
+    } catch {}
+  };
 
   const [uploadedSyllabus, setUploadedSyllabus] = useState<SyllabusUploadResponse | null>(null);
   const [analyzedSyllabus, setAnalyzedSyllabusState] = useState<SyllabusAnalysisResponse | null>(() => {
@@ -289,32 +302,35 @@ export const App: React.FC = () => {
   };
 
   // Poll or check health on mount
+  const checkHealth = useCallback(async () => {
+    try {
+      const data = await apiService.getHealth();
+      setHealth(data);
+      setHealthError(null);
+    } catch (err: any) {
+      setHealth(null);
+      setHealthError(err?.message || 'API Offline');
+    }
+  }, []);
+
   useEffect(() => {
-    let isMounted = true;
-
-    const checkHealth = async () => {
-      try {
-        const data = await apiService.getHealth();
-        if (isMounted) {
-          setHealth(data);
-          setHealthError(null);
-        }
-      } catch (err: any) {
-        if (isMounted) {
-          setHealth(null);
-          setHealthError(err.message || 'API Offline');
-        }
-      }
-    };
-
     checkHealth();
-    const interval = setInterval(checkHealth, 20000);
+    // Poll every 10 seconds for timely recovery after restart
+    const interval = setInterval(checkHealth, 10000);
+
+    // Immediate check on browser window focus or network reconnect
+    const handleRecheck = () => {
+      checkHealth();
+    };
+    window.addEventListener('focus', handleRecheck);
+    window.addEventListener('online', handleRecheck);
 
     return () => {
-      isMounted = false;
       clearInterval(interval);
+      window.removeEventListener('focus', handleRecheck);
+      window.removeEventListener('online', handleRecheck);
     };
-  }, []);
+  }, [checkHealth]);
 
   // Fetch active study plan and discovery resources when syllabus changes
   useEffect(() => {
@@ -326,22 +342,23 @@ export const App: React.FC = () => {
     }
 
     const loadData = async () => {
-      try {
-        const plan = await apiService.getStudyPlan(analyzedSyllabus.syllabus_id);
-        if (isMounted) setStudyPlan(plan);
-      } catch (err: any) {
-        if (isMounted && err instanceof ApiErrorResponse && err.status === 404) {
-          setStudyPlan(null);
-        }
+      const [planRes, resourcesRes] = await Promise.allSettled([
+        apiService.getStudyPlan(analyzedSyllabus.syllabus_id),
+        apiService.getResources(analyzedSyllabus.syllabus_id),
+      ]);
+
+      if (!isMounted) return;
+
+      if (planRes.status === 'fulfilled') {
+        setStudyPlan(planRes.value);
+      } else if (planRes.reason instanceof ApiErrorResponse && planRes.reason.status === 404) {
+        setStudyPlan(null);
       }
 
-      try {
-        const resources = await apiService.getResources(analyzedSyllabus.syllabus_id);
-        if (isMounted) setDiscoveryData(resources);
-      } catch (err: any) {
-        if (isMounted && err instanceof ApiErrorResponse && err.status === 404) {
-          setDiscoveryData(null);
-        }
+      if (resourcesRes.status === 'fulfilled') {
+        setDiscoveryData(resourcesRes.value);
+      } else if (resourcesRes.reason instanceof ApiErrorResponse && resourcesRes.reason.status === 404) {
+        setDiscoveryData(null);
       }
     };
 
@@ -378,7 +395,11 @@ export const App: React.FC = () => {
   if (!session && !isDevBypass) {
     return (
       <Suspense fallback={<PageLoadingFallback />}>
-        <LoginPage onBypassDevMode={() => setIsDevBypass(true)} />
+        <LoginPage 
+          onBypassDevMode={() => setIsDevBypass(true)} 
+          health={health} 
+          healthError={healthError} 
+        />
       </Suspense>
     );
   }
@@ -414,6 +435,8 @@ export const App: React.FC = () => {
           onSelectCourse={setActiveCourse}
           onNavigateToCourses={() => setCurrentTab('courses')}
           user={user}
+          health={health}
+          healthError={healthError}
           onSignOut={handleSignOut}
           onSignIn={() => setIsDevBypass(false)}
         />
@@ -479,7 +502,8 @@ export const App: React.FC = () => {
               <StudyPlanPage
                 analyzedSyllabus={analyzedSyllabus}
                 onNavigate={setCurrentTab}
-                examDate={preferences.examDate}
+                examDate={activeCourse?.assessments?.find(a => a.assessment_type === 'end_sem' || a.scope === 'end_sem')?.exam_date || activeCourse?.assessments?.[activeCourse.assessments.length - 1]?.exam_date || studyPlan?.exam_date}
+                initialPlan={studyPlan}
                 onPlanUpdated={setStudyPlan}
               />
             )}
@@ -500,6 +524,7 @@ export const App: React.FC = () => {
             {currentTab === 'settings' && (
               <SettingsPage
                 health={health}
+                onRefreshHealth={checkHealth}
                 preferences={preferences}
                 onSavePreferences={handleUpdatePreferences}
               />

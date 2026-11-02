@@ -102,7 +102,7 @@ class UserSettingsSchema(BaseModel):
     lesson_style: str = Field(default="In-depth")
     daily_study_availability: str = Field(default="2-4 hours")
     daily_target_minutes: int = Field(default=120)
-    exam_date: str = Field(default="2026-05-15")
+    exam_date: Optional[str] = Field(default=None)
     study_days: List[str] = Field(default=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
     theme: Literal["dark", "light"] = Field(default="dark")
     study_reminders: bool = Field(default=True)

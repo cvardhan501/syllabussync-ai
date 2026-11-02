@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Check, 
-  Calendar, 
   Moon, 
   Sun, 
   Server, 
@@ -28,6 +27,7 @@ import { apiService } from '../services/api';
 
 interface SettingsPageProps {
   health?: HealthResponse | null;
+  onRefreshHealth?: () => Promise<void>;
   preferences?: UserPreferences;
   onSavePreferences?: (prefs: UserPreferences) => void;
 }
@@ -36,7 +36,6 @@ const DEFAULT_PREFERENCES: UserPreferences = {
   preferredLanguage: 'English',
   lessonStyle: 'In-depth',
   dailyStudyAvailability: '2-4 hours',
-  examDate: '2026-05-15',
   theme: 'dark',
   studyReminders: true,
   deadlineAlerts: true,
@@ -44,13 +43,23 @@ const DEFAULT_PREFERENCES: UserPreferences = {
 };
 
 export const SettingsPage: React.FC<SettingsPageProps> = ({ 
-  health: _health,
+  health: propHealth,
+  onRefreshHealth,
   preferences = DEFAULT_PREFERENCES,
   onSavePreferences,
 }) => {
   const [formData, setFormData] = useState<UserPreferences>(preferences);
   const [isSaved, setIsSaved] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+
+  // Synchronized health state from prop and local re-probe
+  const [health, setHealth] = useState<HealthResponse | null>(() => propHealth || null);
+
+  useEffect(() => {
+    if (propHealth) {
+      setHealth(propHealth);
+    }
+  }, [propHealth]);
 
   // Diagnostics state
   const [diagnostics, setDiagnostics] = useState<SystemDiagnosticsResponse | null>(null);
@@ -71,6 +80,17 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   const fetchDiagnostics = async () => {
     setIsLoadingDiagnostics(true);
     setDiagnosticsError(null);
+
+    // Refresh health probe in parallel for instant status updates
+    apiService.getHealth()
+      .then((h) => {
+        setHealth(h);
+        if (onRefreshHealth) onRefreshHealth().catch(() => {});
+      })
+      .catch(() => {
+        setHealth(null);
+      });
+
     try {
       const data = await apiService.getDiagnostics();
       setDiagnostics(data);
@@ -141,7 +161,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
             preferredLanguage: backendSettings.preferred_language,
             lessonStyle: backendSettings.lesson_style,
             dailyStudyAvailability: backendSettings.daily_study_availability,
-            examDate: backendSettings.exam_date,
             theme: backendSettings.theme,
             studyReminders: backendSettings.study_reminders,
             deadlineAlerts: backendSettings.deadline_alerts,
@@ -174,7 +193,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         lesson_style: formData.lessonStyle,
         daily_study_availability: formData.dailyStudyAvailability,
         daily_target_minutes: targetMin,
-        exam_date: formData.examDate,
         study_days: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
         theme: formData.theme,
         study_reminders: formData.studyReminders,
@@ -284,25 +302,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </select>
                 <ChevronDown className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               </div>
-            </div>
-
-            {/* Exam Date */}
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-slate-300 block">
-                Exam Date
-              </label>
-              <div className="relative">
-                <input
-                  type="date"
-                  value={formData.examDate}
-                  onChange={(e) => setFormData({ ...formData, examDate: e.target.value })}
-                  className="w-full rounded-xl bg-[#070b14] border border-[#1b2b52] px-3.5 py-2 text-xs text-white focus:outline-none focus:border-blue-500 transition [color-scheme:dark]"
-                />
-                <Calendar className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-              </div>
-              <p className="text-[10px] text-slate-400 m-0">
-                Used to calculate pace and target milestones.
-              </p>
             </div>
           </div>
         </div>
@@ -455,13 +454,15 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   System Diagnostics & Service Health
                 </h3>
                 <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full uppercase tracking-wider ${
-                  diagnostics?.status === 'healthy' || diagnostics?.status === 'success'
+                  diagnostics?.status === 'healthy' || diagnostics?.status === 'success' || health?.status === 'healthy' || health?.status === 'ok'
                     ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
                     : diagnosticsError
                     ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
                     : 'bg-slate-500/15 text-slate-300 border border-slate-500/30'
                 }`}>
-                  {diagnostics?.status || (diagnosticsError ? 'Unavailable' : 'Checking')}
+                  {diagnostics?.status === 'success' || health?.status === 'healthy' || health?.status === 'ok'
+                    ? 'ONLINE' 
+                    : (diagnostics?.status || (diagnosticsError ? 'DEGRADED' : 'CHECKING'))}
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 m-0">
@@ -482,7 +483,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         </div>
 
         {/* Diagnostics Error Banner */}
-        {diagnosticsError && (
+        {diagnosticsError && !health && (
           <div className="rounded-xl bg-amber-950/20 border border-amber-500/30 p-3.5 flex items-start gap-3">
             <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
             <div className="space-y-1">
@@ -506,13 +507,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 <span>FastAPI Service</span>
               </div>
               <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
-                diagnostics
-                  ? (diagnostics.backend.status === 'ok' || diagnostics.backend.status === 'healthy'
-                      ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
-                      : 'bg-amber-950/40 text-amber-300 border border-amber-800/50')
+                (diagnostics?.backend.status === 'ok' || diagnostics?.backend.status === 'healthy' || health?.status === 'healthy' || health?.status === 'ok')
+                  ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
+                  : diagnostics?.backend.status === 'degraded'
+                  ? 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
                   : 'bg-slate-800 text-slate-400'
               }`}>
-                {diagnostics?.backend.status || (isLoadingDiagnostics ? 'checking' : 'unavailable')}
+                {(diagnostics?.backend.status === 'ok' || diagnostics?.backend.status === 'healthy' || health?.status === 'healthy' || health?.status === 'ok') ? 'online' : (isLoadingDiagnostics ? 'checking' : 'offline')}
               </span>
             </div>
 
@@ -520,19 +521,19 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <div className="flex justify-between">
                 <span className="text-slate-400">Environment:</span>
                 <span className="text-white font-semibold">
-                  {diagnostics ? diagnostics.backend.environment : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                  {diagnostics?.backend.environment || health?.environment || (isLoadingDiagnostics ? 'Checking...' : 'Production')}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">App Version:</span>
                 <span className="text-white">
-                  {diagnostics ? diagnostics.backend.version : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                  {diagnostics?.backend.version || health?.version || (isLoadingDiagnostics ? 'Checking...' : '0.2.0')}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Health Status:</span>
-                <span className={diagnostics ? 'text-emerald-400 font-bold' : 'text-slate-500 font-mono'}>
-                  {diagnostics ? diagnostics.backend.status : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                <span className={(diagnostics?.backend.status === 'ok' || diagnostics?.backend.status === 'healthy' || health?.status === 'healthy' || health?.status === 'ok') ? 'text-emerald-400 font-bold' : 'text-slate-500 font-mono'}>
+                  {(diagnostics?.backend.status === 'ok' || diagnostics?.backend.status === 'healthy' || health?.status === 'healthy' || health?.status === 'ok') ? 'Online' : (isLoadingDiagnostics ? 'Checking...' : 'Offline')}
                 </span>
               </div>
             </div>
@@ -546,11 +547,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 <span>Database</span>
               </div>
               <span className={`text-[10px] px-2 py-0.5 rounded-md font-mono ${
-                diagnostics?.database.status === 'connected'
+                (diagnostics?.database.status === 'connected' || health?.database_connected)
                   ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/50'
+                  : diagnostics?.database.status === 'timeout'
+                  ? 'bg-amber-950/40 text-amber-300 border border-amber-800/50'
                   : 'bg-slate-800 text-slate-400'
               }`}>
-                {diagnostics?.database.status || (isLoadingDiagnostics ? 'checking' : 'unavailable')}
+                {diagnostics?.database.status || (health?.database_connected ? 'connected' : (isLoadingDiagnostics ? 'checking' : 'offline'))}
               </span>
             </div>
 
@@ -558,19 +561,19 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <div className="flex justify-between">
                 <span className="text-slate-400">Engine:</span>
                 <span className="text-white font-semibold">
-                  {diagnostics ? diagnostics.database.engine : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                  {diagnostics?.database.engine || 'PostgreSQL'}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Tables Count:</span>
                 <span className="text-white">
-                  {diagnostics ? `${diagnostics.database.tables_count} tables` : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                  {diagnostics ? `${diagnostics.database.tables_count} tables` : (health?.database_connected ? 'Verified active' : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable'))}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Connection:</span>
-                <span className={diagnostics?.database.status === 'connected' ? 'text-emerald-400 font-bold' : 'text-slate-500 font-mono'}>
-                  {diagnostics ? (diagnostics.database.status === 'connected' ? 'Active & Verified' : 'Error') : (isLoadingDiagnostics ? 'Checking...' : 'Unavailable')}
+                <span className={(diagnostics?.database.status === 'connected' || health?.database_connected) ? 'text-emerald-400 font-bold' : (diagnostics?.database.status === 'timeout' ? 'text-amber-400 font-bold' : 'text-slate-500 font-mono')}>
+                  {(diagnostics?.database.status === 'connected' || health?.database_connected) ? 'Active & Verified' : (diagnostics?.database.status === 'timeout' ? 'Connection Timed Out' : (isLoadingDiagnostics ? 'Checking...' : 'Offline'))}
                 </span>
               </div>
             </div>

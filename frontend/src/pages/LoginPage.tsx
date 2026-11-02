@@ -11,12 +11,19 @@ import {
   Loader2
 } from 'lucide-react';
 import { signInWithGoogle, isSupabaseConfigured } from '../services/supabase';
+import type { HealthResponse } from '../types';
 
 interface LoginPageProps {
   onBypassDevMode?: () => void;
+  health?: HealthResponse | null;
+  healthError?: string | null;
 }
 
-export const LoginPage: React.FC<LoginPageProps> = ({ onBypassDevMode }) => {
+export const LoginPage: React.FC<LoginPageProps> = ({ 
+  onBypassDevMode,
+  health,
+  healthError,
+}) => {
   const [isLoading, setIsLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
@@ -152,6 +159,24 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onBypassDevMode }) => {
                   </button>
                 </div>
               )}
+
+              {/* Live Backend Status Footer */}
+              <div className="pt-3 flex items-center justify-center gap-1.5 text-[11px] font-mono">
+                <span className="text-slate-500">Backend:</span>
+                {health?.status === 'healthy' || health?.status === 'ok' ? (
+                  <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span>FastAPI Online (v{health.version})</span>
+                  </span>
+                ) : healthError ? (
+                  <span className="inline-flex items-center gap-1 text-rose-400 font-medium">
+                    <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
+                    <span>FastAPI Offline</span>
+                  </span>
+                ) : (
+                  <span className="text-slate-500">Checking connection...</span>
+                )}
+              </div>
             </div>
 
             {/* Feature Highlights Grid */}

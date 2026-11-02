@@ -25,6 +25,7 @@ from app.models.database import (
     replace_course_syllabus,
     get_syllabus_record,
     save_syllabus_hierarchy,
+    update_syllabus_exam_date,
 )
 from app.agents.syllabus_analyzer import SyllabusAnalyzerAgent
 from app.services.syllabus_validator import SyllabusValidatorService
@@ -354,6 +355,9 @@ async def setup_and_analyze_syllabus(
                 break
         if not target_exam_date and sorted_assessments:
             target_exam_date = sorted_assessments[-1].exam_date
+
+        if target_exam_date:
+            update_syllabus_exam_date(payload.syllabus_id, target_exam_date)
 
         # 6. Generate initial study plan if exam date is set
         plan_data = None

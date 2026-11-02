@@ -635,6 +635,12 @@ export const VideoLibraryPage: React.FC<VideoLibraryPageProps> = ({
           initialStrategy={(discoveryData?.channel_strategy as any) || 'two_channels'}
           onCompleted={(confirmed) => {
             setDiscoveryData(confirmed);
+            const cacheKey = `video_discovery_${currentSyllabusId}_${selectedLanguage}`;
+            try {
+              sessionStorage.setItem(cacheKey, JSON.stringify(confirmed));
+            } catch {
+              // Ignore session storage quota error
+            }
             setShowWorkflow(false);
             if (onDiscoveryUpdated) onDiscoveryUpdated(confirmed);
           }}

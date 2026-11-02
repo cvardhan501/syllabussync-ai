@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { Menu, Search, Bell, Moon, Sun, GraduationCap, ChevronDown, Plus, LogOut, ShieldCheck } from 'lucide-react';
-import type { NavigationTab, Course } from '../types';
+import { Menu, Search, Bell, Moon, Sun, GraduationCap, ChevronDown, Plus, LogOut, ShieldCheck, Wifi, WifiOff } from 'lucide-react';
+import type { NavigationTab, Course, HealthResponse } from '../types';
 import type { User } from '../services/supabase';
 
 interface HeaderProps {
@@ -14,6 +14,8 @@ interface HeaderProps {
   onSelectCourse?: (c: Course) => void;
   onNavigateToCourses?: () => void;
   user?: User | null;
+  health?: HealthResponse | null;
+  healthError?: string | null;
   onSignOut?: () => void;
   onSignIn?: () => void;
 }
@@ -28,6 +30,8 @@ export const Header: React.FC<HeaderProps> = ({
   onSelectCourse,
   onNavigateToCourses,
   user,
+  health,
+  healthError,
   onSignOut,
   onSignIn,
 }) => {
@@ -149,8 +153,41 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
       </div>
 
-      {/* Right Controls: Notifications, Theme toggle, Profile Avatar */}
+      {/* Right Controls: Health Pill, Notifications, Theme toggle, Profile Avatar */}
       <div className="flex items-center gap-2.5 relative">
+        {/* Backend Health Status Indicator */}
+        <div
+          className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono border transition-all select-none ${
+            health?.status === 'healthy' || health?.status === 'ok'
+              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+              : healthError
+              ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
+              : 'bg-slate-500/10 text-slate-400 border-slate-500/30'
+          }`}
+          title={
+            health?.status === 'healthy' || health?.status === 'ok'
+              ? `FastAPI Backend Online (v${health.version})`
+              : healthError
+              ? `FastAPI Backend Offline: ${healthError}`
+              : 'Connecting to FastAPI Backend...'
+          }
+        >
+          {health?.status === 'healthy' || health?.status === 'ok' ? (
+            <Wifi className="w-3 h-3 text-emerald-400" />
+          ) : healthError ? (
+            <WifiOff className="w-3 h-3 text-rose-400" />
+          ) : (
+            <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-ping" />
+          )}
+          <span className="font-semibold uppercase tracking-wider text-[10px]">
+            {health?.status === 'healthy' || health?.status === 'ok'
+              ? `Online (v${health.version})`
+              : healthError
+              ? 'Offline'
+              : 'Connecting...'}
+          </span>
+        </div>
+
         {/* Notification Bell */}
         <div className="relative">
           <button

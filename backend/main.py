@@ -14,3 +14,11 @@ if str(BACKEND_ROOT) not in sys.path:
 from app.main import app
 
 __all__ = ["app"]
+
+if __name__ == "__main__":
+    import uvicorn
+    # Use SelectorEventLoop on Windows to prevent WinError 64 IOCP socket crashes when clients reset connections
+    loop_target = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, loop=loop_target, reload=False)
+
+

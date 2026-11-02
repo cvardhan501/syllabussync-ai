@@ -20,8 +20,22 @@ import type {
 } from '../types';
 import { getSupabaseAccessToken } from './supabase';
 
-// Use relative API path to leverage Vite proxy in dev, or customizable via environment
-const API_BASE = '/api';
+// Resolves API Base URL for local development and production deployments
+export const getApiBaseUrl = (): string => {
+  const envUrl = (import.meta.env.VITE_API_URL as string)?.trim();
+  if (envUrl) {
+    const clean = envUrl.replace(/\/$/, '');
+    return clean.endsWith('/api') ? clean : `${clean}/api`;
+  }
+  // Local development default: directly target local FastAPI backend
+  if (import.meta.env.DEV) {
+    return 'http://127.0.0.1:8000/api';
+  }
+  // Production fallback: relative /api routed by Vercel serverless functions
+  return '/api';
+};
+
+export const API_BASE = getApiBaseUrl();
 
 export class ApiErrorResponse extends Error {
   status: number;
@@ -32,12 +46,30 @@ export class ApiErrorResponse extends Error {
   }
 }
 
+// Map of in-flight GET requests for transparent client-side deduplication
+const inFlightGetRequests = new Map<string, Promise<Response>>();
+
 /**
  * Custom authenticated fetch wrapper that injects Supabase JWT access token
  * into outgoing API requests as `Authorization: Bearer <token>`.
  * Dispatches an event on 401 Unauthorized so the UI can prompt for re-authentication.
+ * Automatically deduplicates concurrent in-flight GET requests to eliminate redundant network traffic.
  */
 async function authenticatedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const method = (init?.method || 'GET').toUpperCase();
+  const isGet = method === 'GET';
+  const urlKey = typeof input === 'string' ? input : (input instanceof URL ? input.toString() : input.url);
+
+  // Return cloned response for concurrent duplicate in-flight GET requests
+  if (isGet && inFlightGetRequests.has(urlKey)) {
+    try {
+      const inFlight = await inFlightGetRequests.get(urlKey)!;
+      return inFlight.clone();
+    } catch {
+      // If previous in-flight failed, proceed to fresh fetch
+    }
+  }
+
   const token = await getSupabaseAccessToken();
   const headers = new Headers(init?.headers || {});
 
@@ -45,34 +77,59 @@ async function authenticatedFetch(input: RequestInfo | URL, init?: RequestInit):
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  // Enforce a client-side timeout (e.g. 60 seconds) so UI never hangs indefinitely
+  // Enforce a client-side timeout (adaptive: 180s for AI/uploads/study-plan, 60s for standard requests)
+  const urlStr = typeof input === 'string' ? input : ((input as Request)?.url || '');
+  const isHeavyOperation = (
+    urlStr.includes('/syllabus/upload') ||
+    urlStr.includes('/setup-and-analyze') ||
+    urlStr.includes('/analyze') ||
+    urlStr.includes('/study-plan') ||
+    urlStr.includes('/strategy')
+  );
+  const customTimeout = (init as any)?.timeoutMs;
+  const timeoutMs = customTimeout || (isHeavyOperation ? 180000 : 60000);
+
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 60000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   if (init?.signal) {
     init.signal.addEventListener('abort', () => controller.abort());
   }
 
-  try {
-    const response = await window.fetch(input, {
-      ...init,
-      signal: controller.signal,
-      headers,
-    });
+  const executeFetch = async (): Promise<Response> => {
+    try {
+      const response = await window.fetch(input, {
+        ...init,
+        signal: controller.signal,
+        headers,
+      });
 
-    if (response.status === 401 && typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('syllabussync:unauthorized'));
-    }
+      if (response.status === 401 && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('syllabussync:unauthorized'));
+      }
 
-    return response;
-  } catch (err: any) {
-    if (err.name === 'AbortError') {
-      throw new Error('Request timed out after 60 seconds. Please check your network connection and retry.');
+      return response;
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds. Please check your network connection and retry.`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+      if (isGet) {
+        inFlightGetRequests.delete(urlKey);
+      }
     }
-    throw err;
-  } finally {
-    clearTimeout(timeoutId);
+  };
+
+  if (isGet) {
+    const fetchPromise = executeFetch();
+    inFlightGetRequests.set(urlKey, fetchPromise);
+    const resp = await fetchPromise;
+    return resp.clone();
   }
+
+  return executeFetch();
 }
 
 /**
@@ -99,9 +156,9 @@ async function handleApiResponse<T = any>(response: Response, defaultErrorPrefix
     // 1. Structured FastAPI detail response
     if (responseData && typeof responseData === 'object' && responseData.detail) {
       if (typeof responseData.detail === 'string') {
-        errorMsg = responseData.detail;
+        errorMsg = responseData.detail.replace(/^Value error,\s*/i, '');
       } else if (Array.isArray(responseData.detail)) {
-        errorMsg = responseData.detail.map((d: any) => d.msg || JSON.stringify(d)).join(', ');
+        errorMsg = responseData.detail.map((d: any) => (d.msg || JSON.stringify(d)).replace(/^Value error,\s*/i, '')).join(', ');
       }
     }
     // 2. Vercel serverless error strings
@@ -151,20 +208,31 @@ async function handleApiResponse<T = any>(response: Response, defaultErrorPrefix
 
 export const apiService = {
   async getHealth(): Promise<HealthResponse> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
     try {
-      const response = await authenticatedFetch(`${API_BASE}/health`, {
+      // Direct, non-blocking health probe bypassing session token overhead and cache
+      const response = await window.fetch(`${API_BASE}/health`, {
         method: 'GET',
         headers: {
           'Accept': 'application/json',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
         },
+        signal: controller.signal,
       });
 
       return await handleApiResponse<HealthResponse>(response, 'Health check failed');
     } catch (err: any) {
+      if (err.name === 'AbortError') {
+        throw new Error('Health check request timed out after 8 seconds.');
+      }
       if (err instanceof ApiErrorResponse) {
         throw err;
       }
-      throw new Error(err.message || 'Unable to connect to SyllabusSync AI backend API.');
+      throw new Error(err?.message || 'Unable to connect to SyllabusSync AI backend API.');
+    } finally {
+      clearTimeout(timeoutId);
     }
   },
 
@@ -448,6 +516,7 @@ export const apiService = {
       headers: {
         'Accept': 'application/json',
       },
+      ...({ timeoutMs: 8000 } as any),
     });
 
     return await handleApiResponse<SystemDiagnosticsResponse>(response, 'Failed to retrieve system diagnostics.');
@@ -459,6 +528,7 @@ export const apiService = {
       headers: {
         'Accept': 'application/json',
       },
+      ...({ timeoutMs: 8000 } as any),
     });
 
     return await handleApiResponse<DiagnosticTestResult>(response, 'Server returned an unreadable response during YouTube test.');
@@ -470,6 +540,7 @@ export const apiService = {
       headers: {
         'Accept': 'application/json',
       },
+      ...({ timeoutMs: 8000 } as any),
     });
 
     return await handleApiResponse<DiagnosticTestResult>(response, 'Server returned an unreadable response during Strands test.');

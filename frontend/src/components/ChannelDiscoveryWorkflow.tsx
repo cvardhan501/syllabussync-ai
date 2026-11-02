@@ -103,6 +103,7 @@ export const ChannelDiscoveryWorkflow: React.FC<ChannelDiscoveryWorkflowProps> =
 
   // Run Discovery (Transition from Step 1 to Step 2)
   const handleProceedToDiscovery = async () => {
+    if (isDiscovering) return;
     setIsDiscovering(true);
     setErrorMessage(null);
     try {
@@ -122,6 +123,7 @@ export const ChannelDiscoveryWorkflow: React.FC<ChannelDiscoveryWorkflowProps> =
 
   // Run Preview (Transition from Step 2 to Step 3)
   const handleProceedToPreview = async () => {
+    if (isPreviewing) return;
     setIsPreviewing(true);
     setErrorMessage(null);
     try {
@@ -143,6 +145,7 @@ export const ChannelDiscoveryWorkflow: React.FC<ChannelDiscoveryWorkflowProps> =
 
   // Confirm Final Strategy and build persistent Video Library
   const handleConfirmStrategy = async () => {
+    if (isConfirming) return;
     setIsConfirming(true);
     setErrorMessage(null);
     try {

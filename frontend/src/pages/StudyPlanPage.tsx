@@ -27,23 +27,57 @@ interface StudyPlanPageProps {
   analyzedSyllabus: SyllabusAnalysisResponse | null;
   onNavigate: (tab: NavigationTab) => void;
   examDate?: string;
+  initialPlan?: StudyPlanResponse | null;
   onPlanUpdated?: (plan: StudyPlanResponse) => void;
 }
 
 export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
   analyzedSyllabus,
   onNavigate,
-  examDate = '2026-05-15',
+  examDate,
+  initialPlan,
   onPlanUpdated,
 }) => {
-  const [plan, setPlan] = useState<StudyPlanResponse | null>(null);
+  const [plan, setPlan] = useState<StudyPlanResponse | null>(() => initialPlan || null);
   const [isLoading, setIsLoading] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isRescheduling, setIsRescheduling] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // User-selected target exam date: prioritize syllabus plan date, prop, or 60 days in future
+  const getInitialExamDate = () => {
+    if (examDate && examDate > new Date().toISOString().split('T')[0]) {
+      return examDate;
+    }
+    const d = new Date();
+    d.setDate(d.getDate() + 60);
+    return d.toISOString().split('T')[0];
+  };
+
+  const [targetExamDate, setTargetExamDate] = useState<string>(getInitialExamDate);
+
+  // Sync targetExamDate when plan or examDate prop updates
+  useEffect(() => {
+    if (plan?.exam_date) {
+      setTargetExamDate(plan.exam_date);
+    } else if (examDate && examDate > new Date().toISOString().split('T')[0]) {
+      setTargetExamDate(examDate);
+    }
+  }, [plan?.exam_date, examDate]);
+
+  const todayIso = new Date().toISOString().split('T')[0];
+  const minFutureDate = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+  const isExamDateInPast = Boolean(targetExamDate && targetExamDate <= todayIso);
+
   const [viewMode, setViewMode] = useState<'daily' | 'weekly'>('daily');
-  const [selectedDate, setSelectedDate] = useState<string>('');
+  const [selectedDate, setSelectedDate] = useState<string>(() => {
+    if (initialPlan?.daily_schedules?.length) {
+      const today = new Date().toISOString().split('T')[0];
+      const hasToday = initialPlan.daily_schedules.some((d) => d.date === today);
+      return hasToday ? today : initialPlan.daily_schedules[0]?.date || '';
+    }
+    return '';
+  });
 
   // Notes Modal State
   const [activeNoteTask, setActiveNoteTask] = useState<TaskItemSchema | null>(null);
@@ -59,7 +93,10 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
     }
 
     const loadPlan = async () => {
-      setIsLoading(true);
+      // Only show full loading spinner if no plan is cached or displayed
+      if (!plan && !initialPlan) {
+        setIsLoading(true);
+      }
       setError(null);
       try {
         const data = await apiService.getStudyPlan(analyzedSyllabus.syllabus_id);
@@ -67,13 +104,19 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
           setPlan(data);
           if (onPlanUpdated) onPlanUpdated(data);
           // Set selectedDate to today or first day
-          const todayIso = new Date().toISOString().split('T')[0];
-          const hasToday = data.daily_schedules.some((d) => d.date === todayIso);
-          setSelectedDate(hasToday ? todayIso : data.daily_schedules[0]?.date || '');
+          const today = new Date().toISOString().split('T')[0];
+          const hasToday = data.daily_schedules.some((d) => d.date === today);
+          setSelectedDate(hasToday ? today : data.daily_schedules[0]?.date || '');
         }
       } catch (err: any) {
-        if (isMounted && err instanceof ApiErrorResponse && err.status !== 404) {
-          setError(err.message);
+        if (isMounted) {
+          if (err instanceof ApiErrorResponse) {
+            if (err.status !== 404) {
+              setError(err.message || 'Failed to load study plan.');
+            }
+          } else {
+            setError(err?.message || 'Failed to load study plan.');
+          }
         }
       } finally {
         if (isMounted) setIsLoading(false);
@@ -89,19 +132,23 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
   // Generate / Regenerate Study Plan
   const handleGeneratePlan = async () => {
     if (!analyzedSyllabus?.syllabus_id) return;
+    const today = new Date().toISOString().split('T')[0];
+    if (!targetExamDate || targetExamDate <= today) {
+      setError(`Exam date (${targetExamDate || 'empty'}) cannot be in the past. Please select a future exam date.`);
+      return;
+    }
     setIsGenerating(true);
     setError(null);
     try {
       const data = await apiService.createStudyPlan(analyzedSyllabus.syllabus_id, {
-        exam_date: examDate,
+        exam_date: targetExamDate,
         daily_target_minutes: 120,
         preserve_completed: true,
       });
       setPlan(data);
       if (onPlanUpdated) onPlanUpdated(data);
-      const todayIso = new Date().toISOString().split('T')[0];
-      const hasToday = data.daily_schedules.some((d) => d.date === todayIso);
-      setSelectedDate(hasToday ? todayIso : data.daily_schedules[0]?.date || '');
+      const hasToday = data.daily_schedules.some((d) => d.date === today);
+      setSelectedDate(hasToday ? today : data.daily_schedules[0]?.date || '');
     } catch (err: any) {
       setError(err.message || 'Failed to generate study timetable.');
     } finally {
@@ -217,7 +264,6 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
     : 0;
 
   // Check if any overdue uncompleted tasks exist before today
-  const todayIso = new Date().toISOString().split('T')[0];
   const hasOverdueTasks = (plan?.daily_schedules || []).some(
     (g) => g.date < todayIso && g.tasks.some((t) => t.status !== 'completed')
   );
@@ -241,10 +287,25 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
-          {/* Exam Date Pill */}
-          <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#0e1a38] border border-[#1e3262] text-xs font-semibold text-blue-300">
-            <CalendarDays className="w-4 h-4 text-blue-400" />
-            <span>Exam Date: {plan?.exam_date || examDate}</span>
+          {/* Exam Date Picker Pill */}
+          <div className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full border text-xs font-semibold ${
+            isExamDateInPast
+              ? 'bg-amber-950/40 border-amber-500/60 text-amber-300'
+              : 'bg-[#0e1a38] border-[#1e3262] text-blue-300'
+          }`}>
+            <CalendarDays className={`w-4 h-4 ${isExamDateInPast ? 'text-amber-400' : 'text-blue-400'}`} />
+            <span className="text-slate-400 font-medium">Exam Date:</span>
+            <input
+              type="date"
+              min={minFutureDate}
+              value={targetExamDate}
+              onChange={(e) => {
+                setTargetExamDate(e.target.value);
+                setError(null);
+              }}
+              className="bg-transparent text-white font-semibold focus:outline-hidden cursor-pointer"
+              title="Click to change target exam date"
+            />
           </div>
 
           {analyzedSyllabus && plan && (
@@ -349,17 +410,47 @@ export const StudyPlanPage: React.FC<StudyPlanPageProps> = ({
               Ready to Build Your Study Roadmap
             </h3>
             <p className="text-xs text-slate-400 m-0">
-              Generate a timetable based on {analyzedSyllabus.total_topics_count} verified topics, targeting your exam on {examDate}.
+              Generate a timetable based on {analyzedSyllabus.total_topics_count} verified topics, targeting your exam on {targetExamDate}.
             </p>
           </div>
-          <button
-            onClick={handleGeneratePlan}
-            disabled={isGenerating}
-            className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-lg shadow-blue-600/30 transition cursor-pointer"
-          >
-            <Sparkles className="w-4 h-4 text-cyan-300" />
-            <span>{isGenerating ? 'Building Schedule...' : 'Generate Personalized Study Plan'}</span>
-          </button>
+
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+            <div className={`flex items-center gap-2 px-3.5 py-2 rounded-xl border text-xs ${
+              isExamDateInPast
+                ? 'bg-amber-950/20 border-amber-500/40 text-amber-300'
+                : 'bg-[#070e20] border-[#1b2b52] text-slate-300'
+            }`}>
+              <CalendarDays className={`w-4 h-4 shrink-0 ${isExamDateInPast ? 'text-amber-400' : 'text-blue-400'}`} />
+              <span className="text-slate-400 text-[11px]">Exam Date:</span>
+              <input
+                type="date"
+                min={minFutureDate}
+                value={targetExamDate}
+                onChange={(e) => {
+                  setTargetExamDate(e.target.value);
+                  setError(null);
+                }}
+                className="bg-transparent text-white font-semibold focus:outline-hidden cursor-pointer"
+                title="Select your target exam date"
+              />
+            </div>
+
+            <button
+              onClick={handleGeneratePlan}
+              disabled={isGenerating}
+              className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-lg shadow-blue-600/30 transition cursor-pointer"
+            >
+              <Sparkles className="w-4 h-4 text-cyan-300" />
+              <span>{isGenerating ? 'Building Schedule...' : 'Generate Personalized Study Plan'}</span>
+            </button>
+          </div>
+
+          {isExamDateInPast && (
+            <div className="p-3 max-w-md mx-auto rounded-xl bg-amber-950/30 border border-amber-600/40 text-xs text-amber-300 flex items-center justify-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>The current exam date ({targetExamDate}) is in the past. Please choose a future date above to build your study schedule.</span>
+            </div>
+          )}
         </div>
       )}
 

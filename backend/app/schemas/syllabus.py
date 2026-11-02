@@ -1,3 +1,4 @@
+import uuid
 from typing import List, Optional, Literal
 from pydantic import BaseModel, Field
 
@@ -26,13 +27,13 @@ class ValidationReport(BaseModel):
 
 
 class SubtopicItem(BaseModel):
-    id: str = Field(description="Stable unique ID for the subtopic")
-    title: str = Field(description="Subtopic title")
+    id: str = Field(default_factory=lambda: f"sub_{uuid.uuid4().hex[:8]}", description="Stable unique ID for the subtopic")
+    title: str = Field(default="Untitled Subtopic", description="Subtopic title")
 
 
 class TopicItem(BaseModel):
-    id: str = Field(description="Stable unique ID for the topic")
-    title: str = Field(description="Topic title")
+    id: str = Field(default_factory=lambda: f"top_{uuid.uuid4().hex[:8]}", description="Stable unique ID for the topic")
+    title: str = Field(default="Untitled Topic", description="Topic title")
     explanation: str = Field(default="", description="Short explanation or learning objective")
     estimated_minutes: int = Field(default=60, description="Estimated study time in minutes (clearly marked as estimate)")
     difficulty: Literal["easy", "medium", "hard"] = Field(default="medium", description="Suggested difficulty level")
@@ -44,8 +45,8 @@ class TopicItem(BaseModel):
 
 
 class ModuleItem(BaseModel):
-    id: str = Field(description="Stable unique ID for the module")
-    title: str = Field(description="Module or unit name")
+    id: str = Field(default_factory=lambda: f"mod_{uuid.uuid4().hex[:8]}", description="Stable unique ID for the module")
+    title: str = Field(default="Untitled Module", description="Module or unit name")
     order_index: int = Field(default=0, description="Order index of the module")
     official_hours: Optional[float] = Field(default=None, description="Official delivery hours specified in syllabus")
     official_minutes: Optional[int] = Field(default=None, description="Official delivery duration in minutes")

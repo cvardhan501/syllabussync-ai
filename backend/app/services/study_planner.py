@@ -15,6 +15,8 @@ from app.models.database import (
     update_task_completion,
     update_task_note,
     reschedule_plan_tasks,
+    _safe_json_loads,
+    _to_iso_str,
 )
 from app.schemas.study_plan import (
     TaskItemSchema,
@@ -435,7 +437,7 @@ class StudyPlannerService:
         shortfall_min = plan.get("shortfall_minutes", 0)
         shortfall_hrs = round(shortfall_min / 60, 1)
 
-        pref_days = json.loads(plan.get("preferred_days_json") or '["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]')
+        pref_days = _safe_json_loads(plan.get("preferred_days_json"), default=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
 
         return StudyPlanResponse(
             id=real_plan_id,
@@ -457,8 +459,8 @@ class StudyPlannerService:
             total_tasks_count=total_tasks_count,
             completed_tasks_count=completed_tasks_count,
             daily_schedules=daily_schedules,
-            created_at=plan.get("created_at") or today_iso,
-            updated_at=plan.get("updated_at") or today_iso,
+            created_at=_to_iso_str(plan.get("created_at")) or today_iso,
+            updated_at=_to_iso_str(plan.get("updated_at")) or today_iso,
             message=f"Plan contains {total_tasks_count} tasks across {len(daily_schedules)} study days ({prog_pct}% complete).",
         )
 
@@ -484,7 +486,7 @@ class StudyPlannerService:
         ref_from_date = cls._parse_date(from_date) if from_date else today
         plan_exam = cls._parse_date(plan["exam_date"])
         daily_target = plan["daily_target_minutes"]
-        pref_days = json.loads(plan.get("preferred_days_json") or '["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]')
+        pref_days = _safe_json_loads(plan.get("preferred_days_json"), default=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
 
         all_tasks = get_plan_tasks(real_plan_id)
 

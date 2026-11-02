@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import json
+import hashlib
 import datetime
 import time
 import uuid
@@ -370,6 +371,8 @@ def _init_sqlite_schema() -> None:
             cursor.execute("ALTER TABLE syllabi ADD COLUMN is_fallback INTEGER DEFAULT 0")
         if "analysis_engine" not in existing_cols:
             cursor.execute("ALTER TABLE syllabi ADD COLUMN analysis_engine TEXT")
+        if "exam_date" not in existing_cols:
+            cursor.execute("ALTER TABLE syllabi ADD COLUMN exam_date TEXT")
 
         # 2. Courses table
         cursor.execute("""
@@ -986,6 +989,20 @@ def get_syllabus_record(syllabus_id: str, owner_user_id: Optional[str] = None) -
         return res
 
 
+def update_syllabus_exam_date(syllabus_id: str, exam_date: str) -> None:
+    """Updates the syllabus record with its specific exam date."""
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE syllabi SET exam_date = ? WHERE id = ? OR course_id = ?",
+                (exam_date, syllabus_id, syllabus_id)
+            )
+            if hasattr(conn, "commit"):
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Failed to update syllabus exam date for {syllabus_id}: {e}")
+
+
 def get_syllabus_hierarchy(syllabus_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Retrieves normalized hierarchy or stored JSON, verifying tenant ownership if requested."""
     if owner_user_id:
@@ -1061,8 +1078,57 @@ _IN_MEMORY_SEARCH_CACHE: Dict[str, Tuple[float, Any]] = {}
 _SEARCH_CACHE_TTL = 900.0  # 15 minutes
 
 
-def get_cached_search(query_hash: str) -> Optional[Dict[str, Any]]:
-    """Retrieves cached YouTube search results, checking in-memory cache first."""
+def batch_warm_search_cache(queries: List[str], language: Optional[str] = "en") -> int:
+    """
+    Pre-populates _IN_MEMORY_SEARCH_CACHE for multiple queries in a single database roundtrip,
+    preventing N+1 database queries and quota burn during strategy preview and discovery.
+    """
+    if not queries:
+        return 0
+    clean_queries = list(dict.fromkeys(q.strip() for q in queries if q and q.strip()))
+    if not clean_queries:
+        return 0
+    lower_queries = [q.lower() for q in clean_queries]
+    now = time.time()
+    loaded_count = 0
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        if is_postgres():
+            c.execute(
+                "SELECT query_hash, query, language, response_json FROM youtube_search_cache WHERE LOWER(query) = ANY(%s)",
+                (lower_queries,)
+            )
+        else:
+            placeholders = ",".join("?" for _ in lower_queries)
+            c.execute(
+                f"SELECT query_hash, query, language, response_json FROM youtube_search_cache WHERE LOWER(query) IN ({placeholders})",
+                lower_queries
+            )
+        rows = c.fetchall()
+        for r in rows:
+            data = _safe_json_loads(r["response_json"], default=None)
+            if data is not None:
+                q_hash = r["query_hash"]
+                q_text = (r.get("query") or "").strip().lower()
+                l_code = (r.get("language") or language or "en").strip().lower()
+                _IN_MEMORY_SEARCH_CACHE[q_hash] = (now, data)
+                # Compute normalized hash (q|lang) and legacy hashes (q|lang|mr)
+                raw_norm = f"{q_text}|{l_code}"
+                norm_hash = hashlib.sha256(raw_norm.encode("utf-8")).hexdigest()
+                _IN_MEMORY_SEARCH_CACHE[norm_hash] = (now, data)
+                for mr in (4, 5, 8, 10):
+                    leg_hash = hashlib.sha256(f"{q_text}|{l_code}|{mr}".encode("utf-8")).hexdigest()
+                    _IN_MEMORY_SEARCH_CACHE[leg_hash] = (now, data)
+                loaded_count += 1
+    return loaded_count
+
+
+def get_cached_search(
+    query_hash: str,
+    query: Optional[str] = None,
+    language: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Retrieves cached YouTube search results, checking in-memory cache first with query/lang fallbacks."""
     now = time.time()
     if query_hash in _IN_MEMORY_SEARCH_CACHE:
         ts, data = _IN_MEMORY_SEARCH_CACHE[query_hash]
@@ -1073,16 +1139,38 @@ def get_cached_search(query_hash: str) -> Optional[Dict[str, Any]]:
         else:
             del _IN_MEMORY_SEARCH_CACHE[query_hash]
 
+    # Check normalized query|lang in memory cache
+    if query:
+        lang_code = (language or "en").strip().lower()
+        norm_raw = f"{query.strip().lower()}|{lang_code}"
+        norm_hash = hashlib.sha256(norm_raw.encode("utf-8")).hexdigest()
+        if norm_hash in _IN_MEMORY_SEARCH_CACHE:
+            ts, data = _IN_MEMORY_SEARCH_CACHE[norm_hash]
+            if now - ts < _SEARCH_CACHE_TTL:
+                return [dict(v) for v in data] if isinstance(data, list) else data
+
     with get_db_connection() as conn:
         row = conn.execute(
             "SELECT response_json FROM youtube_search_cache WHERE query_hash = ?",
             (query_hash,)
         ).fetchone()
+        if not row and query:
+            clean_q = query.strip().lower()
+            row = conn.execute(
+                "SELECT response_json FROM youtube_search_cache WHERE LOWER(query) = ? LIMIT 1",
+                (clean_q,)
+            ).fetchone()
+
         if not row:
             return None
         data = _safe_json_loads(row["response_json"], default=None)
         if data:
             _IN_MEMORY_SEARCH_CACHE[query_hash] = (now, data)
+            if query:
+                lang_code = (language or "en").strip().lower()
+                norm_raw = f"{query.strip().lower()}|{lang_code}"
+                norm_hash = hashlib.sha256(norm_raw.encode("utf-8")).hexdigest()
+                _IN_MEMORY_SEARCH_CACHE[norm_hash] = (now, data)
         return data
 
 
@@ -1208,7 +1296,11 @@ def save_discovered_resources(
                 cov_params
             )
 
-        # 2. Upsert videos and topic resources
+        # 2. Batch prepare videos and topic resources for high-speed executemany
+        vr_params_list = []
+        tr_params_list = []
+        tr_no_res_list = []
+
         for mapping in topic_mappings:
             topic_id = mapping["topic_id"]
             module_id = mapping["module_id"]
@@ -1231,8 +1323,7 @@ def save_discovered_resources(
             avail_status = mapping.get("availability_status", "available" if res else "missing")
 
             if res:
-                # Upsert into video_resources
-                vr_params = (
+                vr_params_list.append((
                     res["id"],
                     res["video_id"],
                     res["title"],
@@ -1250,53 +1341,9 @@ def save_discovered_resources(
                     res["video_url"],
                     res.get("availability_status", "available"),
                     res.get("description", ""),
-                )
-                if is_postgres():
-                    conn.execute(
-                        """
-                        INSERT INTO video_resources
-                        (id, video_id, title, channel_title, channel_id, thumbnail_url,
-                         duration_seconds, duration_formatted, language, published_at,
-                         view_count, relevance_score, relevance_explanation, is_uncertain, video_url,
-                         availability_status, description)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (id) DO UPDATE SET
-                            video_id = EXCLUDED.video_id,
-                            title = EXCLUDED.title,
-                            channel_title = EXCLUDED.channel_title,
-                            channel_id = EXCLUDED.channel_id,
-                            thumbnail_url = EXCLUDED.thumbnail_url,
-                            duration_seconds = EXCLUDED.duration_seconds,
-                            duration_formatted = EXCLUDED.duration_formatted,
-                            language = EXCLUDED.language,
-                            published_at = EXCLUDED.published_at,
-                            view_count = EXCLUDED.view_count,
-                            relevance_score = EXCLUDED.relevance_score,
-                            relevance_explanation = EXCLUDED.relevance_explanation,
-                            is_uncertain = EXCLUDED.is_uncertain,
-                            video_url = EXCLUDED.video_url,
-                            availability_status = EXCLUDED.availability_status,
-                            description = EXCLUDED.description
-                        """,
-                        vr_params
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO video_resources
-                        (id, video_id, title, channel_title, channel_id, thumbnail_url,
-                         duration_seconds, duration_formatted, language, published_at,
-                         view_count, relevance_score, relevance_explanation, is_uncertain, video_url,
-                         availability_status, description)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        vr_params
-                    )
-
-                # Upsert into topic_resources
-                tr_id = f"tr_{topic_id}"
-                tr_params = (
-                    tr_id,
+                ))
+                tr_params_list.append((
+                    f"tr_{topic_id}",
                     syllabus_id,
                     module_id,
                     topic_id,
@@ -1308,89 +1355,121 @@ def save_discovered_resources(
                     is_shared,
                     shared_topics_json,
                     avail_status,
-                )
-                if is_postgres():
-                    conn.execute(
-                        """
-                        INSERT INTO topic_resources
-                        (id, syllabus_id, module_id, topic_id, video_resource_id,
-                         is_primary, match_status, match_confidence, relevance_notes,
-                         assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
-                        VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (id) DO UPDATE SET
-                            syllabus_id = EXCLUDED.syllabus_id,
-                            module_id = EXCLUDED.module_id,
-                            topic_id = EXCLUDED.topic_id,
-                            video_resource_id = EXCLUDED.video_resource_id,
-                            is_primary = EXCLUDED.is_primary,
-                            match_status = EXCLUDED.match_status,
-                            match_confidence = EXCLUDED.match_confidence,
-                            relevance_notes = EXCLUDED.relevance_notes,
-                            assigned_channel = EXCLUDED.assigned_channel,
-                            is_shared_video = EXCLUDED.is_shared_video,
-                            shared_with_topics_json = EXCLUDED.shared_with_topics_json,
-                            availability_status = EXCLUDED.availability_status
-                        """,
-                        tr_params
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO topic_resources
-                        (id, syllabus_id, module_id, topic_id, video_resource_id,
-                         is_primary, match_status, match_confidence, relevance_notes,
-                         assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
-                        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        tr_params
-                    )
+                ))
             else:
-                tr_id = f"tr_{topic_id}"
-                tr_params = (
-                    tr_id,
+                tr_no_res_list.append((
+                    f"tr_{topic_id}",
                     syllabus_id,
                     module_id,
                     topic_id,
-                    "no_resource",
-                    "uncertain",
+                    match_status,
+                    match_confidence,
                     notes or "No suitable educational video found matching this topic.",
                     assigned_channel,
-                )
-                if is_postgres():
-                    conn.execute(
-                        """
-                        INSERT INTO topic_resources
-                        (id, syllabus_id, module_id, topic_id, video_resource_id,
-                         is_primary, match_status, match_confidence, relevance_notes,
-                         assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
-                        VALUES (%s, %s, %s, %s, NULL, 1, %s, %s, %s, %s, 0, '[]', 'missing')
-                        ON CONFLICT (id) DO UPDATE SET
-                            syllabus_id = EXCLUDED.syllabus_id,
-                            module_id = EXCLUDED.module_id,
-                            topic_id = EXCLUDED.topic_id,
-                            video_resource_id = NULL,
-                            is_primary = 1,
-                            match_status = EXCLUDED.match_status,
-                            match_confidence = EXCLUDED.match_confidence,
-                            relevance_notes = EXCLUDED.relevance_notes,
-                            assigned_channel = EXCLUDED.assigned_channel,
-                            is_shared_video = 0,
-                            shared_with_topics_json = '[]',
-                            availability_status = 'missing'
-                        """,
-                        tr_params
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO topic_resources
-                        (id, syllabus_id, module_id, topic_id, video_resource_id,
-                         is_primary, match_status, match_confidence, relevance_notes,
-                         assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
-                        VALUES (?, ?, ?, ?, '', 1, ?, ?, ?, ?, 0, '[]', 'missing')
-                        """,
-                        tr_params
-                    )
+                ))
+
+        # 3. Fast batch insert via executemany (1 roundtrip per table)
+        if vr_params_list:
+            if is_postgres():
+                vr_sql = """
+                INSERT INTO video_resources
+                (id, video_id, title, channel_title, channel_id, thumbnail_url,
+                 duration_seconds, duration_formatted, language, published_at,
+                 view_count, relevance_score, relevance_explanation, is_uncertain, video_url,
+                 availability_status, description)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    video_id = EXCLUDED.video_id,
+                    title = EXCLUDED.title,
+                    channel_title = EXCLUDED.channel_title,
+                    channel_id = EXCLUDED.channel_id,
+                    thumbnail_url = EXCLUDED.thumbnail_url,
+                    duration_seconds = EXCLUDED.duration_seconds,
+                    duration_formatted = EXCLUDED.duration_formatted,
+                    language = EXCLUDED.language,
+                    published_at = EXCLUDED.published_at,
+                    view_count = EXCLUDED.view_count,
+                    relevance_score = EXCLUDED.relevance_score,
+                    relevance_explanation = EXCLUDED.relevance_explanation,
+                    is_uncertain = EXCLUDED.is_uncertain,
+                    video_url = EXCLUDED.video_url,
+                    availability_status = EXCLUDED.availability_status,
+                    description = EXCLUDED.description
+                """
+            else:
+                vr_sql = """
+                INSERT OR REPLACE INTO video_resources
+                (id, video_id, title, channel_title, channel_id, thumbnail_url,
+                 duration_seconds, duration_formatted, language, published_at,
+                 view_count, relevance_score, relevance_explanation, is_uncertain, video_url,
+                 availability_status, description)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+            conn.executemany(vr_sql, vr_params_list)
+
+        if tr_params_list:
+            if is_postgres():
+                tr_sql = """
+                INSERT INTO topic_resources
+                (id, syllabus_id, module_id, topic_id, video_resource_id,
+                 is_primary, match_status, match_confidence, relevance_notes,
+                 assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
+                VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    syllabus_id = EXCLUDED.syllabus_id,
+                    module_id = EXCLUDED.module_id,
+                    topic_id = EXCLUDED.topic_id,
+                    video_resource_id = EXCLUDED.video_resource_id,
+                    is_primary = EXCLUDED.is_primary,
+                    match_status = EXCLUDED.match_status,
+                    match_confidence = EXCLUDED.match_confidence,
+                    relevance_notes = EXCLUDED.relevance_notes,
+                    assigned_channel = EXCLUDED.assigned_channel,
+                    is_shared_video = EXCLUDED.is_shared_video,
+                    shared_with_topics_json = EXCLUDED.shared_with_topics_json,
+                    availability_status = EXCLUDED.availability_status
+                """
+            else:
+                tr_sql = """
+                INSERT OR REPLACE INTO topic_resources
+                (id, syllabus_id, module_id, topic_id, video_resource_id,
+                 is_primary, match_status, match_confidence, relevance_notes,
+                 assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                """
+            conn.executemany(tr_sql, tr_params_list)
+
+        if tr_no_res_list:
+            if is_postgres():
+                tr_no_sql = """
+                INSERT INTO topic_resources
+                (id, syllabus_id, module_id, topic_id, video_resource_id,
+                 is_primary, match_status, match_confidence, relevance_notes,
+                 assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
+                VALUES (%s, %s, %s, %s, NULL, 1, %s, %s, %s, %s, 0, '[]', 'missing')
+                ON CONFLICT (id) DO UPDATE SET
+                    syllabus_id = EXCLUDED.syllabus_id,
+                    module_id = EXCLUDED.module_id,
+                    topic_id = EXCLUDED.topic_id,
+                    video_resource_id = NULL,
+                    is_primary = 1,
+                    match_status = EXCLUDED.match_status,
+                    match_confidence = EXCLUDED.match_confidence,
+                    relevance_notes = EXCLUDED.relevance_notes,
+                    assigned_channel = EXCLUDED.assigned_channel,
+                    is_shared_video = 0,
+                    shared_with_topics_json = '[]',
+                    availability_status = 'missing'
+                """
+            else:
+                tr_no_sql = """
+                INSERT OR REPLACE INTO topic_resources
+                (id, syllabus_id, module_id, topic_id, video_resource_id,
+                 is_primary, match_status, match_confidence, relevance_notes,
+                 assigned_channel, is_shared_video, shared_with_topics_json, availability_status)
+                VALUES (?, ?, ?, ?, '', 1, ?, ?, ?, ?, 0, '[]', 'missing')
+                """
+            conn.executemany(tr_no_sql, tr_no_res_list)
 
         if is_confirmed:
             conn.execute(
@@ -2237,11 +2316,18 @@ def reschedule_plan_tasks(
 def get_user_settings(user_id: Optional[str] = None) -> Dict[str, Any]:
     """Retrieves persisted student learning settings, falling back to defaults if not yet configured."""
     setting_id = user_id or "default_user"
+    owner_uuid = _normalize_uuid_or_none(user_id) if is_postgres() else user_id
     with get_db_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM user_settings WHERE id = ? OR owner_user_id = ? LIMIT 1",
-            (setting_id, user_id or setting_id)
-        ).fetchone()
+        if is_postgres() and not owner_uuid:
+            row = conn.execute(
+                "SELECT * FROM user_settings WHERE id = ? LIMIT 1",
+                (setting_id,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM user_settings WHERE id = ? OR owner_user_id = ? LIMIT 1",
+                (setting_id, owner_uuid or setting_id)
+            ).fetchone()
 
         if not row:
             return {
@@ -2473,15 +2559,15 @@ def save_course_assessments(course_id: str, assessments: List[Dict[str, Any]]) -
         conn.commit()
 
 
-def get_course_assessments(course_id: str, owner_user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_course_assessments(course_id: str, owner_user_id: Optional[str] = None, conn=None) -> List[Dict[str, Any]]:
     """Retrieves all assessment milestones for a course, tagged with days remaining."""
     if owner_user_id:
         c_owner = get_course_owner_id(course_id)
         if c_owner and c_owner != owner_user_id:
             return []
 
-    with get_db_connection() as conn:
-        rows = conn.execute(
+    def _fetch_with_conn(c):
+        rows = c.execute(
             "SELECT * FROM course_assessments WHERE course_id = ? ORDER BY exam_date ASC, order_index ASC",
             (course_id,)
         ).fetchall()
@@ -2500,6 +2586,12 @@ def get_course_assessments(course_id: str, owner_user_id: Optional[str] = None) 
                 d["is_past"] = False
             result.append(d)
         return result
+
+    if conn is not None:
+        return _fetch_with_conn(conn)
+
+    with get_db_connection() as c:
+        return _fetch_with_conn(c)
 
 
 def get_course(course_id: str, owner_user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -2535,7 +2627,7 @@ def get_course(course_id: str, owner_user_id: Optional[str] = None) -> Optional[
         c["languages"] = _safe_json_loads(c.get("languages_json"), default=["English"])
         c["created_at"] = _to_iso_str(c.get("created_at"))
         c["updated_at"] = _to_iso_str(c.get("updated_at"))
-        c["assessments"] = get_course_assessments(c["id"])
+        c["assessments"] = get_course_assessments(c["id"], conn=conn)
 
         # Fetch syllabus details if available
         if c.get("syllabus_id"):
@@ -2608,7 +2700,7 @@ def get_course_by_syllabus(syllabus_id: str, owner_user_id: Optional[str] = None
 
 
 def get_courses(owner_user_id: Optional[str] = None, include_archived: bool = False) -> List[Dict[str, Any]]:
-    """Retrieves all courses matching owner_user_id (or all unassigned if None in dev mode)."""
+    """Retrieves all courses matching owner_user_id (or all unassigned if None in dev mode) using high-speed batch fetching."""
     if settings.is_production and not owner_user_id:
         return []
 
@@ -2630,13 +2722,147 @@ def get_courses(owner_user_id: Optional[str] = None, include_archived: bool = Fa
             conditions.append("(is_archived = 0 OR is_archived IS NULL)")
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"SELECT id FROM courses {where_clause} ORDER BY updated_at DESC"
-        rows = conn.execute(query, tuple(params)).fetchall()
+        query = f"SELECT * FROM courses {where_clause} ORDER BY updated_at DESC"
+        course_rows = [dict(r) for r in conn.execute(query, tuple(params)).fetchall()]
+
+        if not course_rows:
+            return []
+
+        course_ids = [r["id"] for r in course_rows]
+        syllabus_ids = [r["syllabus_id"] for r in course_rows if r.get("syllabus_id")]
+
+        # 1. Batch fetch assessments for all returned courses
+        assessments_by_course = {}
+        next_assessment_by_course = {}
+        today = datetime.date.today()
+        today_str = today.isoformat()
+
+        if is_postgres():
+            asm_rows = conn.execute(
+                "SELECT * FROM course_assessments WHERE course_id = ANY(%s) ORDER BY exam_date ASC, order_index ASC",
+                (course_ids,)
+            ).fetchall()
+        else:
+            ph = ",".join("?" for _ in course_ids)
+            asm_rows = conn.execute(
+                f"SELECT * FROM course_assessments WHERE course_id IN ({ph}) ORDER BY exam_date ASC, order_index ASC",
+                course_ids
+            ).fetchall()
+
+        for ar in asm_rows:
+            d = dict(ar)
+            d["exam_date"] = _to_date_str(d.get("exam_date"))
+            d["created_at"] = _to_iso_str(d.get("created_at"))
+            try:
+                dt = datetime.date.fromisoformat(d["exam_date"])
+                d["days_remaining"] = (dt - today).days
+                d["is_past"] = dt < today
+            except Exception:
+                d["days_remaining"] = 0
+                d["is_past"] = False
+
+            cid = d["course_id"]
+            assessments_by_course.setdefault(cid, []).append(d)
+            if not d["is_past"] and cid not in next_assessment_by_course:
+                next_assessment_by_course[cid] = d
+
+        # 2. Batch fetch syllabi for all returned courses
+        syllabi_by_id = {}
+        if syllabus_ids:
+            if is_postgres():
+                s_rows = conn.execute("SELECT * FROM syllabi WHERE id = ANY(%s)", (syllabus_ids,)).fetchall()
+            else:
+                ph = ",".join("?" for _ in syllabus_ids)
+                s_rows = conn.execute(f"SELECT * FROM syllabi WHERE id IN ({ph})", syllabus_ids).fetchall()
+            for sr in s_rows:
+                s = dict(sr)
+                s["created_at"] = _to_iso_str(s.get("created_at"))
+                s["is_fallback"] = _safe_bool(s.get("is_fallback"))
+                syllabi_by_id[s["id"]] = s
+
+        # 3. Batch fetch study task stats
+        task_stats = {}
+        overdue_stats = {}
+        all_target_ids = list(set(course_ids + syllabus_ids))
+        if all_target_ids:
+            if is_postgres():
+                stat_rows = conn.execute(
+                    """
+                    SELECT
+                        COALESCE(course_id, syllabus_id) as target_id,
+                        COUNT(*) as total_tasks,
+                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+                        SUM(duration_minutes) as total_minutes,
+                        SUM(CASE WHEN status = 'completed' THEN duration_minutes ELSE 0 END) as completed_minutes,
+                        SUM(CASE WHEN status != 'completed' AND scheduled_date < %s THEN 1 ELSE 0 END) as overdue_count
+                    FROM study_tasks
+                    WHERE course_id = ANY(%s) OR syllabus_id = ANY(%s)
+                    GROUP BY COALESCE(course_id, syllabus_id)
+                    """,
+                    (today_str, all_target_ids, all_target_ids)
+                ).fetchall()
+            else:
+                ph = ",".join("?" for _ in all_target_ids)
+                stat_rows = conn.execute(
+                    f"""
+                    SELECT
+                        COALESCE(course_id, syllabus_id) as target_id,
+                        COUNT(*) as total_tasks,
+                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+                        SUM(duration_minutes) as total_minutes,
+                        SUM(CASE WHEN status = 'completed' THEN duration_minutes ELSE 0 END) as completed_minutes,
+                        SUM(CASE WHEN status != 'completed' AND scheduled_date < ? THEN 1 ELSE 0 END) as overdue_count
+                    FROM study_tasks
+                    WHERE course_id IN ({ph}) OR syllabus_id IN ({ph})
+                    GROUP BY COALESCE(course_id, syllabus_id)
+                    """,
+                    [today_str] + all_target_ids + all_target_ids
+                ).fetchall()
+
+            for st in stat_rows:
+                t_id = st["target_id"]
+                task_stats[t_id] = {
+                    "total_tasks": st["total_tasks"] or 0,
+                    "completed_tasks": st["completed_tasks"] or 0,
+                    "total_minutes": st["total_minutes"] or 0,
+                    "completed_minutes": st["completed_minutes"] or 0,
+                }
+                overdue_stats[t_id] = st["overdue_count"] or 0
+
+        # Construct final courses array with zero N+1 overhead
         result = []
-        for r in rows:
-            course = get_course(r["id"], owner_user_id=owner_user_id)
-            if course:
-                result.append(course)
+        for row in course_rows:
+            c = dict(row)
+            cid = c["id"]
+            sid = c.get("syllabus_id")
+            c["is_archived"] = _safe_bool(c.get("is_archived"))
+            c["is_library_confirmed"] = _safe_bool(c.get("is_library_confirmed"))
+            c["languages"] = _safe_json_loads(c.get("languages_json"), default=["English"])
+            c["created_at"] = _to_iso_str(c.get("created_at"))
+            c["updated_at"] = _to_iso_str(c.get("updated_at"))
+            c["assessments"] = assessments_by_course.get(cid, [])
+            c["next_assessment"] = next_assessment_by_course.get(cid)
+
+            if sid and sid in syllabi_by_id:
+                c["syllabus"] = syllabi_by_id[sid]
+                st = task_stats.get(cid) or task_stats.get(sid) or {
+                    "total_tasks": 0, "completed_tasks": 0, "total_minutes": 0, "completed_minutes": 0
+                }
+                total_t = st["total_tasks"]
+                comp_t = st["completed_tasks"]
+                c["progress"] = {
+                    "total_tasks": total_t,
+                    "completed_tasks": comp_t,
+                    "total_minutes": st["total_minutes"],
+                    "completed_minutes": st["completed_minutes"],
+                    "progress_percentage": round((comp_t / total_t * 100), 1) if total_t > 0 else 0.0,
+                }
+                c["overdue_tasks_count"] = overdue_stats.get(cid) or overdue_stats.get(sid) or 0
+            else:
+                c["overdue_tasks_count"] = 0
+
+            result.append(c)
+
         return result
 
 
@@ -2760,6 +2986,24 @@ def get_semester_overview(owner_user_id: Optional[str] = None) -> Dict[str, Any]
     overdue_tasks_count = 0
     all_upcoming = []
 
+    # Batch fetch topic counts for all courses in a single query
+    syllabus_ids = [c["syllabus_id"] for c in courses if c.get("syllabus_id")]
+    topic_counts = {}
+    if syllabus_ids:
+        with get_db_connection() as conn:
+            if is_postgres():
+                rows = conn.execute(
+                    "SELECT syllabus_id, COUNT(*) as c FROM topics WHERE syllabus_id = ANY(%s) GROUP BY syllabus_id",
+                    (syllabus_ids,)
+                ).fetchall()
+            else:
+                ph = ",".join("?" for _ in syllabus_ids)
+                rows = conn.execute(
+                    f"SELECT syllabus_id, COUNT(*) as c FROM topics WHERE syllabus_id IN ({ph}) GROUP BY syllabus_id",
+                    syllabus_ids
+                ).fetchall()
+            topic_counts = {r["syllabus_id"]: r["c"] for r in rows}
+
     for c in courses:
         prog = c.get("progress", {})
         total_planned_minutes += prog.get("total_minutes", 0)
@@ -2769,9 +3013,7 @@ def get_semester_overview(owner_user_id: Optional[str] = None) -> Dict[str, Any]
         overdue_tasks_count += c.get("overdue_tasks_count", 0)
 
         if c.get("syllabus_id"):
-            with get_db_connection() as conn:
-                t_count = conn.execute("SELECT COUNT(*) as c FROM topics WHERE syllabus_id = ?", (c["syllabus_id"],)).fetchone()
-                total_topics += (t_count["c"] if t_count else 0)
+            total_topics += topic_counts.get(c["syllabus_id"], 0)
 
         for a in c.get("assessments", []):
             if not a.get("is_past"):

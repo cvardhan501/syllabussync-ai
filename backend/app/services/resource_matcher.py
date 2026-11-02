@@ -15,6 +15,7 @@ from app.models.database import (
     get_syllabus_resources,
     update_topic_resource,
     set_third_channel_approved,
+    batch_warm_search_cache,
 )
 from app.services.youtube_client import (
     YouTubeClientService,
@@ -426,11 +427,15 @@ class ResourceMatcherService:
         all_rejected_map = get_all_rejected_channels_for_syllabus(syllabus_id)
 
         # Search candidates for all topics using bounded async concurrency
+        # Pre-warm search cache in a single query to eliminate N+1 DB roundtrips and YouTube API hits
+        topic_queries = [cls.generate_topic_search_query(course_name, t["topic_title"]) for t in flattened_topics]
+        batch_warm_search_cache(topic_queries, primary_lang)
+
         topic_candidates: Dict[str, List[Dict[str, Any]]] = {}
         channel_to_topics: Dict[str, Set[str]] = {}
         channel_id_map: Dict[str, Optional[str]] = {}
 
-        sem = asyncio.Semaphore(5)
+        sem = asyncio.Semaphore(15)
 
         async def _fetch_topic_search(t: Dict[str, Any]):
             async with sem:
@@ -870,6 +875,9 @@ class ResourceMatcherService:
         hierarchy = get_syllabus_hierarchy(syllabus_id)
         course_name = hierarchy.get("course_name") if hierarchy else "Course"
 
+        # Single batch query for all topic rejected channels across syllabus to prevent N+1 queries
+        all_rejected_map = get_all_rejected_channels_for_syllabus(syllabus_id)
+
         topic_mappings: List[Dict[str, Any]] = []
         is_any_fallback = False
 
@@ -907,7 +915,7 @@ class ResourceMatcherService:
                 "match_status": item.match_status,
                 "match_confidence": "high" if item.match_status == "verified" else "medium" if item.match_status == "probable" else "uncertain",
                 "relevance_notes": item.relevance_explanation,
-                "rejected_channels": get_topic_rejected_channels(syllabus_id, item.topic_id),
+                "rejected_channels": all_rejected_map.get(item.topic_id, []),
                 "assigned_channel": item.selected_channel,
                 "is_shared_video": "Shared video:" in item.relevance_explanation,
                 "shared_with_topics": [],

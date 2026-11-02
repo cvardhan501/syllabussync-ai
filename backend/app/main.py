@@ -1,11 +1,21 @@
+import sys
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+
+if sys.platform == "win32":
+    # Prevent Windows ProactorEventLoop WinError 64 socket disconnect crashes in Python 3.13
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.api import api_router
+from app.schemas.health import HealthResponse
 from app.models.database import init_db
 from app.services.youtube_client import (
     YouTubeApiException,
@@ -54,6 +64,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -99,6 +110,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # Include API routes under /api
 app.include_router(api_router, prefix="/api")
+
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def root_health():
+    """Root-level health check endpoint for cloud platform probes."""
+    from app.api.health import get_health
+    return await get_health()
 
 
 @app.get("/")

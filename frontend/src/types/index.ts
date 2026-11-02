@@ -455,7 +455,7 @@ export interface UserSettingsSchema {
   lesson_style: string;
   daily_study_availability: string;
   daily_target_minutes: number;
-  exam_date: string;
+  exam_date?: string;
   study_days: string[];
   theme: 'dark' | 'light';
   study_reminders: boolean;
@@ -467,7 +467,7 @@ export interface UserPreferences {
   preferredLanguage: string;
   lessonStyle: string;
   dailyStudyAvailability: string;
-  examDate: string;
+  examDate?: string;
   theme: 'dark' | 'light';
   studyReminders: boolean;
   deadlineAlerts: boolean;

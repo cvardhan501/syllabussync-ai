@@ -19,6 +19,7 @@ from app.models.database import (
     get_syllabus_owner_id,
     get_study_plan_owner_id,
     get_task_owner_id,
+    update_syllabus_exam_date,
 )
 
 logger = logging.getLogger("syllabus_sync.api.planner")
@@ -46,7 +47,7 @@ async def create_study_plan(
     verify_ownership(s_owner, current_user_id, resource_type="syllabus")
 
     try:
-        return await StudyPlannerService.generate_or_update_plan(
+        plan_res = await StudyPlannerService.generate_or_update_plan(
             syllabus_id=syllabus_id,
             exam_date=payload.exam_date,
             daily_target_minutes=payload.daily_target_minutes,
@@ -55,10 +56,22 @@ async def create_study_plan(
             preserve_completed=payload.preserve_completed,
             owner_user_id=current_user_id,
         )
+        if payload.exam_date:
+            try:
+                update_syllabus_exam_date(syllabus_id, payload.exam_date)
+            except Exception as e:
+                logger.warning(f"Failed to update syllabus exam date: {e}")
+        return plan_res
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
+        )
+    except Exception as e:
+        logger.error(f"Error generating study plan for syllabus {syllabus_id}: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate study plan: {str(e)}",
         )
 
 
@@ -82,6 +95,12 @@ async def get_study_plan(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
+        )
+    except Exception as e:
+        logger.error(f"Error retrieving study plan for syllabus {syllabus_id}: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve study plan: {str(e)}",
         )
 
 

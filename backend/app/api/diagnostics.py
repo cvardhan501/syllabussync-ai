@@ -4,19 +4,21 @@ System Diagnostics API
 Safe configuration status endpoints:
 - Never reveals secret keys, passwords, authorization tokens, or full exception traces.
 - Verifies database connectivity, Strands SDK provider status, and YouTube Data API v3.
-- Provides interactive test endpoints for live verification.
+- Provides interactive, non-blocking test endpoints for live verification with strict timeouts.
+- Independent probes: one unavailable or slow service never marks other services unavailable.
 """
 
 import re
 import time
+import asyncio
 import datetime
 import logging
-from typing import Optional
+from typing import Optional, List, Tuple
 from fastapi import APIRouter, Depends, status
 import httpx
 
 from app.core.config import settings
-from app.core.auth import verify_diagnostics_access, check_is_admin, require_admin_access
+from app.core.auth import check_is_admin, require_admin_access, verify_diagnostics_access
 from app.models.database import get_db_connection, is_postgres
 from app.schemas.diagnostics import (
     BackendDiagnostic,
@@ -40,6 +42,36 @@ router = APIRouter(
 )
 
 
+def _probe_database_sync(is_admin: bool) -> Tuple[str, str, int, List[str]]:
+    """Synchronous database query executed within a thread pool with strict timeout."""
+    engine_name = "PostgreSQL" if is_postgres() else "SQLite"
+    with get_db_connection() as conn:
+        if is_postgres():
+            rows = conn.execute(
+                "SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        all_tables = [r["name"] for r in rows]
+        actual_tables_count = len(all_tables)
+        tables_list = all_tables if is_admin else []
+        return "connected", engine_name, actual_tables_count, tables_list
+
+
+def _probe_youtube_cache_count_sync() -> int:
+    """Queries cached search query count safely."""
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) as cnt FROM youtube_search_cache").fetchone()
+            if row:
+                return row["cnt"]
+    except Exception:
+        pass
+    return 0
+
+
 @router.get(
     "",
     response_model=SystemDiagnosticsResponse,
@@ -50,114 +82,142 @@ async def get_system_diagnostics(is_admin: bool = Depends(check_is_admin)):
     """
     Returns sanitized diagnostics of backend, database connectivity,
     Strands Agents SDK configuration, and YouTube Data API v3 settings.
-    Accessible to authenticated users in production.
+    Probes run independently with individual timeouts:
+    A slow or unavailable database, Bedrock, or YouTube never marks FastAPI offline.
     Zero secret leakage guaranteed.
     """
-    # 1. Backend info
+    # 1. FastAPI Backend Probe (instant, non-blocking)
     backend_diag = BackendDiagnostic(
         status="healthy",
         version=settings.app_version,
         environment=settings.app_env,
     )
 
-    # 2. Database connectivity
-    tables_list = []
-    db_status = "connected"
-    engine_name = "PostgreSQL" if is_postgres() else "SQLite"
-    actual_tables_count = 0
-    try:
-        with get_db_connection() as conn:
-            if is_postgres():
-                rows = conn.execute(
-                    "SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-                ).fetchall()
-            all_tables = [r["name"] for r in rows]
-            actual_tables_count = len(all_tables)
-            # Table inventory is restricted to administrators; general authenticated users see count
-            tables_list = all_tables if is_admin else []
-    except Exception as db_err:
-        logger.warning(f"Database diagnostics probe error: {db_err}")
-        db_status = "error"
+    # 2. Database Probe (async thread with 3.0s bounded timeout)
+    async def _run_db_probe() -> DatabaseDiagnostic:
+        engine_name = "PostgreSQL" if is_postgres() else "SQLite"
+        try:
+            db_status, eng, tbl_count, tbl_list = await asyncio.wait_for(
+                asyncio.to_thread(_probe_database_sync, is_admin),
+                timeout=3.0
+            )
+            return DatabaseDiagnostic(
+                status=db_status,
+                engine=eng,
+                tables_count=tbl_count,
+                tables=tbl_list,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Database diagnostics probe timed out after 3.0s")
+            return DatabaseDiagnostic(
+                status="timeout",
+                engine=engine_name,
+                tables_count=0,
+                tables=[],
+            )
+        except Exception as db_err:
+            logger.warning(f"Database diagnostics probe error: {db_err}")
+            return DatabaseDiagnostic(
+                status="error",
+                engine=engine_name,
+                tables_count=0,
+                tables=[],
+            )
 
-    database_diag = DatabaseDiagnostic(
-        status=db_status,
-        engine=engine_name,
-        tables_count=actual_tables_count,
-        tables=tables_list,
+    # 3. Strands Agents SDK Probe (configuration inspection + cached probe result)
+    def _run_strands_probe() -> StrandsDiagnostic:
+        has_strands_creds = settings.has_strands_credentials()
+        provider = settings.strands_provider
+        model = settings.strands_model
+
+        if has_strands_creds:
+            creds_summary = f"Credentials configured ({provider.title()})"
+            active_mode = "live"
+            fallback_reason = None
+        else:
+            creds_summary = "Not Set (Missing API credentials in environment)"
+            active_mode = "development_fallback"
+            fallback_reason = f"No credentials provided for provider '{provider}'."
+
+        strands_conn_status = (
+            _LAST_STRANDS_TEST["status"]
+            if _LAST_STRANDS_TEST
+            else ("unverified" if has_strands_creds else "missing")
+        )
+        return StrandsDiagnostic(
+            provider=provider,
+            model=model,
+            region=settings.aws_region if provider == "bedrock" else None,
+            credentials_configured=has_strands_creds,
+            credentials_summary=creds_summary,
+            fallback_enabled=settings.allow_dev_fallback_analysis,
+            active_mode=active_mode,
+            fallback_reason=fallback_reason,
+            connectivity_status=strands_conn_status,
+            last_tested=_LAST_STRANDS_TEST.get("timestamp") if _LAST_STRANDS_TEST else None,
+            last_test_message=_LAST_STRANDS_TEST.get("message") if _LAST_STRANDS_TEST else None,
+        )
+
+    # 4. YouTube Data API v3 Probe (configuration inspection + async cache count)
+    async def _run_youtube_probe() -> YouTubeDiagnostic:
+        has_yt_creds = settings.has_youtube_credentials()
+        try:
+            cached_count = await asyncio.wait_for(
+                asyncio.to_thread(_probe_youtube_cache_count_sync),
+                timeout=2.0
+            )
+        except Exception:
+            cached_count = 0
+
+        if has_yt_creds:
+            key_summary = "Configured (Active)"
+            yt_active_mode = "live"
+            yt_fallback_reason = None
+        else:
+            key_summary = "Not Set (YOUTUBE_API_KEY missing in environment)"
+            yt_active_mode = "development_fallback"
+            yt_fallback_reason = "YOUTUBE_API_KEY environment variable is not configured."
+
+        yt_conn_status = (
+            _LAST_YOUTUBE_TEST["status"]
+            if _LAST_YOUTUBE_TEST
+            else ("unverified" if has_yt_creds else "missing")
+        )
+        return YouTubeDiagnostic(
+            key_configured=has_yt_creds,
+            key_summary=key_summary,
+            fallback_enabled=settings.allow_dev_fallback_youtube,
+            active_mode=yt_active_mode,
+            fallback_reason=yt_fallback_reason,
+            cached_queries_count=cached_count,
+            connectivity_status=yt_conn_status,
+            last_tested=_LAST_YOUTUBE_TEST.get("timestamp") if _LAST_YOUTUBE_TEST else None,
+            last_test_message=_LAST_YOUTUBE_TEST.get("message") if _LAST_YOUTUBE_TEST else None,
+        )
+
+    # Execute probes concurrently and independently
+    db_result, strands_result, yt_result = await asyncio.gather(
+        _run_db_probe(),
+        asyncio.to_thread(_run_strands_probe),
+        _run_youtube_probe(),
+        return_exceptions=True,
     )
 
-    # 3. Strands Agents SDK
-    has_strands_creds = settings.has_strands_credentials()
-    provider = settings.strands_provider
-    model = settings.strands_model
-
-    if has_strands_creds:
-        creds_summary = f"Credentials configured ({provider.title()})"
-        active_mode = "live"
-        fallback_reason = None
-    else:
-        creds_summary = "Not Set (Missing API credentials in environment)"
-        active_mode = "development_fallback"
-        fallback_reason = f"No credentials provided for provider '{provider}'."
-
-    strands_conn_status = (
-        _LAST_STRANDS_TEST["status"]
-        if _LAST_STRANDS_TEST
-        else ("unverified" if has_strands_creds else "missing")
+    # Safeguard against any unexpected exception
+    database_diag = db_result if isinstance(db_result, DatabaseDiagnostic) else DatabaseDiagnostic(
+        status="error",
+        engine="PostgreSQL" if is_postgres() else "SQLite",
+        tables_count=0,
+        tables=[],
     )
-    strands_diag = StrandsDiagnostic(
-        provider=provider,
-        model=model,
-        region=settings.aws_region if provider == "bedrock" else None,
-        credentials_configured=has_strands_creds,
-        credentials_summary=creds_summary,
-        fallback_enabled=settings.allow_dev_fallback_analysis,
-        active_mode=active_mode,
-        fallback_reason=fallback_reason,
-        connectivity_status=strands_conn_status,
-        last_tested=_LAST_STRANDS_TEST.get("timestamp") if _LAST_STRANDS_TEST else None,
-        last_test_message=_LAST_STRANDS_TEST.get("message") if _LAST_STRANDS_TEST else None,
-    )
-
-    # 4. YouTube Data API v3
-    has_yt_creds = settings.has_youtube_credentials()
-    cached_count = 0
-    try:
-        with get_db_connection() as conn:
-            row = conn.execute("SELECT COUNT(*) as cnt FROM youtube_search_cache").fetchone()
-            if row:
-                cached_count = row["cnt"]
-    except Exception:
-        pass
-
-    if has_yt_creds:
-        key_summary = "Configured (Active)"
-        yt_active_mode = "live"
-        yt_fallback_reason = None
-    else:
-        key_summary = "Not Set (YOUTUBE_API_KEY missing in environment)"
-        yt_active_mode = "development_fallback"
-        yt_fallback_reason = "YOUTUBE_API_KEY environment variable is not configured."
-
-    yt_conn_status = (
-        _LAST_YOUTUBE_TEST["status"]
-        if _LAST_YOUTUBE_TEST
-        else ("unverified" if has_yt_creds else "missing")
-    )
-    youtube_diag = YouTubeDiagnostic(
-        key_configured=has_yt_creds,
-        key_summary=key_summary,
+    strands_diag = strands_result if isinstance(strands_result, StrandsDiagnostic) else _run_strands_probe()
+    youtube_diag = yt_result if isinstance(yt_result, YouTubeDiagnostic) else YouTubeDiagnostic(
+        key_configured=settings.has_youtube_credentials(),
+        key_summary="Configured" if settings.has_youtube_credentials() else "Not Set",
         fallback_enabled=settings.allow_dev_fallback_youtube,
-        active_mode=yt_active_mode,
-        fallback_reason=yt_fallback_reason,
-        cached_queries_count=cached_count,
-        connectivity_status=yt_conn_status,
-        last_tested=_LAST_YOUTUBE_TEST.get("timestamp") if _LAST_YOUTUBE_TEST else None,
-        last_test_message=_LAST_YOUTUBE_TEST.get("message") if _LAST_YOUTUBE_TEST else None,
+        active_mode="live" if settings.has_youtube_credentials() else "development_fallback",
+        cached_queries_count=0,
+        connectivity_status="unverified",
     )
 
     return SystemDiagnosticsResponse(
@@ -180,6 +240,7 @@ async def test_youtube_api():
     """
     Executes a minimal, safe 1-video search query against YouTube Data API v3
     to verify credentials and network reachability without logging secrets.
+    Enforces a strict 7.0s timeout so the UI never hangs.
     """
     global _LAST_YOUTUBE_TEST
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -207,8 +268,8 @@ async def test_youtube_api():
 
     start_time = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url, params=params)
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await asyncio.wait_for(client.get(url, params=params), timeout=7.0)
             latency = int((time.perf_counter() - start_time) * 1000)
 
             if resp.status_code == 200:
@@ -252,23 +313,7 @@ async def test_youtube_api():
                         tested=True,
                         status="auth_failed",
                         latency_ms=latency,
-                        message="YouTube API key is expired or invalid in Google Cloud Console. Please renew YOUTUBE_API_KEY.",
-                    )
-                elif resp.status_code == 403:
-                    res = DiagnosticTestResult(
-                        service="youtube",
-                        tested=True,
-                        status="auth_failed",
-                        latency_ms=latency,
-                        message=f"YouTube API authorization failed: {msg or 'Access forbidden for YouTube Data API v3'}.",
-                    )
-                elif resp.status_code == 400:
-                    res = DiagnosticTestResult(
-                        service="youtube",
-                        tested=True,
-                        status="auth_failed",
-                        latency_ms=latency,
-                        message=f"YouTube API rejected request format or key parameter: {msg or 'Bad Request'}.",
+                        message="Configured YOUTUBE_API_KEY is rejected or expired by Google Cloud.",
                     )
                 else:
                     res = DiagnosticTestResult(
@@ -276,24 +321,26 @@ async def test_youtube_api():
                         tested=True,
                         status="error",
                         latency_ms=latency,
-                        message=f"YouTube API returned HTTP status {resp.status_code}.",
+                        message=f"YouTube API returned HTTP {resp.status_code}: {msg or 'Search request failed'}",
                     )
 
-    except httpx.TimeoutException:
+    except (asyncio.TimeoutError, httpx.TimeoutException):
+        latency = int((time.perf_counter() - start_time) * 1000)
         res = DiagnosticTestResult(
             service="youtube",
             tested=True,
             status="network_error",
-            latency_ms=8000,
-            message="Connection to YouTube API timed out (8.0s timeout reached).",
+            latency_ms=latency,
+            message="Connection to YouTube API timed out after 7.0 seconds. FastAPI service remains operational.",
         )
-    except httpx.RequestError as exc:
+    except Exception as exc:
+        latency = int((time.perf_counter() - start_time) * 1000)
         res = DiagnosticTestResult(
             service="youtube",
             tested=True,
             status="network_error",
-            latency_ms=0,
-            message=f"Network error contacting YouTube: {exc.__class__.__name__}.",
+            latency_ms=latency,
+            message=f"Network error communicating with YouTube API: {type(exc).__name__}",
         )
 
     _LAST_YOUTUBE_TEST = {
@@ -302,6 +349,54 @@ async def test_youtube_api():
         "message": res.message,
     }
     return res
+
+
+def _probe_bedrock_sync(model: str, is_admin: bool) -> DiagnosticTestResult:
+    """Synchronous AWS STS and Bedrock 1-token test probe executed in a worker thread."""
+    start_time = time.perf_counter()
+    import boto3
+    # Check STS identity first (validates credentials without model cost)
+    sts = boto3.client("sts", region_name=settings.aws_region)
+    caller_ident = sts.get_caller_identity()
+    arn = caller_ident.get("Arn", "unknown")
+    # Mask 12-digit AWS account ID in IAM ARN
+    masked_arn = re.sub(r"::\d{12}:", "::************:", arn)
+
+    # Check Bedrock model invocation access
+    bedrock_rt = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+    try:
+        # 1-token minimal test probe to verify actual account model enablement
+        bedrock_rt.converse(
+            modelId=model,
+            messages=[{"role": "user", "content": [{"text": "ping"}]}],
+            inferenceConfig={"maxTokens": 1}
+        )
+        total_latency = int((time.perf_counter() - start_time) * 1000)
+        ident_note = f" Authenticated as IAM ARN: {masked_arn}." if is_admin else ""
+        return DiagnosticTestResult(
+            service="strands",
+            tested=True,
+            status="success",
+            latency_ms=total_latency,
+            message=(
+                f"Bedrock invocation succeeded for model '{model}' in region '{settings.aws_region}'.{ident_note} "
+                f"({total_latency} ms)."
+            ),
+        )
+    except Exception as model_err:
+        from app.agents.syllabus_analyzer import SyllabusAnalyzerAgent
+        err_cat, err_msg = SyllabusAnalyzerAgent.classify_model_error(model_err)
+        total_latency = int((time.perf_counter() - start_time) * 1000)
+
+        status_code = "model_not_available" if err_cat == "MODEL_NOT_AVAILABLE" else "auth_failed"
+        ident_prefix = f"AWS IAM authentication succeeded ({masked_arn} in {settings.aws_region}), but " if is_admin else f"Bedrock model '{model}' in region '{settings.aws_region}': "
+        return DiagnosticTestResult(
+            service="strands",
+            tested=True,
+            status=status_code,
+            latency_ms=total_latency,
+            message=f"{ident_prefix}model failed [{err_cat}]: {err_msg}",
+        )
 
 
 @router.post(
@@ -314,7 +409,7 @@ async def test_strands_model(is_admin: bool = Depends(check_is_admin)):
     """
     Safely inspects Strands provider configuration and verifies IAM identity / model availability
     without spending unnecessary token credits.
-    Accessible to authenticated users; administrative identity details are restricted.
+    Offloaded to thread pool with strict 7.0s timeout to guarantee event loop responsiveness.
     """
     global _LAST_STRANDS_TEST
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -344,51 +439,19 @@ async def test_strands_model(is_admin: bool = Depends(check_is_admin)):
     if provider == "bedrock":
         start_time = time.perf_counter()
         try:
-            import boto3
-            # Check STS identity first (validates access key and secret key without model cost)
-            sts = boto3.client("sts", region_name=settings.aws_region)
-            caller_ident = sts.get_caller_identity()
-            arn = caller_ident.get("Arn", "unknown")
-            # Mask 12-digit AWS account ID in IAM ARN
-            masked_arn = re.sub(r"::\d{12}:", "::************:", arn)
+            res = await asyncio.wait_for(
+                asyncio.to_thread(_probe_bedrock_sync, model, is_admin),
+                timeout=7.0
+            )
+        except asyncio.TimeoutError:
             latency = int((time.perf_counter() - start_time) * 1000)
-
-            # Check Bedrock model invocation access
-            bedrock_rt = boto3.client("bedrock-runtime", region_name=settings.aws_region)
-            try:
-                # 1-token minimal test probe to verify actual account model enablement
-                bedrock_rt.converse(
-                    modelId=model,
-                    messages=[{"role": "user", "content": [{"text": "ping"}]}],
-                    inferenceConfig={"maxTokens": 1}
-                )
-                total_latency = int((time.perf_counter() - start_time) * 1000)
-                ident_note = f" Authenticated as IAM ARN: {masked_arn}." if is_admin else ""
-                res = DiagnosticTestResult(
-                    service="strands",
-                    tested=True,
-                    status="success",
-                    latency_ms=total_latency,
-                    message=(
-                        f"Bedrock invocation succeeded for model '{model}' in region '{settings.aws_region}'.{ident_note} "
-                        f"({total_latency} ms)."
-                    ),
-                )
-            except Exception as model_err:
-                from app.agents.syllabus_analyzer import SyllabusAnalyzerAgent
-                err_cat, err_msg = SyllabusAnalyzerAgent.classify_model_error(model_err)
-                total_latency = int((time.perf_counter() - start_time) * 1000)
-
-                status_code = "model_not_available" if err_cat == "MODEL_NOT_AVAILABLE" else "auth_failed"
-                ident_prefix = f"AWS IAM authentication succeeded ({masked_arn} in {settings.aws_region}), but " if is_admin else f"Bedrock model '{model}' in region '{settings.aws_region}': "
-                res = DiagnosticTestResult(
-                    service="strands",
-                    tested=True,
-                    status=status_code,
-                    latency_ms=total_latency,
-                    message=f"{ident_prefix}model failed [{err_cat}]: {err_msg}",
-                )
-
+            res = DiagnosticTestResult(
+                service="strands",
+                tested=True,
+                status="timeout",
+                latency_ms=latency,
+                message=f"Bedrock invocation probe timed out after 7.0s in region '{settings.aws_region}'. FastAPI backend service remains operational.",
+            )
         except Exception as aws_err:
             latency = int((time.perf_counter() - start_time) * 1000)
             res = DiagnosticTestResult(

@@ -11,6 +11,7 @@ import re
 import json
 import logging
 import uuid
+import asyncio
 from typing import Tuple, List, Optional, Any
 from fastapi import HTTPException, status
 from pydantic import ValidationError
@@ -331,7 +332,7 @@ class SyllabusAnalyzerAgent:
 
         # Strands agent call with non-streaming fallback on streaming toolUse sequence errors
         try:
-            result = agent(user_prompt)
+            result = await asyncio.to_thread(agent, user_prompt, limits={"turns": 4})
         except Exception as e:
             err_cat, _ = cls.classify_model_error(e)
             if not non_streaming and (

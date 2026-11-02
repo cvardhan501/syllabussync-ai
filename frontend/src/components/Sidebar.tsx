@@ -130,7 +130,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="px-4 py-2.5 border-t border-[#152342] bg-[#070d1c]">
           <div className="flex items-center justify-between text-[11px]">
             <span className="text-slate-400 font-medium">FastAPI Backend</span>
-            {health ? (
+            {health?.status === 'healthy' || health?.status === 'ok' ? (
               <span className="inline-flex items-center gap-1.5 text-emerald-400 font-medium">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 <Wifi className="w-3 h-3" />

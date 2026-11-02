@@ -221,9 +221,19 @@ class YouTubeClientService:
         legacy_hash = hashlib.sha256(f"{query.strip().lower()}|{lang_code}|{max_results}".encode("utf-8")).hexdigest()
         excluded_set = {ch.strip().lower() for ch in (excluded_channels or [])}
 
-        # 1. Check Cache if not forcing refresh (check normalized hash first, then legacy hash)
+        # 1. Check Cache if not forcing refresh (check normalized hash first, then legacy hash, then query/lang fallback)
         if not force_refresh:
-            cached_data = get_cached_search(query_hash) or get_cached_search(legacy_hash)
+            cached_data = (
+                get_cached_search(query_hash, query=query, language=lang_code)
+                or get_cached_search(legacy_hash, query=query, language=lang_code)
+            )
+            if not cached_data:
+                for alt_mr in (4, 5, 8, 10):
+                    alt_hash = hashlib.sha256(f"{query.strip().lower()}|{lang_code}|{alt_mr}".encode("utf-8")).hexdigest()
+                    cached_data = get_cached_search(alt_hash, query=query, language=lang_code)
+                    if cached_data:
+                        break
+
             if cached_data and isinstance(cached_data, list):
                 # Filter out excluded channels from cached results
                 filtered = []
